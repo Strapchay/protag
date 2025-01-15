@@ -12,3 +12,7 @@ docs/
 
 # Dotenv file
 .env
+
+#frontend file
+frontend/
+protag/
