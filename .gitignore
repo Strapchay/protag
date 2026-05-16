@@ -1,0 +1,41 @@
+# Go binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/aion-kernel
+/orchestrator
+/orchestrator-cli
+/cmd/orchestrator/orchestrator
+/cmd/orchestrator-cli/orchestrator-cli
+
+# Test artifacts
+*.test
+*.out
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Runtime directories
+.aion/
+.env
+rpc_debug.log
+tui_debug.log
+pi_help.txt
+
+# Generated code
+internal/dag/flatbuf/*.go
+!internal/dag/flatbuf/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Vendor (use modules)
+/vendor/

@@ -1,0 +1,84 @@
+// FlatBuffer schema for the Aion-Kernel DAG
+// Compile: flatc --go -o internal/dag/flatbuf/ flatbuf/dag.fbs
+
+namespace aion.dag;
+
+/// Status of a DAG task node.
+enum NodeStatus : byte {
+    Pending = 0,
+    InProgress = 1,
+    Done = 2,
+    Failed = 3,
+    Blocked = 4
+}
+
+/// Type of edge between DAG nodes.
+enum EdgeType : byte {
+    /// Normal task dependency: to_node cannot start until from_node is Done.
+    Dependency = 0,
+    /// Stub contract: to_node needs an interface provided by from_node.
+    StubContract = 1
+}
+
+/// A single task node in the DAG.
+table DagNode {
+    /// Immutable UUID for this node.
+    id: string (key);
+    /// Domain this node is assigned to (e.g., "auth", "data", "api").
+    domain_id: string;
+    /// JSON task specification. Nulled when status reaches Done (growth control).
+    task_spec: string;
+    /// Current execution status.
+    status: NodeStatus = Pending;
+    /// UUID of the agent currently working on this node.
+    assigned_agent: string;
+    /// Files this task will create or modify.
+    target_files: [string];
+    /// Priority (lower = higher priority, executed first).
+    priority: int32;
+    /// Unix timestamp (ms) when this node was created.
+    created_at: int64;
+    /// Unix timestamp (ms) of last status update.
+    updated_at: int64;
+    /// Unix timestamp (ms) when execution started.
+    started_at: int64;
+    /// Unix timestamp (ms) when execution completed.
+    completed_at: int64;
+    /// Number of prompt tokens evaluated.
+    prompt_tokens: int32;
+    /// Number of completion tokens generated.
+    completion_tokens: int32;
+}
+
+/// A directed edge between two DAG nodes.
+table DagEdge {
+    /// UUID of the source node (dependency / producer).
+    from_node: string;
+    /// UUID of the target node (dependent / consumer).
+    to_node: string;
+    /// Type of this edge.
+    edge_type: EdgeType = Dependency;
+    /// For StubContract edges, the stub contract UUID.
+    stub_id: string;
+}
+
+/// Header containing metadata about the DAG.
+table DagHeader {
+    /// Schema version for mmap compatibility checking.
+    schema_version: uint32;
+    /// Number of nodes currently in non-Done status.
+    active_node_count: uint32;
+    /// Maximum allowed active nodes (ceiling for SPLIT/INJECT rejection).
+    max_nodes: uint32;
+    /// Unix timestamp (ms) of last modification.
+    last_modified: int64;
+}
+
+/// Root DAG container.
+table Dag {
+    header: DagHeader;
+    nodes: [DagNode];
+    edges: [DagEdge];
+}
+
+root_type Dag;

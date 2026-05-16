@@ -1,0 +1,93 @@
+# Aion-Kernel Configuration
+# See docs/current/implementation_arch.md for architecture details.
+
+orchestrator:
+  # gRPC listen address, sourced from .env via AION_ORCHESTRATOR_HOST/PORT
+  listen_addr: "${AION_ORCHESTRATOR_HOST}:${AION_ORCHESTRATOR_PORT}"
+  # Path to DAG FlatBuffer file (relative to project root)
+  dag_file: "${AION_DAG_FILE}"
+  # Path to WAL file
+  wal_file: "${AION_WAL_FILE}"
+  # Maximum number of active DAG nodes before rejecting SPLIT/INJECT
+  max_active_nodes: ${AION_MAX_ACTIVE_NODES}
+  # Maximum ms between WAL flushes (group commit deadline)
+  flush_deadline_ms: ${AION_FLUSH_DEADLINE_MS}
+
+health:
+  # Seconds without heartbeat before agent is considered dead
+  heartbeat_timeout_sec: ${AION_HEARTBEAT_TIMEOUT_SEC}
+  # Seconds without progress (lock/write/update) before agent is killed
+  progress_timeout_sec: ${AION_PROGRESS_TIMEOUT_SEC}
+
+cgroups:
+  # Enable cgroup resource limits (requires Linux + permissions)
+  enabled: ${AION_CGROUPS_ENABLED}
+  # Memory limit per agent process group (MB)
+  memory_max_mb: ${AION_CGROUPS_MEMORY_MAX_MB}
+  # Max PIDs per agent process group
+  pids_max: ${AION_CGROUPS_PIDS_MAX}
+
+inference:
+  # Model Profiles allow reusing configurations and environment variables
+  models:
+    oracle:
+      provider: "${AION_PROFILE_ORACLE_PROVIDER}"
+      model: "${AION_PROFILE_ORACLE_MODEL}"
+      env:
+        ${AION_PROFILE_ORACLE_ENV_KEY}: "${AION_PROFILE_ORACLE_API_KEY}"
+    forge:
+      provider: "${AION_PROFILE_FORGE_PROVIDER}"
+      model: "${AION_PROFILE_FORGE_MODEL}"
+      env:
+        ${AION_PROFILE_FORGE_ENV_KEY}: "${AION_PROFILE_FORGE_API_KEY}"
+    glimmer:
+      provider: "${AION_PROFILE_GLIMMER_PROVIDER}"
+      model: "${AION_PROFILE_GLIMMER_MODEL}"
+      env:
+        ${AION_PROFILE_GLIMMER_ACCOUNT_ENV_KEY}: "${AION_PROFILE_GLIMMER_ACCOUNT_ID}"
+        ${AION_PROFILE_GLIMMER_API_KEY_ENV_KEY}: "${AION_PROFILE_GLIMMER_API_KEY}"
+    ember:
+      provider: "${AION_PROFILE_EMBER_PROVIDER}"
+      model: "${AION_PROFILE_EMBER_MODEL}"
+      env:
+        ${AION_PROFILE_EMBER_ENV_KEY}: "${AION_PROFILE_EMBER_API_KEY}"
+    lyric:
+      provider: "${AION_PROFILE_LYRIC_PROVIDER}"
+      model: "${AION_PROFILE_LYRIC_MODEL}"
+      env:
+        ${AION_PROFILE_LYRIC_ENV_KEY}: "${AION_PROFILE_LYRIC_API_KEY}"
+
+  coordinator:
+    use_profile: "${AION_COORDINATOR_PROFILE}"
+    # Production planning should use the Pi-backed Coordinator. Set this true
+    # only for development smoke tests or legacy natural-spec fallback behavior.
+    deterministic_fallback: ${AION_COORDINATOR_DETERMINISTIC_FALLBACK}
+  domain_agents:
+    use_profile: "${AION_DOMAIN_AGENTS_PROFILE}"
+  fallback:
+    provider: "${AION_PROFILE_HARBOR_PROVIDER}"
+    model: "${AION_PROFILE_HARBOR_MODEL}"
+    endpoint: "${AION_PROFILE_HARBOR_ENDPOINT}"
+
+agents:
+  # Directory for Pi Agent session files
+  session_dir: "${AION_AGENT_SESSION_DIR}"
+  # Maximum concurrent domain agents
+  max_agents: ${AION_MAX_AGENTS}
+  # Path to the Pi binary
+  command_path: "${AION_AGENT_COMMAND_PATH}"
+  # Paths to Pi skills/extensions
+  skill_paths:
+    - "${AION_AGENT_SKILL_PATH}"
+  # Files that cannot be locked directly — must use Utility Agent
+  shared_files:
+    - "go.mod"
+    - "go.sum"
+
+memory:
+  # Enable semantic memory (Chromem-DB)
+  enabled: ${AION_MEMORY_ENABLED}
+  # Enable read queries during agent ORIENT phase
+  read_enabled: ${AION_MEMORY_READ_ENABLED}
+  # Minimum similarity threshold for memory retrieval
+  relevance_threshold: ${AION_MEMORY_RELEVANCE_THRESHOLD}

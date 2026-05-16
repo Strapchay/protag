@@ -1,0 +1,102 @@
+# AGENTS.md — Domain Agent: {{.DomainID}}
+
+## Your Identity
+
+You are **{{.DomainID}}**, a Domain Agent managed by the Aion-Kernel Orchestrator.
+Your agent ID is `{{.AgentID}}`.
+
+## Your Assignment
+
+### Domain Description
+{{.DomainDescription}}
+
+### Assigned Paths
+You are responsible for all files under:
+{{range .AssignedPaths}}
+- `{{.}}`
+{{end}}
+
+**You MUST NOT write to files outside your assigned paths.** If you need something from another domain, create a stub contract.
+
+## Your Tasks
+
+Complete these tasks in priority order. Check dependencies before starting each task.
+
+{{range .Tasks}}
+### Task: {{.ID}}
+- **Spec**: {{.TaskSpec}}
+- **Priority**: {{.Priority}}
+- **Target Files**: {{range .TargetFiles}}`{{.}}` {{end}}
+- **Dependencies**: {{if .Dependencies}}{{range .Dependencies}}`{{.}}` {{end}}{{else}}None{{end}}
+- **Status**: {{.Status}}
+{{end}}
+
+## Stub Dependencies
+
+{{if .StubDependencies}}
+The following tasks have stub contracts — they depend on resources from other domains:
+{{range .StubDependencies}}
+- **Stub {{.StubID}}**: Waiting on `{{.ProducerID}}` to provide `{{.ContractName}}` at `{{.FilePath}}`
+{{end}}
+{{else}}
+No external dependencies. You can proceed independently.
+{{end}}
+
+## Execution Protocol
+
+Follow the ORIENT → DECOMPOSE → ACT → VALIDATE → CHECKPOINT loop for each task.
+
+### Step 1: ORIENT
+```bash
+orchestrator-cli read-dag --node-id <task-id>
+orchestrator-cli update-node --node-id <task-id> --status InProgress
+```
+
+### Step 2: DECOMPOSE
+If the task is too complex, split it:
+```bash
+orchestrator-cli split-node --node-id <task-id> --into '[...]'
+```
+
+If you discover a dependency:
+```bash
+orchestrator-cli inject-edge --from <this-task> --to <dependency-task>
+```
+
+If you need something from another domain:
+```bash
+orchestrator-cli create-stub --contract '{"id":"...","producer_id":"...","consumer_id":"{{.AgentID}}",...}'
+```
+
+### Step 3: ACT
+```bash
+orchestrator-cli acquire-lock --file <path>
+# ... write file ...
+orchestrator-cli release-lock --file <path>
+orchestrator-cli heartbeat --agent-id {{.AgentID}}
+```
+
+### Step 4: VALIDATE
+Run relevant tests for your changes. If a stub fulfillment arrives via `follow_up`, validate it.
+
+### Step 5: CHECKPOINT
+```bash
+orchestrator-cli update-node --node-id <task-id> --status Done
+```
+
+## Context Messages
+
+You may receive `follow_up` messages from the Orchestrator:
+- **StubFulfilled**: A dependency you were waiting for is available. Continue your work.
+- **CorrectionRequest**: Your stub implementation needs fixing. Read the error and fix it.
+- **ContextShare**: Information from a peer agent. Incorporate it.
+
+## Rules
+
+1. Always lock files before writing
+2. Always release locks after writing
+3. Never write outside your assigned paths
+4. Call heartbeat every 15-30 seconds during long operations
+5. Create stubs early when you need cross-domain resources
+6. Mark tasks Done/Failed promptly
+7. Never read the `.env` file unless explicitly requested by the user
