@@ -62,22 +62,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		switch msg.String() {
-		case "tab", "ctrl+j":
+		case "shift+tab", "backtab":
 			m.nextPane()
 			handledGlobalKey = true
-		case "shift+tab", "ctrl+k":
+		case "ctrl+k":
 			m.prevPane()
 			handledGlobalKey = true
 		case "q":
 			if !m.isEditablePaneFocused() {
 				return m, tea.Quit
-			}
-		case "enter":
-			// If not already editing chat or agents, enter chat.
-			if !m.isEditablePaneFocused() && m.ChatInput != nil {
-				m.SelectedPane = "chat"
-				m.ChatInput.input.Focus()
-				handledGlobalKey = true
 			}
 		}
 	case tea.WindowSizeMsg:
@@ -113,11 +106,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	if m.LogView != nil {
-		if m.SelectedPane == "agents" {
-			if !m.LogView.input.Focused() {
-				m.LogView.input.Focus()
-			}
-		} else if m.LogView.input.Focused() {
+		if m.SelectedPane != "agents" && m.LogView.input.Focused() {
 			m.LogView.input.Blur()
 		}
 	}
@@ -183,7 +172,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 	}
 
-	// Delegate non-key messages to child panes
+	if mouseMsg, ok := msg.(tea.MouseMsg); ok {
+		return m, m.updateActivePane(mouseMsg)
+	}
+
+	// Delegate stream/tick/status messages to child panes.
 	if m.DagView != nil {
 		newDag, cmd := m.DagView.Update(msg)
 		m.DagView = newDag.(*DagModel)
@@ -228,6 +221,42 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+func (m *Model) updateActivePane(msg tea.Msg) tea.Cmd {
+	switch m.SelectedPane {
+	case "dag":
+		if m.DagView != nil {
+			newDag, cmd := m.DagView.Update(msg)
+			m.DagView = newDag.(*DagModel)
+			return cmd
+		}
+	case "hub":
+		if m.HubView != nil {
+			newHub, cmd := m.HubView.Update(msg)
+			m.HubView = newHub.(*HubModel)
+			return cmd
+		}
+	case "agents":
+		if m.LogView != nil {
+			newLog, cmd := m.LogView.Update(msg)
+			m.LogView = newLog.(*MultiLogModel)
+			return cmd
+		}
+	case "ops":
+		if m.OpsView != nil {
+			newOps, cmd := m.OpsView.Update(msg)
+			m.OpsView = newOps.(*OpsModel)
+			return cmd
+		}
+	case "chat":
+		if m.ChatInput != nil {
+			newChat, cmd := m.ChatInput.Update(msg)
+			m.ChatInput = newChat.(*ChatModel)
+			return cmd
+		}
+	}
+	return nil
 }
 
 func (m *Model) isEditablePaneFocused() bool {
@@ -321,7 +350,8 @@ func (m *Model) resizePanes() {
 		return
 	}
 
-	paneHeight := m.Height - 4 // title, tabs, status, and spacing
+	tabsHeight := lipgloss.Height(m.renderTabs())
+	paneHeight := m.Height - 1 - tabsHeight - 1 - 3 // title, tabs, status, and separating newlines
 	if paneHeight < 1 {
 		paneHeight = 1
 	}

@@ -54,6 +54,12 @@ func TestConfigDefaults(t *testing.T) {
 	if config.Health.HeartbeatTimeoutSec != 30 {
 		t.Fatalf("expected default 30s, got %d", config.Health.HeartbeatTimeoutSec)
 	}
+	if config.Cgroups.Mode != "direct" {
+		t.Fatalf("expected default cgroup mode direct, got %q", config.Cgroups.Mode)
+	}
+	if config.Cgroups.BasePath != "/sys/fs/cgroup/aion" {
+		t.Fatalf("expected default cgroup base path, got %q", config.Cgroups.BasePath)
+	}
 }
 
 func TestConfigListenAddrFromEnv(t *testing.T) {

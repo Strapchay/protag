@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -14,6 +15,7 @@ func TestCgroupsLifecycle(t *testing.T) {
 
 	config := CgroupConfig{
 		Enabled:        true,
+		BasePath:       cgroupBasePath,
 		AgentID:        "test-agent-123",
 		MemoryMaxBytes: 1024 * 1024 * 100, // 100MB
 		PidsMax:        50,
@@ -22,7 +24,7 @@ func TestCgroupsLifecycle(t *testing.T) {
 	// 1. Create
 	err := CreateCgroup(config)
 	if err != nil {
-		if os.IsPermission(err) || err.Error() == "permission denied" || len(err.Error()) > 0 && err.Error()[len(err.Error())-17:] == "permission denied" {
+		if os.IsPermission(err) || strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "read-only file system") {
 			t.Skipf("CreateCgroup permission denied, skipping test: %v", err)
 		}
 		t.Fatalf("CreateCgroup failed: %v", err)
@@ -53,7 +55,7 @@ func TestCgroupsLifecycle(t *testing.T) {
 
 	// 2. Assign Process (use own PID)
 	myPid := os.Getpid()
-	err = AssignProcess(config.AgentID, myPid)
+	err = AssignProcess(config.BasePath, config.AgentID, myPid)
 	if err != nil {
 		t.Fatalf("AssignProcess failed: %v", err)
 	}
@@ -68,7 +70,7 @@ func TestCgroupsLifecycle(t *testing.T) {
 	}
 
 	// 3. Destroy
-	err = DestroyCgroup(config.AgentID)
+	err = DestroyCgroup(config.BasePath, config.AgentID)
 	// Even with process inside, cgroups v2 usually let you delete if empty or force hierarchy.
 	// But actually if a process is inside, RMDIR might fail with Device or Resource Busy
 	// We won't strictly enforce tests of busy cgroups as that risks flaky CI.
@@ -111,6 +113,7 @@ func TestResourceGovernance(t *testing.T) {
 
 	config := CgroupConfig{
 		Enabled:        true,
+		BasePath:       cgroupBasePath,
 		AgentID:        "oom-test-agent",
 		MemoryMaxBytes: 10 * 1024 * 1024, // 10MB cutoff
 		PidsMax:        50,
@@ -118,9 +121,12 @@ func TestResourceGovernance(t *testing.T) {
 
 	err := CreateCgroup(config)
 	if err != nil {
-		t.Skipf("CreateCgroup permission denied, skipping test: %v", err)
+		if os.IsPermission(err) || strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "read-only file system") {
+			t.Skipf("CreateCgroup unavailable, skipping test: %v", err)
+		}
+		t.Fatalf("CreateCgroup failed: %v", err)
 	}
-	defer DestroyCgroup(config.AgentID)
+	defer DestroyCgroup(config.BasePath, config.AgentID)
 
 	// Since we can't easily OOM the current test process without crashing the test test runner,
 	// we would typically test this by spawning a child process that allocates memory until it gets killed

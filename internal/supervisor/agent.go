@@ -217,7 +217,7 @@ func (s *AgentSupervisor) spawnAgent(ctx context.Context) error {
 
 	// Assign to cgroup
 	if s.config.Cgroup.Enabled {
-		if err := AssignProcess(s.config.AgentID, piAgent.PID()); err != nil {
+		if err := AssignProcess(s.config.Cgroup.BasePath, s.config.AgentID, piAgent.PID()); err != nil {
 			log.Printf("supervisor: cgroup assign failed for %s: %v", s.config.AgentID, err)
 		}
 	}
@@ -306,7 +306,7 @@ func (s *AgentSupervisor) Stop() error {
 	}
 
 	// Clean up cgroup
-	DestroyCgroup(s.config.AgentID)
+	DestroyCgroup(s.config.Cgroup.BasePath, s.config.AgentID)
 
 	log.Printf("supervisor: agent %s stopped", s.config.AgentID)
 	return nil
@@ -769,7 +769,7 @@ func (s *AgentSupervisor) handleCrash(reason string) {
 	}
 
 	// Destroy and recreate cgroup
-	DestroyCgroup(s.config.AgentID)
+	DestroyCgroup(s.config.Cgroup.BasePath, s.config.AgentID)
 
 	if count >= maxRestarts {
 		log.Printf("supervisor: agent %s exceeded max restarts, giving up", s.config.AgentID)

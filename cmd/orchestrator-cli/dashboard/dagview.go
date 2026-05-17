@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -22,14 +23,15 @@ type dagDataMsg struct {
 
 type NodeData struct {
 	ID            string `json:"id"`
-	Type          string `json:"type"`
+	DomainID      string `json:"domain_id"`
+	Type          string `json:"type,omitempty"`
 	Status        string `json:"status"`
 	AssignedAgent string `json:"assigned_agent"`
 }
 
 type EdgeData struct {
-	From string `json:"from"`
-	To   string `json:"to"`
+	From string `json:"from_node"`
+	To   string `json:"to_node"`
 }
 
 type DagModel struct {
@@ -39,13 +41,19 @@ type DagModel struct {
 	edges            []EdgeData
 	selectedIdx      int
 	lastError        error
+	viewport         viewport.Model
+	dirty            bool
 	orchestratorAddr string
 	Focused          bool
 }
 
 func NewDagModel(addr string) *DagModel {
+	vp := viewport.New(80, 10)
+	vp.SetContent("DAG is empty or initializing...")
 	return &DagModel{
 		orchestratorAddr: addr,
+		viewport:         vp,
+		dirty:            true,
 	}
 }
 
@@ -81,15 +89,7 @@ func (m *DagModel) fetchDagCmd() tea.Cmd {
 			return dagDataMsg{Err: err}
 		}
 
-		var resp struct {
-			Result struct {
-				Dag struct {
-					Nodes []NodeData `json:"nodes"`
-					Edges []EdgeData `json:"edges"`
-				} `json:"dag"`
-			} `json:"result"`
-			Error string `json:"error"`
-		}
+		var resp dagRPCResponse
 		decoder := json.NewDecoder(conn)
 		if err := decoder.Decode(&resp); err != nil {
 			return dagDataMsg{Err: err}
@@ -98,26 +98,44 @@ func (m *DagModel) fetchDagCmd() tea.Cmd {
 			return dagDataMsg{Err: fmt.Errorf("%s", resp.Error)}
 		}
 
-		return dagDataMsg{Nodes: resp.Result.Dag.Nodes, Edges: resp.Result.Dag.Edges}
+		nodes, edges, err := decodeDAGSnapshot(resp.Result)
+		if err != nil {
+			return dagDataMsg{Err: err}
+		}
+		return dagDataMsg{Nodes: nodes, Edges: edges}
 	}
 }
 
 func (m *DagModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.MouseMsg:
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.viewport.LineUp(3)
+			return m, nil
+		case tea.MouseButtonWheelDown:
+			m.viewport.LineDown(3)
+			return m, nil
+		}
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "up", "left":
 			if m.selectedIdx > 0 {
 				m.selectedIdx--
+				m.dirty = true
 			}
 		case "down", "right":
 			if m.selectedIdx < len(m.nodes)-1 {
 				m.selectedIdx++
+				m.dirty = true
 			}
 		}
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.viewport.Width = contentWidth(msg.Width, 4)
+		m.viewport.Height = contentHeight(msg.Height, 2)
+		m.dirty = true
 	case tickMsg:
 		return m, tea.Batch(m.tickCmd(), m.fetchDagCmd())
 	case dagDataMsg:
@@ -126,16 +144,35 @@ func (m *DagModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.nodes = msg.Nodes
 			m.edges = msg.Edges
 		}
+		m.dirty = true
 	}
 	return m, nil
 }
 
 func (m *DagModel) View() string {
+	if m.dirty {
+		m.renderDAG()
+		m.dirty = false
+	}
+	borderColor := lipgloss.Color("240")
+	if m.Focused {
+		borderColor = lipgloss.Color("205")
+	}
+	border := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(borderColor).
+		Width(contentWidth(m.width, 2))
+	return border.Render(m.viewport.View())
+}
+
+func (m *DagModel) renderDAG() {
 	if m.lastError != nil {
-		return wrapPlain(fmt.Sprintf("Error polling DAG: %v", m.lastError), contentWidth(m.width, 2))
+		m.viewport.SetContent(wrapPlain(fmt.Sprintf("Error polling DAG: %v", m.lastError), contentWidth(m.width, 4)))
+		return
 	}
 	if len(m.nodes) == 0 {
-		return "DAG is empty or initializing..."
+		m.viewport.SetContent("DAG is empty or initializing...")
+		return
 	}
 
 	// Flat deterministic sort for navigation
@@ -179,39 +216,33 @@ func (m *DagModel) View() string {
 		sb.WriteString(wrapPlain("    "+strings.Join(row, " -> "), contentWidth(m.width, 6)) + "\n\n")
 	}
 
-	graphOutput := sb.String()
-
 	// Selected Node Details Pane
-	var detailsOutput string
 	if selectedNode != nil {
 		detailsW := contentWidth(m.width, 6)
-		detailsOutput = fmt.Sprintf("ID: %s\nType: %s\nStatus: %s\nAssigned Agent: %s",
+		nodeType := selectedNode.Type
+		if nodeType == "" {
+			nodeType = selectedNode.DomainID
+		}
+		assignedAgent := selectedNode.AssignedAgent
+		if strings.TrimSpace(assignedAgent) == "" && strings.TrimSpace(selectedNode.DomainID) != "" {
+			assignedAgent = "agent-" + selectedNode.DomainID
+		}
+		if strings.TrimSpace(assignedAgent) == "" {
+			assignedAgent = "unassigned"
+		}
+		sb.WriteString("\nSelected Node\n\n")
+		sb.WriteString(fmt.Sprintf("ID: %s\nDomain: %s\nStatus: %s\nAssigned Agent: %s\n",
 			wrapPlain(selectedNode.ID, detailsW),
-			wrapPlain(selectedNode.Type, detailsW),
+			wrapPlain(nodeType, detailsW),
 			wrapPlain(selectedNode.Status, detailsW),
-			wrapPlain(selectedNode.AssignedAgent, detailsW))
+			wrapPlain(assignedAgent, detailsW)))
 	}
 
-	borderColor := lipgloss.Color("240")
-	if m.Focused {
-		borderColor = lipgloss.Color("205")
+	wasAtBottom := m.viewport.AtBottom()
+	m.viewport.SetContent(sb.String())
+	if wasAtBottom {
+		m.viewport.GotoBottom()
 	}
-
-	mainBox := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(borderColor).
-		Padding(0, 1).
-		Width(contentWidth(m.width, 2)).
-		Render(graphOutput)
-
-	detailsBox := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(borderColor).
-		Padding(0, 1).
-		Width(contentWidth(m.width, 2)).
-		Render(detailsOutput)
-
-	return lipgloss.JoinVertical(lipgloss.Left, mainBox, detailsBox)
 }
 
 func (m *DagModel) computeLayers() [][]NodeData {
@@ -260,6 +291,99 @@ func (m *DagModel) computeLayers() [][]NodeData {
 	}
 
 	return layers
+}
+
+type dagRPCResponse struct {
+	Result json.RawMessage `json:"result"`
+	Error  string          `json:"error"`
+}
+
+type dagSnapshotWire struct {
+	Dag struct {
+		Nodes []dagNodeWire `json:"nodes"`
+		Edges []dagEdgeWire `json:"edges"`
+	} `json:"dag"`
+	Nodes []dagNodeWire `json:"nodes"`
+	Edges []dagEdgeWire `json:"edges"`
+}
+
+type dagNodeWire struct {
+	ID            string      `json:"id"`
+	DomainID      string      `json:"domain_id"`
+	Type          string      `json:"type"`
+	Status        interface{} `json:"status"`
+	AssignedAgent string      `json:"assigned_agent"`
+}
+
+type dagEdgeWire struct {
+	From     string `json:"from"`
+	To       string `json:"to"`
+	FromNode string `json:"from_node"`
+	ToNode   string `json:"to_node"`
+}
+
+func decodeDAGSnapshot(raw json.RawMessage) ([]NodeData, []EdgeData, error) {
+	if len(raw) == 0 {
+		return nil, nil, nil
+	}
+	var snap dagSnapshotWire
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		return nil, nil, err
+	}
+	wireNodes := snap.Nodes
+	wireEdges := snap.Edges
+	if len(wireNodes) == 0 && len(snap.Dag.Nodes) > 0 {
+		wireNodes = snap.Dag.Nodes
+		wireEdges = snap.Dag.Edges
+	}
+
+	nodes := make([]NodeData, 0, len(wireNodes))
+	for _, node := range wireNodes {
+		nodes = append(nodes, NodeData{
+			ID:            node.ID,
+			DomainID:      node.DomainID,
+			Type:          node.Type,
+			Status:        normalizeNodeStatus(node.Status),
+			AssignedAgent: node.AssignedAgent,
+		})
+	}
+
+	edges := make([]EdgeData, 0, len(wireEdges))
+	for _, edge := range wireEdges {
+		from := edge.FromNode
+		if from == "" {
+			from = edge.From
+		}
+		to := edge.ToNode
+		if to == "" {
+			to = edge.To
+		}
+		edges = append(edges, EdgeData{From: from, To: to})
+	}
+	return nodes, edges, nil
+}
+
+func normalizeNodeStatus(status interface{}) string {
+	switch v := status.(type) {
+	case string:
+		if v != "" {
+			return v
+		}
+	case float64:
+		switch int(v) {
+		case 0:
+			return "Pending"
+		case 1:
+			return "InProgress"
+		case 2:
+			return "Done"
+		case 3:
+			return "Failed"
+		case 4:
+			return "Blocked"
+		}
+	}
+	return "Unknown"
 }
 
 func (m *DagModel) styleForStatus(status string) lipgloss.Style {

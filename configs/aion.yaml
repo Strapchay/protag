@@ -22,6 +22,10 @@ health:
 cgroups:
   # Enable cgroup resource limits (requires Linux + permissions)
   enabled: ${AION_CGROUPS_ENABLED}
+  # Cgroup management mode for the installed runtime
+  mode: ${AION_CGROUPS_MODE}
+  # Base cgroup subtree created by the install step or delegated runtime
+  base_path: ${AION_CGROUPS_BASE_PATH}
   # Memory limit per agent process group (MB)
   memory_max_mb: ${AION_CGROUPS_MEMORY_MAX_MB}
   # Max PIDs per agent process group

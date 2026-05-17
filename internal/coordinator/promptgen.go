@@ -17,22 +17,30 @@ type PromptData struct {
 }
 
 // GenerateSystemInstructions creates per-agent system prompts from a plan response.
-func GenerateSystemInstructions(plan *PlanResponse, projectContext string) (map[string]string, error) {
+func GenerateSystemInstructions(plan *PlanResponse, projectContext, buildSpec string) (map[string]string, error) {
 	prompts := make(map[string]string)
 
 	for _, domain := range plan.Domains {
-		prompt := buildDomainPrompt(domain, projectContext)
+		prompt := buildDomainPrompt(domain, projectContext, buildSpec)
 		prompts[domain.DomainID] = prompt
 	}
 
 	return prompts, nil
 }
 
-func buildDomainPrompt(domain Domain, projectContext string) string {
+func buildDomainPrompt(domain Domain, projectContext, buildSpec string) string {
 	var b strings.Builder
 
 	b.WriteString(fmt.Sprintf("# Domain Agent: %s\n\n", domain.DomainID))
 	b.WriteString(fmt.Sprintf("## Description\n%s\n\n", domain.Description))
+	b.WriteString("## Mission\n")
+	b.WriteString("Implement only the work assigned to your domain. Keep your changes inside the assigned paths and the node/task scope in the build spec.\n\n")
+
+	if strings.TrimSpace(buildSpec) != "" {
+		b.WriteString("## Build Spec\n")
+		b.WriteString(buildSpec)
+		b.WriteString("\n\n")
+	}
 
 	b.WriteString("## Assigned Paths\n")
 	for _, p := range domain.AssignedPaths {
@@ -42,8 +50,14 @@ func buildDomainPrompt(domain Domain, projectContext string) string {
 
 	b.WriteString("## Protocol\n")
 	b.WriteString("You are participating in a multi-agent orchestrated process.\n")
-	b.WriteString("Tasks will no longer be listed upfront. Instead, the Aion-Kernel Orchestrator will DISPATCH tasks to you dynamically over your JSON-RPC connection.\n")
-	b.WriteString("When you receive a `task_dispatch` follow-up, orient yourself, execute it, and then mark the target node as `Done` using the orchestrator-cli.\n")
+	b.WriteString("The orchestrator owns task allocation and coordination. Your job is to execute the domain scope, not to broaden it.\n")
+	b.WriteString("Use the loaded skills and workspace conventions for operational commands and coordination details; do not restate command syntax here.\n")
+	b.WriteString("- Report node progress through the coordination workflow defined by your skills.\n")
+	b.WriteString("- Communicate with the orchestrator when you need clarification, status updates, or a scope decision.\n")
+	b.WriteString("- Coordinate with other domain agents only when the task truly crosses ownership boundaries.\n")
+	b.WriteString("- If your work requires another domain to change files outside your scope, ask for a stub or a handoff instead of widening your own scope.\n")
+	b.WriteString("- Do not assume you have every Pi capability available. Stay within the supplied skills, your assigned domain scope, and the build spec.\n")
+	b.WriteString("When you receive a `task_dispatch` follow-up, orient yourself, execute it, and then complete the node using the coordination flow in your skills.\n")
 
 	if projectContext != "" {
 		b.WriteString("\n## Project Context\n")

@@ -95,6 +95,7 @@ kernel/
 ├── proto/                    # Protobuf service definitions
 ├── flatbuf/                  # FlatBuffer schema files
 ├── skills/                   # Pi Agent skills
+├── install/                  # systemd install templates and setup helpers
 ├── configs/                  # Configuration files
 └── test/                     # Integration tests & mocks
 ```

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -57,9 +58,11 @@ type HealthConfig struct {
 
 // CgroupsConfig configures cgroup resource limits.
 type CgroupsConfig struct {
-	Enabled     bool  `yaml:"enabled"`
-	MemoryMaxMB int64 `yaml:"memory_max_mb"`
-	PidsMax     int64 `yaml:"pids_max"`
+	Enabled     bool   `yaml:"enabled"`
+	Mode        string `yaml:"mode,omitempty"`
+	BasePath    string `yaml:"base_path,omitempty"`
+	MemoryMaxMB int64  `yaml:"memory_max_mb"`
+	PidsMax     int64  `yaml:"pids_max"`
 }
 
 // InferenceConfig configures LLM inference providers.
@@ -166,6 +169,8 @@ health:
 
 cgroups:
   enabled: true
+  mode: "${AION_CGROUPS_MODE}"
+  base_path: "${AION_CGROUPS_BASE_PATH}"
   memory_max_mb: 2048
   pids_max: 256
 
@@ -265,6 +270,12 @@ func applyDefaults(c *Config) {
 	if c.Cgroups.PidsMax == 0 {
 		c.Cgroups.PidsMax = 256
 	}
+	if c.Cgroups.Mode == "" {
+		c.Cgroups.Mode = "direct"
+	}
+	if c.Cgroups.BasePath == "" {
+		c.Cgroups.BasePath = "/sys/fs/cgroup/aion"
+	}
 	if c.Memory.Enabled {
 		if c.Memory.StorePath == "" {
 			c.Memory.StorePath = filepath.Join(filepath.Dir(c.Orchestrator.DagFile), "memory")
@@ -290,6 +301,11 @@ func validateConfig(c *Config) error {
 	}
 	if c.Agents.MaxAgents > 32 {
 		return fmt.Errorf("max_agents %d exceeds reasonable limit", c.Agents.MaxAgents)
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Cgroups.Mode)) {
+	case "", "direct", "systemd", "disabled":
+	default:
+		return fmt.Errorf("invalid cgroups.mode %q", c.Cgroups.Mode)
 	}
 	return nil
 }

@@ -19,13 +19,15 @@ import (
 
 // Allocator manages the spinning up and termination of domain agents.
 type Allocator struct {
-	config       *Config
-	projectRoot  string
-	hubRouter    *hub.Router
-	dagManager   *dag.Manager
-	activeAgents map[string]*supervisor.AgentSupervisor
-	mu           sync.Mutex
-	statusFn     func(text, level string) // optional: broadcasts to TUI status bar
+	config        *Config
+	projectRoot   string
+	hubRouter     *hub.Router
+	dagManager    *dag.Manager
+	activeAgents  map[string]*supervisor.AgentSupervisor
+	mu            sync.Mutex
+	statusFn      func(text, level string) // optional: broadcasts to TUI status bar
+	agentStatusFn func(agentID, text, level string)
+	broadcastFn   func(hub.Message)
 }
 
 // NewAllocator creates a new allocator.
@@ -42,6 +44,14 @@ func NewAllocator(config *Config, projectRoot string, hubRouter *hub.Router, dag
 // SetStatusFunc registers a callback for live status broadcasts.
 func (a *Allocator) SetStatusFunc(fn func(text, level string)) {
 	a.statusFn = fn
+}
+
+func (a *Allocator) SetAgentStatusFunc(fn func(agentID, text, level string)) {
+	a.agentStatusFn = fn
+}
+
+func (a *Allocator) SetBroadcastFunc(fn func(hub.Message)) {
+	a.broadcastFn = fn
 }
 
 func (a *Allocator) emitStatus(text, level string) {
@@ -132,7 +142,9 @@ func (a *Allocator) Allocate(ctx context.Context, domains []coordinator.Domain, 
 				Env:        envVars,
 			},
 			Cgroup: supervisor.CgroupConfig{
-				Enabled:        a.config.Cgroups.Enabled,
+				Enabled:        a.config.Cgroups.Enabled && strings.ToLower(strings.TrimSpace(a.config.Cgroups.Mode)) != "disabled",
+				Mode:           a.config.Cgroups.Mode,
+				BasePath:       a.config.Cgroups.BasePath,
 				AgentID:        agentID,
 				MemoryMaxBytes: a.config.Cgroups.MemoryMaxMB * 1024 * 1024,
 				PidsMax:        a.config.Cgroups.PidsMax,
@@ -143,8 +155,15 @@ func (a *Allocator) Allocate(ctx context.Context, domains []coordinator.Domain, 
 		}
 
 		agent := supervisor.NewAgentSupervisor(agentConfig)
-		if a.statusFn != nil {
+		if a.agentStatusFn != nil {
+			agent.SetStatusFunc(func(text, level string) {
+				a.agentStatusFn(agentID, text, level)
+			})
+		} else if a.statusFn != nil {
 			agent.SetStatusFunc(a.statusFn)
+		}
+		if a.broadcastFn != nil {
+			agent.SetBroadcastFunc(a.broadcastFn)
 		}
 		a.activeAgents[agentID] = agent
 
@@ -162,6 +181,30 @@ func (a *Allocator) Allocate(ctx context.Context, domains []coordinator.Domain, 
 
 	a.emitStatus(fmt.Sprintf("%d agent(s) allocated — awaiting task dispatch", len(domains)), "ok")
 	return nil
+}
+
+type AgentInfo struct {
+	AgentID  string `json:"agent_id"`
+	DomainID string `json:"domain_id"`
+	State    string `json:"state"`
+}
+
+func (a *Allocator) AgentInfos() []AgentInfo {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	infos := make([]AgentInfo, 0, len(a.activeAgents))
+	for agentID, agent := range a.activeAgents {
+		infos = append(infos, AgentInfo{
+			AgentID:  agentID,
+			DomainID: agent.DomainID(),
+			State:    agent.State().String(),
+		})
+	}
+	sort.Slice(infos, func(i, j int) bool {
+		return infos[i].AgentID < infos[j].AgentID
+	})
+	return infos
 }
 
 // StopAll terminates all managed agents.
@@ -300,7 +343,7 @@ func (a *Allocator) dispatchReadyTasks() {
 			b.WriteString("\n")
 		}
 		b.WriteString("\nExecute this task, then mark it Done using:\n")
-		b.WriteString(fmt.Sprintf("orchestrator-cli update-node --node-id %s --status Done\n", node.ID))
+		b.WriteString("the update flow defined in your loaded skills.\n")
 
 		msg := hub.Message{
 			ID:        fmt.Sprintf("dispatch-%s-%d", node.ID, time.Now().Unix()),

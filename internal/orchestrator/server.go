@@ -44,21 +44,23 @@ type Server struct {
 	stubRegistry *stub.Registry
 	memoryStore  memory.Store
 
-	hubCallback       func(hub.Message) // called when hub messages need routing
-	replanCb          func()
-	reviveCb          func(string) error
-	buildSpecCb       func(string) // called when user issues /build-spec
-	refineCb          func(string) // called when user sends message to orchestrator
-	retryCb           func() error
-	continueCb        func() error
-	resumeCb          func() error
-	statusCb          func() string
-	showSpecCb        func() (string, error)
-	resetCb           func() error
-	buildSpecStatusCb func() string
-	buildSpecPlanCb   func() (string, error)
-	buildSpecTraceCb  func() (string, error)
-	buildSpecCancelCb func() error
+	hubCallback         func(hub.Message) // called when hub messages need routing
+	replanCb            func()
+	reviveCb            func(string) error
+	buildSpecCb         func(string) // called when user issues /build-spec
+	refineCb            func(string) // called when user sends message to orchestrator
+	retryCb             func() error
+	continueCb          func() error
+	resumeCb            func() error
+	buildSpecContinueCb func() error
+	statusCb            func() string
+	showSpecCb          func() (string, error)
+	resetCb             func() error
+	buildSpecStatusCb   func() string
+	buildSpecPlanCb     func() (string, error)
+	buildSpecTraceCb    func() (string, error)
+	buildSpecCancelCb   func() error
+	agentListCb         func() []AgentInfo
 
 	listener   net.Listener
 	heartbeats map[string]int64 // agentID → last heartbeat unix ms
@@ -338,6 +340,10 @@ func (s *Server) handleRequest(req Request) Response {
 		return s.handleBuildSpecShowTrace(req)
 	case "build-spec-cancel":
 		return s.handleBuildSpecCancel(req)
+	case "build-spec-continue-agents":
+		return s.handleBuildSpecContinueAgents(req)
+	case "list-agents":
+		return s.handleListAgents(req)
 	case "trigger-replan":
 		return s.handleTriggerReplan(req)
 	case "revive-agent":
@@ -361,6 +367,10 @@ func (s *Server) SetArchitectContinueCallback(cb func() error) {
 
 func (s *Server) SetArchitectResumeCallback(cb func() error) {
 	s.resumeCb = cb
+}
+
+func (s *Server) SetBuildSpecContinueCallback(cb func() error) {
+	s.buildSpecContinueCb = cb
 }
 
 func (s *Server) SetArchitectStatusCallback(cb func() string) {
@@ -389,6 +399,10 @@ func (s *Server) SetBuildSpecTraceCallback(cb func() (string, error)) {
 
 func (s *Server) SetBuildSpecCancelCallback(cb func() error) {
 	s.buildSpecCancelCb = cb
+}
+
+func (s *Server) SetAgentListCallback(cb func() []AgentInfo) {
+	s.agentListCb = cb
 }
 
 func (s *Server) SetRuntimeSubsystems(dagManager *dag.Manager, lockManager *locking.Manager, stubRegistry *stub.Registry, memoryStore memory.Store) {
@@ -546,6 +560,24 @@ func (s *Server) handleBuildSpecCancel(req Request) Response {
 		return Response{ID: req.ID, Error: err.Error()}
 	}
 	return Response{ID: req.ID, Result: map[string]string{"status": "cancel_started"}}
+}
+
+func (s *Server) handleBuildSpecContinueAgents(req Request) Response {
+	if s.buildSpecContinueCb == nil {
+		return Response{ID: req.ID, Error: "build-spec continue callback not configured"}
+	}
+	if err := s.buildSpecContinueCb(); err != nil {
+		s.BroadcastStatus("Build-spec continue failed: "+err.Error(), "error")
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	return Response{ID: req.ID, Result: map[string]string{"status": "continue_started"}}
+}
+
+func (s *Server) handleListAgents(req Request) Response {
+	if s.agentListCb == nil {
+		return Response{ID: req.ID, Result: map[string][]AgentInfo{"agents": nil}}
+	}
+	return Response{ID: req.ID, Result: map[string][]AgentInfo{"agents": s.agentListCb()}}
 }
 
 func (s *Server) handleTriggerReplan(req Request) Response {

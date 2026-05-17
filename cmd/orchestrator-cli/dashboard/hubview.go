@@ -101,8 +101,17 @@ func (m *HubModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.viewport.Width = contentWidth(msg.Width, 4)
-		m.viewport.Height = msg.Height
+		m.viewport.Height = contentHeight(msg.Height, 3)
 		m.renderLines()
+	case tea.MouseMsg:
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.viewport.LineUp(3)
+			return m, nil
+		case tea.MouseButtonWheelDown:
+			m.viewport.LineDown(3)
+			return m, nil
+		}
 	case hubEventMsg:
 		m.connected = true
 		// Parse the raw hub message

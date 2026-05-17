@@ -14,6 +14,7 @@ func TestArchitectCommandHandlers(t *testing.T) {
 	retryCalled := false
 	continueCalled := false
 	resumeCalled := false
+	continueAgentsCalled := false
 	resetCalled := false
 	s.SetArchitectStatusCallback(func() string { return "status=awaiting_user" })
 	s.SetArchitectRetryCallback(func() error {
@@ -26,6 +27,10 @@ func TestArchitectCommandHandlers(t *testing.T) {
 	})
 	s.SetArchitectResumeCallback(func() error {
 		resumeCalled = true
+		return nil
+	})
+	s.SetBuildSpecContinueCallback(func() error {
+		continueAgentsCalled = true
 		return nil
 	})
 	s.SetArchitectShowSpecCallback(func() (string, error) { return "# Spec", nil })
@@ -49,7 +54,10 @@ func TestArchitectCommandHandlers(t *testing.T) {
 	if resp := s.handleRequest(Request{ID: "5", Method: "architect-show-spec"}); resp.Error != "" {
 		t.Fatalf("architect-show-spec error: %s", resp.Error)
 	}
-	if resp := s.handleRequest(Request{ID: "6", Method: "architect-reset"}); resp.Error != "" || !resetCalled {
+	if resp := s.handleRequest(Request{ID: "6", Method: "build-spec-continue-agents"}); resp.Error != "" || !continueAgentsCalled {
+		t.Fatalf("build-spec-continue-agents resp=%#v called=%v", resp, continueAgentsCalled)
+	}
+	if resp := s.handleRequest(Request{ID: "7", Method: "architect-reset"}); resp.Error != "" || !resetCalled {
 		t.Fatalf("architect-reset resp=%#v called=%v", resp, resetCalled)
 	}
 }

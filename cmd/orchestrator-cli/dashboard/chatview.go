@@ -54,6 +54,8 @@ var architectCommands = []architectCommand{
 	{Name: "/resume", Description: "reconcile live Architect context from persisted session state"},
 	{Name: "/retry", Description: "retry the last safe failed/timed-out Architect request"},
 	{Name: "/continue", Description: "ask the Architect to continue from current restored context"},
+	{Name: "/continue-agents", Description: "resume persisted domain agents after build-spec allocation"},
+	{Name: "/resume-agents", Description: "alias for /continue-agents"},
 	{Name: "/show-spec", Description: "show docs/build_spec.md"},
 	{Name: "/show-plan", Description: "show the current build-spec plan"},
 	{Name: "/show-build-spec-trace", Description: "show the current build-spec planning trace"},
@@ -578,6 +580,10 @@ func (m *ChatModel) executeCommand(cmdStr string) {
 		params = map[string]interface{}{}
 	case "/resume":
 		methodName = "architect-resume"
+		params = map[string]interface{}{}
+		showResponse = true
+	case "/continue-agents", "/resume-agents", "/countine-agents":
+		methodName = "build-spec-continue-agents"
 		params = map[string]interface{}{}
 		showResponse = true
 	case "/status":

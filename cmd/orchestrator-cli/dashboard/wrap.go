@@ -17,6 +17,13 @@ func contentWidth(width, paddingAndBorder int) int {
 	return clampWidth(width - paddingAndBorder)
 }
 
+func contentHeight(height, frame int) int {
+	if height-frame < 1 {
+		return 1
+	}
+	return height - frame
+}
+
 func wrapPlain(text string, width int) string {
 	width = clampWidth(width)
 	var out []string

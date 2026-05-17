@@ -207,6 +207,10 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 		return resumable.Resume(daemon.ctx)
 	})
 
+	server.SetBuildSpecContinueCallback(func() error {
+		return daemon.continueBuildSpecAgents()
+	})
+
 	server.SetArchitectStatusCallback(func() string {
 		statusable, ok := daemon.coordinator.(interface{ SessionStatus() string })
 		if !ok {
@@ -276,13 +280,34 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	server.SetBuildSpecCancelCallback(func() error {
 		return daemon.cancelBuildSpecAttempt()
 	})
-
-	// Wire the allocator status callback to the server's broadcast mechanism.
-	alloc.SetStatusFunc(func(text, level string) {
-		server.BroadcastStatus(text, level)
+	server.SetAgentListCallback(func() []AgentInfo {
+		infos := []AgentInfo{{
+			AgentID:  "coordinator",
+			DomainID: "coordinator",
+			State:    "Available",
+		}}
+		infos = append(infos, daemon.allocator.AgentInfos()...)
+		return infos
 	})
 
+	daemon.configureAllocatorCallbacks()
+
 	return daemon, nil
+}
+
+func (d *Daemon) configureAllocatorCallbacks() {
+	if d == nil || d.allocator == nil || d.server == nil {
+		return
+	}
+	d.allocator.SetStatusFunc(func(text, level string) {
+		d.server.BroadcastStatus(text, level)
+	})
+	d.allocator.SetAgentStatusFunc(func(agentID, text, level string) {
+		d.server.BroadcastAgentStatus(agentID, text, level)
+	})
+	d.allocator.SetBroadcastFunc(func(msg hub.Message) {
+		d.server.BroadcastHubEvent(msg)
+	})
 }
 
 func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunState) *coordinator.PiCoordinator {
@@ -335,6 +360,13 @@ func (d *Daemon) Start() error {
 	if addr := d.server.Addr(); addr != "" {
 		if err := writeServerInfo(d.projectRoot, d.runState, addr); err != nil {
 			log.Printf("daemon: failed to write server info: %v", err)
+		}
+	}
+
+	if attempt, err := loadBuildSpecAttempt(d.runState.Root); err == nil && attempt != nil {
+		switch attempt.Status {
+		case BuildSpecAttemptActive, BuildSpecAttemptAllocating, BuildSpecAttemptPlanning, BuildSpecAttemptCommitting:
+			d.server.BroadcastStatus("Persisted build-spec attempt loaded. Issue /continue-agents to resume domain work.", "info")
 		}
 	}
 
@@ -587,7 +619,7 @@ func (d *Daemon) SubmitWork(ctx context.Context, userPrompt string) error {
 
 	log.Printf("daemon: generating initial system instructions")
 	d.server.BroadcastStatus("Generating agent system instructions...", "info")
-	prompts, err := coordinator.GenerateSystemInstructions(plan, "")
+	prompts, err := coordinator.GenerateSystemInstructions(plan, "", userPrompt)
 	if err != nil {
 		return fmt.Errorf("daemon: generate prompts failed: %w", err)
 	}

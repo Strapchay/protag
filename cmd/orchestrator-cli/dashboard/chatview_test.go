@@ -10,7 +10,7 @@ import (
 
 func TestArchitectCommandHelpIncludesResilienceCommands(t *testing.T) {
 	help := architectCommandHelp()
-	for _, want := range []string{"/resume", "/retry", "/continue", "/show-spec", "/show-plan", "/show-build-spec-trace", "/coordinator-status", "/clear", "/reset-session"} {
+	for _, want := range []string{"/resume", "/retry", "/continue", "/continue-agents", "/show-spec", "/show-plan", "/show-build-spec-trace", "/coordinator-status", "/clear", "/reset-session"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %s:\n%s", want, help)
 		}

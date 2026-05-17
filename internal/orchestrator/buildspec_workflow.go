@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"time"
 
 	"aion-kernel/internal/coordinator"
@@ -185,7 +187,7 @@ func (d *Daemon) executeBuildSpecAttempt(ctx context.Context, attempt *BuildSpec
 
 	log.Printf("daemon: generating initial system instructions")
 	d.server.BroadcastAgentStatus("coordinator", "Coordinator is generating agent system instructions...", "info")
-	prompts, err := coordinator.GenerateSystemInstructions(plan, "")
+	prompts, err := coordinator.GenerateSystemInstructions(plan, "", string(specData))
 	if err != nil {
 		return fmt.Errorf("generate prompts failed: %w", err)
 	}
@@ -349,11 +351,62 @@ func (d *Daemon) resetBuildSpecArtifactsLocked() error {
 	}
 	d.dagManager = dagMgr
 	d.allocator = NewAllocator(d.config, d.projectRoot, d.hubRouter, dagMgr)
-	d.allocator.SetStatusFunc(func(text, level string) {
-		d.server.BroadcastStatus(text, level)
-	})
+	d.configureAllocatorCallbacks()
 	d.server.SetRuntimeSubsystems(dagMgr, d.lockManager, d.stubRegistry, d.memoryStore)
 	d.server.ClearHubHistory()
+	return nil
+}
+
+func (d *Daemon) continueBuildSpecAgents() error {
+	attempt, err := loadBuildSpecAttempt(d.runState.Root)
+	if err != nil {
+		return fmt.Errorf("load build-spec attempt: %w", err)
+	}
+	if attempt == nil {
+		return fmt.Errorf("no persisted build-spec attempt to continue")
+	}
+	if attempt.Status != BuildSpecAttemptActive && attempt.Status != BuildSpecAttemptAllocating {
+		return fmt.Errorf("build-spec agents are only resumable after allocation has started")
+	}
+	return d.resumeActiveBuildSpecAgents(attempt)
+}
+
+func (d *Daemon) resumeActiveBuildSpecAgents(attempt *BuildSpecAttempt) error {
+	if attempt == nil || attempt.Plan == nil {
+		return nil
+	}
+	if attempt.Status != BuildSpecAttemptActive && attempt.Status != BuildSpecAttemptAllocating {
+		return nil
+	}
+	if len(attempt.Plan.Domains) == 0 {
+		return nil
+	}
+	if len(d.allocator.AgentInfos()) > 0 {
+		return nil
+	}
+
+	_ = appendBuildSpecTrace(d.runState.Root, fmt.Sprintf("resuming build-spec agents from persisted attempt %s", attempt.AttemptID))
+	d.server.BroadcastAgentStatus("coordinator", "Resuming persisted build-spec domain agents...", "info")
+
+	specText, err := os.ReadFile(filepath.Join(d.projectRoot, "docs", "build_spec.md"))
+	if err != nil {
+		return fmt.Errorf("read build spec for resumed agents: %w", err)
+	}
+	prompts, err := coordinator.GenerateSystemInstructions(attempt.Plan, "", string(specText))
+	if err != nil {
+		return fmt.Errorf("generate resumed prompts: %w", err)
+	}
+	if err := d.allocator.Allocate(d.ctx, attempt.Plan.Domains, prompts); err != nil {
+		return fmt.Errorf("allocate resumed agents: %w", err)
+	}
+	if attempt.Status == BuildSpecAttemptAllocating {
+		attempt.Status = BuildSpecAttemptActive
+		attempt.FailureReason = ""
+		now := time.Now().UTC()
+		attempt.CompletedAt = &now
+		_ = saveBuildSpecAttempt(d.runState.Root, attempt)
+	}
+	d.server.BroadcastAgentStatus("coordinator", "Persisted build-spec agents resumed.", "ok")
 	return nil
 }
 

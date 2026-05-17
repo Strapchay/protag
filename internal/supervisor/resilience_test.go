@@ -44,7 +44,7 @@ func TestSupervisorResilienceNetworkFault(t *testing.T) {
 
 	netEvent := PiAgentEvent{
 		Type:    "tool_error",
-		Message: "dial tcp 10.0.0.1:443: connect: ECONNRESET",
+		Message: json.RawMessage(`"dial tcp 10.0.0.1:443: connect: ECONNRESET"`),
 	}
 
 	// Send the fault event. Without an active PiAgentProcess, this is just a
@@ -73,7 +73,7 @@ func TestSupervisorLoopBreakerFileModified(t *testing.T) {
 	}
 
 	// File modification resets the loop heuristic safely
-	s.handleEvent(PiAgentEvent{Type: "file_modified", Message: "saved auth.go"})
+	s.handleEvent(PiAgentEvent{Type: "file_modified", Message: json.RawMessage(`"saved auth.go"`)})
 
 	if len(s.recentTools) != 0 {
 		t.Fatalf("expected clear after file_modified, got %d", len(s.recentTools))

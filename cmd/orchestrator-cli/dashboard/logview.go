@@ -6,6 +6,7 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"time"
 
 	"aion-kernel/internal/hub"
 
@@ -27,6 +28,19 @@ type MultiLogModel struct {
 	height      int
 	Focused     bool
 	input       textarea.Model
+}
+
+type agentListTickMsg struct{}
+
+type agentListMsg struct {
+	Agents []agentListItem
+	Err    error
+}
+
+type agentListItem struct {
+	AgentID  string `json:"agent_id"`
+	DomainID string `json:"domain_id"`
+	State    string `json:"state"`
 }
 
 type agentTraceMeta struct {
@@ -60,7 +74,46 @@ func (m *MultiLogModel) Init() tea.Cmd {
 		textarea.Blink,
 		m.startStreamCmd(),
 		m.readNextCmd(),
+		m.fetchAgentsCmd(),
+		m.agentListTickCmd(),
 	)
+}
+
+func (m *MultiLogModel) agentListTickCmd() tea.Cmd {
+	return tea.Tick(3*time.Second, func(time.Time) tea.Msg {
+		return agentListTickMsg{}
+	})
+}
+
+func (m *MultiLogModel) fetchAgentsCmd() tea.Cmd {
+	return func() tea.Msg {
+		reqBytes, _ := json.Marshal(map[string]interface{}{
+			"method": "list-agents",
+			"id":     "agents-list-1",
+			"params": map[string]interface{}{},
+		})
+		conn, err := net.Dial("tcp", m.addr)
+		if err != nil {
+			return agentListMsg{Err: err}
+		}
+		defer conn.Close()
+		if _, err := conn.Write(reqBytes); err != nil {
+			return agentListMsg{Err: err}
+		}
+		var resp struct {
+			Result struct {
+				Agents []agentListItem `json:"agents"`
+			} `json:"result"`
+			Error string `json:"error"`
+		}
+		if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+			return agentListMsg{Err: err}
+		}
+		if resp.Error != "" {
+			return agentListMsg{Err: fmt.Errorf("%s", resp.Error)}
+		}
+		return agentListMsg{Agents: resp.Result.Agents}
+	}
 }
 
 func (m *MultiLogModel) startStreamCmd() tea.Cmd {
@@ -148,6 +201,18 @@ func (m *MultiLogModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewports[id] = vp
 		}
 
+	case tea.MouseMsg:
+		if len(m.agents) > 0 {
+			switch msg.Button {
+			case tea.MouseButtonWheelUp:
+				m.scrollActive(-3)
+				return m, nil
+			case tea.MouseButtonWheelDown:
+				m.scrollActive(3)
+				return m, nil
+			}
+		}
+
 	case tea.KeyMsg:
 		if msg.String() == "esc" {
 			if m.input.Focused() {
@@ -155,6 +220,15 @@ func (m *MultiLogModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.input.Focus()
+			return m, nil
+		}
+
+		switch msg.String() {
+		case "left":
+			m.PrevAgent()
+			return m, nil
+		case "right":
+			m.NextAgent()
 			return m, nil
 		}
 
@@ -168,12 +242,20 @@ func (m *MultiLogModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.syncInputSize()
 				return m, nil
 			}
+			switch msg.String() {
+			case "pgup", "alt+up", "ctrl+up":
+				m.scrollActive(-5)
+				return m, nil
+			case "pgdown", "pgdn", "alt+down", "ctrl+down":
+				m.scrollActive(5)
+				return m, nil
+			}
 		} else {
 			switch msg.String() {
-			case "left", "h":
+			case "h":
 				m.PrevAgent()
 				return m, nil
-			case "right", "l":
+			case "l":
 				m.NextAgent()
 				return m, nil
 			case "up":
@@ -185,12 +267,13 @@ func (m *MultiLogModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			case "down":
-				if len(m.agents) > 0 {
-					activeID := m.agents[m.activeIdx]
-					vp := m.viewports[activeID]
-					vp.LineDown(1)
-					m.viewports[activeID] = vp
-				}
+				m.scrollActive(1)
+				return m, nil
+			case "pgup":
+				m.scrollActive(-5)
+				return m, nil
+			case "pgdown", "pgdn":
+				m.scrollActive(5)
 				return m, nil
 			}
 		}
@@ -203,25 +286,32 @@ func (m *MultiLogModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case StatusMsg:
 		cmds = append(cmds, m.readNextCmd())
 
+	case agentListTickMsg:
+		cmds = append(cmds, m.fetchAgentsCmd(), m.agentListTickCmd())
+
+	case agentListMsg:
+		if msg.Err == nil {
+			for _, agent := range msg.Agents {
+				m.ensureAgent(agent.AgentID)
+				meta := m.agentMeta[agent.AgentID]
+				meta.LastKind = "status"
+				meta.LastStatus = strings.TrimSpace(agent.State)
+				meta.LastLevel = "info"
+				m.agentMeta[agent.AgentID] = meta
+			}
+		}
+
 	case tuiEventMsg:
 		if msg.Audience != tuiAudienceLogs {
 			cmds = append(cmds, m.readNextCmd())
 			return m, tea.Batch(cmds...)
 		}
 		id := msg.AgentID
-		if _, exists := m.viewports[id]; !exists {
-			previousActive := m.activeAgentID()
-			m.agents = append(m.agents, id)
-			sort.Strings(m.agents)
-			if previousActive != "" {
-				m.activeIdx = indexOfString(m.agents, previousActive)
-				if m.activeIdx < 0 {
-					m.activeIdx = 0
-				}
-			}
-			vp := viewport.New(contentWidth(m.width, 4), m.transcriptHeight())
-			m.viewports[id] = vp
+		if !isDisplayAgent(id) {
+			cmds = append(cmds, m.readNextCmd())
+			return m, tea.Batch(cmds...)
 		}
+		m.ensureAgent(id)
 
 		m.agentOutput[id] = append(m.agentOutput[id], formatLogEvent(msg))
 		if len(m.agentOutput[id]) > 500 {
@@ -248,12 +338,73 @@ func (m *MultiLogModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
+func isDisplayAgent(agentID string) bool {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return false
+	}
+	if agentID == "user" || agentID == "orchestrator" || agentID == "context_prompt" || agentID == "system" {
+		return false
+	}
+	return agentID == "coordinator" || agentID == "architect" || strings.HasPrefix(agentID, "agent-")
+}
+
+func (m *MultiLogModel) ensureAgent(id string) {
+	if !isDisplayAgent(id) {
+		return
+	}
+	if _, exists := m.viewports[id]; exists {
+		return
+	}
+	previousActive := m.activeAgentID()
+	m.agents = append(m.agents, id)
+	sort.SliceStable(m.agents, func(i, j int) bool {
+		return agentSortRank(m.agents[i]) < agentSortRank(m.agents[j]) ||
+			(agentSortRank(m.agents[i]) == agentSortRank(m.agents[j]) && m.agents[i] < m.agents[j])
+	})
+	if previousActive != "" {
+		m.activeIdx = indexOfString(m.agents, previousActive)
+		if m.activeIdx < 0 {
+			m.activeIdx = 0
+		}
+	}
+	vp := viewport.New(contentWidth(m.width, 4), m.transcriptHeight())
+	m.viewports[id] = vp
+}
+
+func agentSortRank(agentID string) int {
+	switch agentID {
+	case "coordinator":
+		return 0
+	case "architect":
+		return 1
+	}
+	if strings.HasPrefix(agentID, "agent-") {
+		return 2
+	}
+	return 3
+}
+
 func (m *MultiLogModel) transcriptHeight() int {
-	h := m.height - 8
-	if h < 4 {
-		h = 4
+	h := m.height - m.input.Height() - 7
+	if h < 1 {
+		h = 1
 	}
 	return h
+}
+
+func (m *MultiLogModel) scrollActive(delta int) {
+	if len(m.agents) == 0 {
+		return
+	}
+	activeID := m.agents[m.activeIdx]
+	vp := m.viewports[activeID]
+	if delta < 0 {
+		vp.LineUp(-delta)
+	} else if delta > 0 {
+		vp.LineDown(delta)
+	}
+	m.viewports[activeID] = vp
 }
 
 func (m *MultiLogModel) syncInputSize() {
@@ -312,7 +463,7 @@ func (m *MultiLogModel) sendActiveAgentMessage() error {
 		return err
 	}
 	if resp.Error != "" {
-		return fmt.Errorf(resp.Error)
+		return fmt.Errorf("%s", resp.Error)
 	}
 
 	m.appendSystemLine("sent to " + activeID + ": " + text)
@@ -425,7 +576,7 @@ func (m *MultiLogModel) View() string {
 				sb.WriteString("\n")
 			}
 		}
-		scrollbar = "\n" + sb.String()
+		scrollbar = sb.String()
 	}
 
 	inputBorder := lipgloss.NewStyle().
@@ -434,6 +585,10 @@ func (m *MultiLogModel) View() string {
 		Width(contentWidth(m.width, 2)).
 		Render(m.input.View())
 
-	content := border.Render(vpView + scrollbar)
+	content := vpView
+	if scrollbar != "" {
+		content = lipgloss.JoinHorizontal(lipgloss.Top, vpView, scrollbar)
+	}
+	content = border.Render(content)
 	return strings.Join([]string{strings.Join(tabs, " "), header, content, inputBorder}, "\n")
 }
