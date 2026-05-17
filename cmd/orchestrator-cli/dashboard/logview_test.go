@@ -1,9 +1,11 @@
 package dashboard
 
 import (
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 func TestAgentsPaneFiltersNonAgentParticipants(t *testing.T) {
@@ -72,5 +74,33 @@ func TestAgentsPaneArrowNavigationWorksWhileFocused(t *testing.T) {
 	m = updated.(*MultiLogModel)
 	if m.activeAgentID() != "coordinator" {
 		t.Fatalf("left arrow should move back to coordinator, got %q", m.activeAgentID())
+	}
+}
+
+func TestAgentsPaneKeepsActiveTabVisibleWhenOverflowing(t *testing.T) {
+	m := NewMultiLogModel("127.0.0.1:0")
+	m.Update(tea.WindowSizeMsg{Width: 40, Height: 24})
+	agents := []agentListItem{
+		{AgentID: "coordinator", DomainID: "coordinator", State: "Available"},
+		{AgentID: "agent-a", DomainID: "a", State: "Running"},
+		{AgentID: "agent-b", DomainID: "b", State: "Running"},
+		{AgentID: "agent-c", DomainID: "c", State: "Running"},
+		{AgentID: "agent-d", DomainID: "d", State: "Running"},
+		{AgentID: "agent-e", DomainID: "e", State: "Running"},
+	}
+	updated, _ := m.Update(agentListMsg{Agents: agents})
+	m = updated.(*MultiLogModel)
+	m.activeIdx = len(m.agents) - 1
+
+	view := m.View()
+	lines := strings.Split(view, "\n")
+	if len(lines) == 0 {
+		t.Fatal("empty view")
+	}
+	if got := lipgloss.Width(lines[0]); got > 40 {
+		t.Fatalf("tab line exceeds width: %d > 40\n%s", got, lines[0])
+	}
+	if !strings.Contains(lines[0], "agent-e") {
+		t.Fatalf("active agent should remain visible: %s", lines[0])
 	}
 }

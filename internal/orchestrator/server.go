@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +45,7 @@ type Server struct {
 	lockManager  *locking.Manager
 	stubRegistry *stub.Registry
 	memoryStore  memory.Store
+	logsDir      string
 
 	hubCallback         func(hub.Message) // called when hub messages need routing
 	replanCb            func()
@@ -85,6 +88,13 @@ func NewServer(
 	}
 }
 
+// SetLogsDir configures the directory used to persist hub history.
+func (s *Server) SetLogsDir(dir string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.logsDir = dir
+}
+
 // SetHubCallback sets the function called when hub messages need routing.
 func (s *Server) SetHubCallback(cb func(hub.Message)) {
 	s.hubCallback = cb
@@ -103,6 +113,7 @@ func (s *Server) SetBuildSpecCallback(cb func(string)) {
 }
 
 func (s *Server) BroadcastHubEvent(msg hub.Message) {
+	s.appendHubEventToDisk(msg)
 	s.mu.Lock()
 	s.hubHistory = append(s.hubHistory, msg)
 	if len(s.hubHistory) > 500 {
@@ -122,10 +133,93 @@ func (s *Server) BroadcastHubEvent(msg hub.Message) {
 	}
 }
 
+func (s *Server) appendHubEventToDisk(msg hub.Message) {
+	s.mu.RLock()
+	logsDir := s.logsDir
+	s.mu.RUnlock()
+	if strings.TrimSpace(logsDir) == "" {
+		return
+	}
+	path := filepath.Join(logsDir, "hub_history.jsonl")
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.Write(append(data, '\n'))
+}
+
+func (s *Server) loadHubHistory() []hub.Message {
+	s.mu.RLock()
+	logsDir := s.logsDir
+	s.mu.RUnlock()
+	if strings.TrimSpace(logsDir) == "" {
+		s.mu.RLock()
+		history := append([]hub.Message(nil), s.hubHistory...)
+		s.mu.RUnlock()
+		return history
+	}
+	path := filepath.Join(logsDir, "hub_history.jsonl")
+	f, err := os.Open(path)
+	if err != nil {
+		s.mu.RLock()
+		history := append([]hub.Message(nil), s.hubHistory...)
+		s.mu.RUnlock()
+		return history
+	}
+	defer f.Close()
+
+	var history []hub.Message
+	scanner := bufio.NewScanner(f)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+	for scanner.Scan() {
+		var msg hub.Message
+		if err := json.Unmarshal(scanner.Bytes(), &msg); err == nil {
+			history = append(history, msg)
+		}
+	}
+	if len(history) > 0 {
+		return history
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]hub.Message(nil), s.hubHistory...)
+}
+
 // BroadcastStatus emits a SystemStatus message to all TUI subscribers.
 // level is one of "info", "warn", "error", "ok".
 func (s *Server) BroadcastStatus(text, level string) {
 	s.BroadcastAgentStatus("orchestrator", text, level)
+}
+
+// BroadcastTransientStatus emits a SystemStatus message without persisting it
+// in hub history. This is for startup-only notices that should not replay.
+func (s *Server) BroadcastTransientStatus(text, level string) {
+	payload, _ := json.Marshal(hub.SystemStatusPayload{Text: text, Level: level})
+	msg := hub.Message{
+		ID:        fmt.Sprintf("sys-%d", time.Now().UnixNano()),
+		Type:      hub.MsgSystemStatus,
+		FromAgent: "orchestrator",
+		Payload:   payload,
+		Timestamp: time.Now(),
+	}
+	s.mu.RLock()
+	subs := make([]chan hub.Message, 0, len(s.hubSubs))
+	for ch := range s.hubSubs {
+		subs = append(subs, ch)
+	}
+	s.mu.RUnlock()
+	for _, ch := range subs {
+		select {
+		case ch <- msg:
+		default:
+		}
+	}
 }
 
 func (s *Server) BroadcastAgentStatus(agentID, text, level string) {
@@ -224,7 +318,6 @@ func (s *Server) handleTailHubEvents(req Request, encoder *json.Encoder, conn ne
 	ch := make(chan hub.Message, 100)
 	s.mu.Lock()
 	s.hubSubs[ch] = struct{}{}
-	history := append([]hub.Message(nil), s.hubHistory...)
 	s.mu.Unlock()
 
 	defer func() {
@@ -233,7 +326,7 @@ func (s *Server) handleTailHubEvents(req Request, encoder *json.Encoder, conn ne
 		s.mu.Unlock()
 	}()
 
-	for _, msg := range history {
+	for _, msg := range s.loadHubHistory() {
 		if err := encoder.Encode(msg); err != nil {
 			return
 		}
@@ -264,7 +357,6 @@ func (s *Server) handleTailAgentLogs(req Request, encoder *json.Encoder, conn ne
 	ch := make(chan hub.Message, 100)
 	s.mu.Lock()
 	s.hubSubs[ch] = struct{}{}
-	history := append([]hub.Message(nil), s.hubHistory...)
 	s.mu.Unlock()
 
 	defer func() {
@@ -273,7 +365,7 @@ func (s *Server) handleTailAgentLogs(req Request, encoder *json.Encoder, conn ne
 		s.mu.Unlock()
 	}()
 
-	for _, msg := range history {
+	for _, msg := range s.loadHubHistory() {
 		if msg.FromAgent == params.AgentID || msg.ToAgent == params.AgentID {
 			if err := encoder.Encode(msg); err != nil {
 				return

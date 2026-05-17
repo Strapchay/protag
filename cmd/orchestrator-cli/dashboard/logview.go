@@ -21,8 +21,11 @@ type MultiLogModel struct {
 	viewports   map[string]viewport.Model
 	agentOutput map[string][]string
 	agentMeta   map[string]agentTraceMeta
+	renderCache map[string]string
+	renderDirty map[string]bool
 	agents      []string
 	activeIdx   int
+	tabStartIdx int
 	eventCh     chan tea.Msg
 	width       int
 	height      int
@@ -64,6 +67,8 @@ func NewMultiLogModel(addr string) *MultiLogModel {
 		viewports:   make(map[string]viewport.Model),
 		agentOutput: make(map[string][]string),
 		agentMeta:   make(map[string]agentTraceMeta),
+		renderCache: make(map[string]string),
+		renderDirty: make(map[string]bool),
 		eventCh:     make(chan tea.Msg, 100),
 		input:       ti,
 	}
@@ -194,6 +199,9 @@ func (m *MultiLogModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.syncInputSize()
+		for id := range m.viewports {
+			m.renderDirty[id] = true
+		}
 		for id, vp := range m.viewports {
 			vp.Width = contentWidth(m.width, 4)
 			vp.Height = m.transcriptHeight()
@@ -317,6 +325,7 @@ func (m *MultiLogModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.agentOutput[id]) > 500 {
 			m.agentOutput[id] = m.agentOutput[id][len(m.agentOutput[id])-500:]
 		}
+		m.renderDirty[id] = true
 
 		meta := m.agentMeta[id]
 		meta.LastKind = msg.Kind
@@ -370,6 +379,7 @@ func (m *MultiLogModel) ensureAgent(id string) {
 	}
 	vp := viewport.New(contentWidth(m.width, 4), m.transcriptHeight())
 	m.viewports[id] = vp
+	m.ensureActiveTabVisible()
 }
 
 func agentSortRank(agentID string) int {
@@ -485,18 +495,25 @@ func (m *MultiLogModel) appendSystemLine(text string) {
 		m.viewports[id] = viewport.New(contentWidth(m.width, 4), m.transcriptHeight())
 	}
 	m.agentOutput[id] = append(m.agentOutput[id], text)
+	m.renderDirty[id] = true
 	vp := m.viewports[id]
 	vp.SetContent(m.renderAgentOutput(id, vp.Width))
 	m.viewports[id] = vp
 }
 
 func (m *MultiLogModel) renderAgentOutput(id string, width int) string {
+	if cached, ok := m.renderCache[id]; ok && !m.renderDirty[id] {
+		return cached
+	}
 	wrapWidth := contentWidth(width, 2)
 	var wrappedLines []string
 	for _, rawLine := range m.agentOutput[id] {
 		wrappedLines = append(wrappedLines, wrapPlain(rawLine, wrapWidth))
 	}
-	return strings.Join(wrappedLines, "\n")
+	rendered := strings.Join(wrappedLines, "\n")
+	m.renderCache[id] = rendered
+	m.renderDirty[id] = false
+	return rendered
 }
 
 func formatLogEvent(msg tuiEventMsg) string {
@@ -531,18 +548,7 @@ func (m *MultiLogModel) View() string {
 	activeID := m.agents[m.activeIdx]
 	vp := m.viewports[activeID]
 	meta := m.agentMeta[activeID]
-
-	var tabs []string
-	for i, id := range m.agents {
-		label := truncateToWidth(id, 18)
-		style := lipgloss.NewStyle().Padding(0, 1)
-		if i == m.activeIdx {
-			style = style.Background(lipgloss.Color("39")).Foreground(lipgloss.Color("255")).Bold(true)
-		} else {
-			style = style.Background(lipgloss.Color("236")).Foreground(lipgloss.Color("248"))
-		}
-		tabs = append(tabs, style.Render(label))
-	}
+	tabs := m.renderAgentTabs(contentWidth(m.width, 2))
 
 	header := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("255")).
@@ -590,5 +596,122 @@ func (m *MultiLogModel) View() string {
 		content = lipgloss.JoinHorizontal(lipgloss.Top, vpView, scrollbar)
 	}
 	content = border.Render(content)
-	return strings.Join([]string{strings.Join(tabs, " "), header, content, inputBorder}, "\n")
+	return strings.Join([]string{tabs, header, content, inputBorder}, "\n")
+}
+
+func (m *MultiLogModel) renderAgentTabs(maxWidth int) string {
+	if len(m.agents) == 0 {
+		return ""
+	}
+
+	tabFor := func(id string, selected bool) string {
+		label := truncateToWidth(id, 18)
+		style := lipgloss.NewStyle().Padding(0, 1)
+		if selected {
+			style = style.Background(lipgloss.Color("39")).Foreground(lipgloss.Color("255")).Bold(true)
+		} else {
+			style = style.Background(lipgloss.Color("236")).Foreground(lipgloss.Color("248"))
+		}
+		return style.Render(label)
+	}
+
+	tabs := make([]string, len(m.agents))
+	widths := make([]int, len(m.agents))
+	for i, id := range m.agents {
+		tabs[i] = tabFor(id, i == m.activeIdx)
+		widths[i] = lipgloss.Width(tabs[i])
+	}
+
+	ellipsis := lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render("…")
+	ellipsisW := lipgloss.Width(ellipsis)
+	spacerW := 1
+
+	start := m.tabStartIdx
+	if start < 0 {
+		start = 0
+	}
+	if start > m.activeIdx {
+		start = m.activeIdx
+	}
+
+	end := start
+	total := 0
+	for end < len(tabs) {
+		nextW := widths[end]
+		if end > start {
+			nextW += spacerW
+		}
+		if total+nextW > maxWidth {
+			break
+		}
+		total += nextW
+		end++
+	}
+
+	if m.activeIdx >= end {
+		start = m.activeIdx
+		end = start
+		total = 0
+		for end < len(tabs) {
+			nextW := widths[end]
+			if end > start {
+				nextW += spacerW
+			}
+			if total+nextW > maxWidth {
+				break
+			}
+			total += nextW
+			end++
+		}
+	}
+
+	if start > 0 {
+		total += ellipsisW + spacerW
+	}
+	if end < len(tabs) {
+		total += ellipsisW + spacerW
+	}
+
+	for total > maxWidth && start < end {
+		if start < m.activeIdx {
+			total -= widths[start]
+			if start < end-1 {
+				total -= spacerW
+			}
+			start++
+			if start > 0 {
+				total += spacerW
+			}
+			continue
+		}
+		total -= widths[end-1]
+		if end-start > 1 {
+			total -= spacerW
+		}
+		end--
+	}
+
+	m.tabStartIdx = start
+	m.ensureActiveTabVisible()
+
+	var parts []string
+	if start > 0 {
+		parts = append(parts, ellipsis)
+	}
+	for i := start; i < end; i++ {
+		parts = append(parts, tabs[i])
+	}
+	if end < len(tabs) {
+		parts = append(parts, ellipsis)
+	}
+	return strings.Join(parts, " ")
+}
+
+func (m *MultiLogModel) ensureActiveTabVisible() {
+	if m.activeIdx < 0 || m.activeIdx >= len(m.agents) {
+		return
+	}
+	if m.tabStartIdx > m.activeIdx {
+		m.tabStartIdx = m.activeIdx
+	}
 }

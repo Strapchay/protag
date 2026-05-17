@@ -40,6 +40,8 @@ type DagModel struct {
 	nodes            []NodeData
 	edges            []EdgeData
 	selectedIdx      int
+	selectedLine     int
+	nodeLines        map[string]int
 	lastError        error
 	viewport         viewport.Model
 	dirty            bool
@@ -53,6 +55,7 @@ func NewDagModel(addr string) *DagModel {
 	return &DagModel{
 		orchestratorAddr: addr,
 		viewport:         vp,
+		nodeLines:        make(map[string]int),
 		dirty:            true,
 	}
 }
@@ -171,6 +174,7 @@ func (m *DagModel) renderDAG() {
 		return
 	}
 	if len(m.nodes) == 0 {
+		m.selectedLine = 0
 		m.viewport.SetContent("DAG is empty or initializing...")
 		return
 	}
@@ -200,20 +204,28 @@ func (m *DagModel) renderDAG() {
 		selectedNode = &orderedNodes[m.selectedIdx]
 	}
 
-	var sb strings.Builder
-	sb.WriteString("DAG Visualization\n\n")
+	lines := []string{"DAG Visualization", ""}
+	m.nodeLines = make(map[string]int, len(m.nodes))
 
 	for _, layer := range layers {
 		var row []string
 		for _, node := range layer {
 			style := m.styleForStatus(node.Status)
+			prefix := " "
 			if selectedNode != nil && node.ID == selectedNode.ID {
 				style = style.Reverse(true)
+				prefix = "▶"
 			}
 			nodeText := truncateToWidth(node.ID, 24)
-			row = append(row, style.Render(fmt.Sprintf("[%s]", nodeText)))
+			row = append(row, style.Render(fmt.Sprintf("%s[%s]", prefix, nodeText)))
 		}
-		sb.WriteString(wrapPlain("    "+strings.Join(row, " -> "), contentWidth(m.width, 6)) + "\n\n")
+		rowLine := wrapPlain("    "+strings.Join(row, " -> "), contentWidth(m.width, 6))
+		lines = append(lines, rowLine, "")
+		for _, node := range layer {
+			if selectedNode != nil && node.ID == selectedNode.ID {
+				m.nodeLines[node.ID] = len(lines) - 2
+			}
+		}
 	}
 
 	// Selected Node Details Pane
@@ -230,18 +242,26 @@ func (m *DagModel) renderDAG() {
 		if strings.TrimSpace(assignedAgent) == "" {
 			assignedAgent = "unassigned"
 		}
-		sb.WriteString("\nSelected Node\n\n")
-		sb.WriteString(fmt.Sprintf("ID: %s\nDomain: %s\nStatus: %s\nAssigned Agent: %s\n",
-			wrapPlain(selectedNode.ID, detailsW),
-			wrapPlain(nodeType, detailsW),
-			wrapPlain(selectedNode.Status, detailsW),
-			wrapPlain(assignedAgent, detailsW)))
+		lines = append(lines, "Selected Node", "")
+		lines = append(lines,
+			fmt.Sprintf("ID: %s", wrapPlain(selectedNode.ID, detailsW)),
+			fmt.Sprintf("Domain: %s", wrapPlain(nodeType, detailsW)),
+			fmt.Sprintf("Status: %s", wrapPlain(selectedNode.Status, detailsW)),
+			fmt.Sprintf("Assigned Agent: %s", wrapPlain(assignedAgent, detailsW)),
+		)
+		m.selectedLine = m.nodeLines[selectedNode.ID]
+		if m.selectedLine < 0 {
+			m.selectedLine = 0
+		}
 	}
 
-	wasAtBottom := m.viewport.AtBottom()
-	m.viewport.SetContent(sb.String())
-	if wasAtBottom {
-		m.viewport.GotoBottom()
+	m.viewport.SetContent(strings.Join(lines, "\n"))
+	if selectedNode != nil && m.height > 0 {
+		target := m.selectedLine - m.viewport.Height/2
+		if target < 0 {
+			target = 0
+		}
+		m.viewport.SetYOffset(target)
 	}
 }
 

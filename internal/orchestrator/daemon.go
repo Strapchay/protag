@@ -107,6 +107,7 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 
 	// Initialize Server
 	server := NewServer(dagMgr, lockMgr, stubReg, memStore)
+	server.SetLogsDir(runState.LogsDir)
 	if broadcaster, ok := coord.(interface{ SetBroadcastFunc(func(hub.Message)) }); ok {
 		broadcaster.SetBroadcastFunc(func(msg hub.Message) {
 			server.BroadcastHubEvent(msg)
@@ -366,7 +367,7 @@ func (d *Daemon) Start() error {
 	if attempt, err := loadBuildSpecAttempt(d.runState.Root); err == nil && attempt != nil {
 		switch attempt.Status {
 		case BuildSpecAttemptActive, BuildSpecAttemptAllocating, BuildSpecAttemptPlanning, BuildSpecAttemptCommitting:
-			d.server.BroadcastStatus("Persisted build-spec attempt loaded. Issue /continue-agents to resume domain work.", "info")
+			d.server.BroadcastTransientStatus("Persisted build-spec attempt loaded. Issue /continue-agents to resume domain work.", "info")
 		}
 	}
 
@@ -468,6 +469,7 @@ func (d *Daemon) ResetCurrentRun() error {
 	d.auditor.lockManager = lockMgr
 	d.auditor.hubRouter = hubRouter
 	d.server.SetRuntimeSubsystems(dagMgr, lockMgr, stubReg, d.memoryStore)
+	d.server.SetLogsDir(newRun.LogsDir)
 	d.server.ClearHubHistory()
 
 	if oldDAG != nil {
