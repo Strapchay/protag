@@ -44,17 +44,21 @@ type Server struct {
 	stubRegistry *stub.Registry
 	memoryStore  memory.Store
 
-	hubCallback func(hub.Message) // called when hub messages need routing
-	replanCb    func()
-	reviveCb    func(string) error
-	buildSpecCb func(string) // called when user issues /build-spec
-	refineCb    func(string) // called when user sends message to orchestrator
-	retryCb     func() error
-	continueCb  func() error
-	resumeCb    func() error
-	statusCb    func() string
-	showSpecCb  func() (string, error)
-	resetCb     func() error
+	hubCallback       func(hub.Message) // called when hub messages need routing
+	replanCb          func()
+	reviveCb          func(string) error
+	buildSpecCb       func(string) // called when user issues /build-spec
+	refineCb          func(string) // called when user sends message to orchestrator
+	retryCb           func() error
+	continueCb        func() error
+	resumeCb          func() error
+	statusCb          func() string
+	showSpecCb        func() (string, error)
+	resetCb           func() error
+	buildSpecStatusCb func() string
+	buildSpecPlanCb   func() (string, error)
+	buildSpecTraceCb  func() (string, error)
+	buildSpecCancelCb func() error
 
 	listener   net.Listener
 	heartbeats map[string]int64 // agentID → last heartbeat unix ms
@@ -119,11 +123,15 @@ func (s *Server) BroadcastHubEvent(msg hub.Message) {
 // BroadcastStatus emits a SystemStatus message to all TUI subscribers.
 // level is one of "info", "warn", "error", "ok".
 func (s *Server) BroadcastStatus(text, level string) {
+	s.BroadcastAgentStatus("orchestrator", text, level)
+}
+
+func (s *Server) BroadcastAgentStatus(agentID, text, level string) {
 	payload, _ := json.Marshal(hub.SystemStatusPayload{Text: text, Level: level})
 	s.BroadcastHubEvent(hub.Message{
 		ID:        fmt.Sprintf("sys-%d", time.Now().UnixNano()),
 		Type:      hub.MsgSystemStatus,
-		FromAgent: "orchestrator",
+		FromAgent: agentID,
 		Payload:   payload,
 		Timestamp: time.Now(),
 	})
@@ -322,6 +330,14 @@ func (s *Server) handleRequest(req Request) Response {
 		return s.handleArchitectShowSpec(req)
 	case "architect-reset":
 		return s.handleArchitectReset(req)
+	case "build-spec-status":
+		return s.handleBuildSpecStatus(req)
+	case "build-spec-show-plan":
+		return s.handleBuildSpecShowPlan(req)
+	case "build-spec-show-trace":
+		return s.handleBuildSpecShowTrace(req)
+	case "build-spec-cancel":
+		return s.handleBuildSpecCancel(req)
 	case "trigger-replan":
 		return s.handleTriggerReplan(req)
 	case "revive-agent":
@@ -357,6 +373,22 @@ func (s *Server) SetArchitectShowSpecCallback(cb func() (string, error)) {
 
 func (s *Server) SetArchitectResetCallback(cb func() error) {
 	s.resetCb = cb
+}
+
+func (s *Server) SetBuildSpecStatusCallback(cb func() string) {
+	s.buildSpecStatusCb = cb
+}
+
+func (s *Server) SetBuildSpecPlanCallback(cb func() (string, error)) {
+	s.buildSpecPlanCb = cb
+}
+
+func (s *Server) SetBuildSpecTraceCallback(cb func() (string, error)) {
+	s.buildSpecTraceCb = cb
+}
+
+func (s *Server) SetBuildSpecCancelCallback(cb func() error) {
+	s.buildSpecCancelCb = cb
 }
 
 func (s *Server) SetRuntimeSubsystems(dagManager *dag.Manager, lockManager *locking.Manager, stubRegistry *stub.Registry, memoryStore memory.Store) {
@@ -474,6 +506,46 @@ func (s *Server) handleArchitectReset(req Request) Response {
 	}
 	s.BroadcastStatus("Architect session reset; fresh session started.", "ok")
 	return Response{ID: req.ID, Result: map[string]string{"status": "reset_complete"}}
+}
+
+func (s *Server) handleBuildSpecStatus(req Request) Response {
+	if s.buildSpecStatusCb == nil {
+		return Response{ID: req.ID, Error: "build-spec status callback not configured"}
+	}
+	return Response{ID: req.ID, Result: map[string]string{"status": s.buildSpecStatusCb()}}
+}
+
+func (s *Server) handleBuildSpecShowPlan(req Request) Response {
+	if s.buildSpecPlanCb == nil {
+		return Response{ID: req.ID, Error: "build-spec show-plan callback not configured"}
+	}
+	text, err := s.buildSpecPlanCb()
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	return Response{ID: req.ID, Result: map[string]string{"plan": text}}
+}
+
+func (s *Server) handleBuildSpecShowTrace(req Request) Response {
+	if s.buildSpecTraceCb == nil {
+		return Response{ID: req.ID, Error: "build-spec show-trace callback not configured"}
+	}
+	text, err := s.buildSpecTraceCb()
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	return Response{ID: req.ID, Result: map[string]string{"trace": text}}
+}
+
+func (s *Server) handleBuildSpecCancel(req Request) Response {
+	if s.buildSpecCancelCb == nil {
+		return Response{ID: req.ID, Error: "build-spec cancel callback not configured"}
+	}
+	if err := s.buildSpecCancelCb(); err != nil {
+		s.BroadcastStatus("Build-spec cancel failed: "+err.Error(), "error")
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	return Response{ID: req.ID, Result: map[string]string{"status": "cancel_started"}}
 }
 
 func (s *Server) handleTriggerReplan(req Request) Response {

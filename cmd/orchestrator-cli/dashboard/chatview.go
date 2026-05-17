@@ -30,16 +30,17 @@ type chatLine struct {
 }
 
 type ChatModel struct {
-	addr         string
-	viewport     viewport.Model
-	input        textarea.Model
-	history      []chatLine
-	width        int
-	height       int
-	Focused      bool
-	FocusHistory bool
-	autoScroll   bool
-	logger       *log.Logger
+	addr            string
+	viewport        viewport.Model
+	input           textarea.Model
+	history         []chatLine
+	width           int
+	height          int
+	Focused         bool
+	FocusHistory    bool
+	autoScroll      bool
+	logger          *log.Logger
+	buildSpecActive bool
 }
 
 type architectCommand struct {
@@ -54,6 +55,9 @@ var architectCommands = []architectCommand{
 	{Name: "/retry", Description: "retry the last safe failed/timed-out Architect request"},
 	{Name: "/continue", Description: "ask the Architect to continue from current restored context"},
 	{Name: "/show-spec", Description: "show docs/build_spec.md"},
+	{Name: "/show-plan", Description: "show the current build-spec plan"},
+	{Name: "/show-build-spec-trace", Description: "show the current build-spec planning trace"},
+	{Name: "/coordinator-status", Description: "show the current build-spec attempt state"},
 	{Name: "/clear", Description: "clear visible chat history only"},
 	{Name: "/reset-session", Description: "delete current run state and start a fresh Architect session"},
 	{Name: "/replan", Description: "trigger DAG replan"},
@@ -194,11 +198,19 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if v != "" {
 					m.AddMessage("user", "User", v, lipgloss.NewStyle().Foreground(lipgloss.Color("82")), "text")
 					go m.executeCommand(v)
+					if strings.HasPrefix(v, "/build-spec") {
+						m.buildSpecActive = true
+					}
 				}
 				// Force autoscroll on new message
 				m.autoScroll = true
 				return m, nil
 			case tea.KeyEsc:
+				if m.buildSpecActive {
+					go m.executeCommand("/build-spec-cancel")
+					m.buildSpecActive = false
+					return m, nil
+				}
 				m.input.Blur()
 				return m, nil
 			}
@@ -257,6 +269,17 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.AddMessage(msg.AgentID, author, displayText, authorStyle, msgType)
+		if msg.AgentID == "orchestrator" {
+			lower := strings.ToLower(msg.Content)
+			switch {
+			case strings.Contains(lower, "build-spec planning and allocation complete"),
+				strings.Contains(lower, "build-spec planning canceled"),
+				strings.Contains(lower, "planning failed"),
+				strings.Contains(lower, "allocation failed"),
+				strings.Contains(lower, "build-spec failed"):
+				m.buildSpecActive = false
+			}
+		}
 		return m, nil
 
 	case tea.WindowSizeMsg:
@@ -565,11 +588,27 @@ func (m *ChatModel) executeCommand(cmdStr string) {
 		methodName = "architect-show-spec"
 		params = map[string]interface{}{}
 		showResponse = true
+	case "/show-plan":
+		methodName = "build-spec-show-plan"
+		params = map[string]interface{}{}
+		showResponse = true
+	case "/show-build-spec-trace":
+		methodName = "build-spec-show-trace"
+		params = map[string]interface{}{}
+		showResponse = true
+	case "/coordinator-status":
+		methodName = "build-spec-status"
+		params = map[string]interface{}{}
+		showResponse = true
 	case "/reset-session":
 		methodName = "architect-reset"
 		params = map[string]interface{}{}
 		showResponse = true
 		clearAfterResponse = true
+	case "/build-spec-cancel":
+		methodName = "build-spec-cancel"
+		params = map[string]interface{}{}
+		showResponse = true
 	case "/revive":
 		if len(parts) < 2 {
 			return
@@ -626,6 +665,12 @@ func (m *ChatModel) executeCommand(cmdStr string) {
 		text := resp.Result["status"]
 		if text == "" {
 			text = resp.Result["spec"]
+		}
+		if text == "" {
+			text = resp.Result["plan"]
+		}
+		if text == "" {
+			text = resp.Result["trace"]
 		}
 		if text == "" {
 			text = "No status returned"

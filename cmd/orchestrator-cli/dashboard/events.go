@@ -52,7 +52,7 @@ func (n *tuiEventNormalizer) Normalize(msg hub.Message) []tuiEventMsg {
 		if text == "" {
 			text = payload.Content
 		}
-		return []tuiEventMsg{{
+		events := []tuiEventMsg{{
 			Audience: tuiAudienceStatus,
 			Kind:     tuiKindStatus,
 			AgentID:  coalesceAgentID(msg),
@@ -60,6 +60,18 @@ func (n *tuiEventNormalizer) Normalize(msg hub.Message) []tuiEventMsg {
 			Level:    payload.Level,
 			Raw:      string(msg.Payload),
 		}}
+		if agentID := strings.TrimSpace(msg.FromAgent); agentID != "" && agentID != "orchestrator" {
+			events = append(events, tuiEventMsg{
+				Audience: tuiAudienceLogs,
+				Kind:     tuiKindStatus,
+				AgentID:  agentID,
+				Author:   authorFor(agentID, ""),
+				Content:  text,
+				Level:    payload.Level,
+				Raw:      string(msg.Payload),
+			})
+		}
+		return events
 	}
 
 	agentID := n.normalizeAgentID(msg)
@@ -155,7 +167,7 @@ func isChatRelevant(msg hub.Message, agentID, role, kind string) bool {
 	if msg.ToAgent == "tui" {
 		return true
 	}
-	return agentID == "orchestrator" || agentID == "architect"
+	return agentID == "orchestrator" || agentID == "architect" || agentID == "coordinator"
 }
 
 func authorFor(agentID, role string) string {
@@ -164,6 +176,9 @@ func authorFor(agentID, role string) string {
 	}
 	if agentID == "orchestrator" || agentID == "architect" {
 		return "Architect"
+	}
+	if agentID == "coordinator" {
+		return "Coordinator"
 	}
 	if strings.TrimSpace(agentID) == "" {
 		return "System"

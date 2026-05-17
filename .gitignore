@@ -39,3 +39,5 @@ Thumbs.db
 
 # Vendor (use modules)
 /vendor/
+.agents
+.codex

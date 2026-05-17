@@ -6,12 +6,10 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
-	"time"
 )
 
-// DefaultCoordinator uses a Pi Agent to plan work distribution.
-// For now, it provides a deterministic planning implementation
-// that can be switched to Pi Agent-backed planning later.
+// DefaultCoordinator is retained for compatibility with old construction
+// paths. Runtime build-spec planning must use PiCoordinator.
 type DefaultCoordinator struct {
 	// Config for Pi Agent spawning (future use)
 	Provider string
@@ -23,29 +21,10 @@ func NewDefaultCoordinator() *DefaultCoordinator {
 	return &DefaultCoordinator{}
 }
 
-// Plan analyzes the project and produces a work distribution plan.
-// Currently uses heuristic-based planning. Will be upgraded to
-// Pi Agent-backed planning.
+// Plan refuses runtime planning because static coordinator planning can mutate
+// the DAG without a live Coordinator Pi turn.
 func (c *DefaultCoordinator) Plan(ctx context.Context, req PlanRequest) (*PlanResponse, error) {
-	if req.ProjectScan == nil {
-		return nil, fmt.Errorf("coordinator: project scan required")
-	}
-
-	log.Printf("coordinator: planning for prompt: %s", truncate(req.UserPrompt, 80))
-	log.Printf("coordinator: project has %d files, %d modules, languages: %v",
-		req.ProjectScan.FileCount, req.ProjectScan.ModuleCount, req.ProjectScan.Languages)
-
-	// Heuristic planning: cluster files by top-level directory
-	domains, nodes, edges := heuristicPlan(req)
-
-	resp := &PlanResponse{
-		Domains: domains,
-		Nodes:   nodes,
-		Edges:   edges,
-	}
-
-	logJSON("coordinator: plan", resp)
-	return resp, nil
+	return nil, fmt.Errorf("coordinator: static runtime planning is disabled; configure the Pi-backed coordinator")
 }
 
 // Replan re-evaluates a subgraph.
@@ -190,6 +169,3 @@ func logJSON(prefix string, v interface{}) {
 	}
 	log.Printf("%s:\n%s", prefix, string(data))
 }
-
-// Ensure DefaultCoordinator is used in time
-var _ = time.Now

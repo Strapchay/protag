@@ -40,9 +40,9 @@ func main() {
 
 	// Parse flags for the command
 	if command == "dashboard" {
-		addr := resolveOrchestratorAddr()
+		addr := resolveDashboardAddr()
 		if addr == "" {
-			exitError("dashboard requires AION_ORCHESTRATOR_ADDR or AION_ORCHESTRATOR_CORE_ADDR")
+			exitError("dashboard requires a running project server or AION_ORCHESTRATOR_ADDR/AION_ORCHESTRATOR_CORE_ADDR")
 		}
 		p := tea.NewProgram(dashboard.NewModel(addr), tea.WithMouseCellMotion())
 		if _, err := p.Run(); err != nil {
@@ -129,6 +129,32 @@ func resolveOrchestratorAddr() string {
 		return host + ":" + port
 	}
 	return ""
+}
+
+func resolveDashboardAddr() string {
+	if addr := resolveProjectServerAddr(); addr != "" {
+		return addr
+	}
+	return resolveOrchestratorAddr()
+}
+
+func resolveProjectServerAddr() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	path := filepath.Join(cwd, ".aion", "server.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var info struct {
+		Addr string `json:"addr"`
+	}
+	if err := json.Unmarshal(data, &info); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(info.Addr)
 }
 
 func parseCommand(command string, args []string) (map[string]interface{}, error) {

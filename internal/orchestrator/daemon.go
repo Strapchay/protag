@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -24,21 +25,24 @@ import (
 // Daemon is the main Orchestrator process. It initializes all subsystems
 // and manages the full lifecycle from startup through shutdown.
 type Daemon struct {
-	config       *Config
-	dagManager   *dag.Manager
-	lockManager  *locking.Manager
-	stubRegistry *stub.Registry
-	hubRouter    *hub.Router
-	allocator    *Allocator
-	server       *Server
-	coordinator  coordinator.Coordinator
-	memoryStore  memory.Store
-	projectRoot  string
-	auditor      *Auditor
-	runState     *RunState
-	ctx          context.Context
-	cancel       context.CancelFunc
-	resetMu      sync.Mutex
+	config           *Config
+	dagManager       *dag.Manager
+	lockManager      *locking.Manager
+	stubRegistry     *stub.Registry
+	hubRouter        *hub.Router
+	allocator        *Allocator
+	server           *Server
+	coordinator      coordinator.Coordinator
+	memoryStore      memory.Store
+	projectRoot      string
+	auditor          *Auditor
+	runState         *RunState
+	ctx              context.Context
+	cancel           context.CancelFunc
+	resetMu          sync.Mutex
+	buildSpecMu      sync.Mutex
+	buildSpecCancel  context.CancelFunc
+	buildSpecAttempt *BuildSpecAttempt
 }
 
 // NewDaemon creates a new Orchestrator daemon with the given config.
@@ -103,6 +107,19 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 
 	// Initialize Server
 	server := NewServer(dagMgr, lockMgr, stubReg, memStore)
+	if broadcaster, ok := coord.(interface{ SetBroadcastFunc(func(hub.Message)) }); ok {
+		broadcaster.SetBroadcastFunc(func(msg hub.Message) {
+			server.BroadcastHubEvent(msg)
+		})
+	}
+	if tracer, ok := coord.(interface{ SetTraceFunc(func(string)) }); ok {
+		tracer.SetTraceFunc(func(text string) {
+			_ = appendBuildSpecTrace(runState.Root, text)
+			if trace := truncateTraceForStatus(text); trace != "" {
+				server.BroadcastAgentStatus("coordinator", "Build-spec trace: "+trace, "info")
+			}
+		})
+	}
 
 	// Initialize Auditor
 	progressTimeout := time.Duration(config.Health.ProgressTimeoutSec) * time.Second
@@ -211,32 +228,53 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	})
 
 	server.SetBuildSpecCallback(func(spec string) {
+		_ = appendBuildSpecTrace(daemon.runState.Root, fmt.Sprintf("command received: %s", strings.TrimSpace(spec)))
 		specPath := filepath.Join(daemon.projectRoot, "docs", "build_spec.md")
 		if info, err := os.Stat(specPath); err != nil {
 			if os.IsNotExist(err) {
+				_ = appendBuildSpecTrace(daemon.runState.Root, fmt.Sprintf("preflight failed: missing build spec at %s", specPath))
 				daemon.server.BroadcastStatus("Build spec missing: ask the Solution Architect to create docs/build_spec.md, including the docs directory if needed.", "error")
 				log.Printf("daemon: build-spec missing at %s", specPath)
 				return
 			}
+			_ = appendBuildSpecTrace(daemon.runState.Root, fmt.Sprintf("preflight failed: stat build spec: %v", err))
 			daemon.server.BroadcastStatus(fmt.Sprintf("Build spec check failed: %v", err), "error")
 			log.Printf("daemon: build-spec stat failed: %v", err)
 			return
 		} else if info.IsDir() {
+			_ = appendBuildSpecTrace(daemon.runState.Root, fmt.Sprintf("preflight failed: build spec path is directory: %s", specPath))
 			daemon.server.BroadcastStatus("Build spec path is a directory; expected docs/build_spec.md file.", "error")
 			log.Printf("daemon: build-spec path is directory: %s", specPath)
 			return
 		} else if info.Size() == 0 {
+			_ = appendBuildSpecTrace(daemon.runState.Root, fmt.Sprintf("preflight failed: build spec is empty at %s", specPath))
 			daemon.server.BroadcastStatus("Build spec is empty: ask the Solution Architect to write the finalized spec before /build-spec.", "error")
 			log.Printf("daemon: build-spec empty at %s", specPath)
 			return
 		}
-		if handoff, ok := daemon.coordinator.(interface{ MarkBuildSpecHandoff() }); ok {
-			handoff.MarkBuildSpecHandoff()
+		specData, err := os.ReadFile(specPath)
+		if err != nil {
+			_ = appendBuildSpecTrace(daemon.runState.Root, fmt.Sprintf("preflight failed: read build spec: %v", err))
+			daemon.server.BroadcastStatus(fmt.Sprintf("Build spec read failed: %v", err), "error")
+			log.Printf("daemon: build-spec read failed: %v", err)
+			return
 		}
-		// userPrompt is ignored for now as we read from build_spec.md
-		if err := daemon.SubmitWork(daemon.ctx, "docs/build_spec.md"); err != nil {
-			log.Printf("daemon: build-spec failed: %v", err)
+		if err := daemon.TriggerBuildSpec(specPath, specData); err != nil {
+			daemon.server.BroadcastStatus(fmt.Sprintf("Build spec failed to start: %v", err), "error")
+			log.Printf("daemon: build-spec failed to start: %v", err)
 		}
+	})
+	server.SetBuildSpecStatusCallback(func() string {
+		return daemon.buildSpecStatus()
+	})
+	server.SetBuildSpecPlanCallback(func() (string, error) {
+		return daemon.buildSpecPlan()
+	})
+	server.SetBuildSpecTraceCallback(func() (string, error) {
+		return daemon.buildSpecTrace()
+	})
+	server.SetBuildSpecCancelCallback(func() error {
+		return daemon.cancelBuildSpecAttempt()
 	})
 
 	// Wire the allocator status callback to the server's broadcast mechanism.
@@ -294,6 +332,11 @@ func (d *Daemon) Start() error {
 
 	// Give server a moment to bind
 	time.Sleep(100 * time.Millisecond)
+	if addr := d.server.Addr(); addr != "" {
+		if err := writeServerInfo(d.projectRoot, d.runState, addr); err != nil {
+			log.Printf("daemon: failed to write server info: %v", err)
+		}
+	}
 
 	log.Printf("daemon: aion-kernel ready")
 	return nil
@@ -309,6 +352,9 @@ func (d *Daemon) startArchitectPhase() error {
 				if sup, ok := agent.(*supervisor.AgentSupervisor); ok {
 					d.hubRouter.RegisterAgent("orchestrator", sup)
 					sup.SetStatusFunc(func(text, level string) {
+						if d.buildSpecAttemptIsActive() {
+							return
+						}
 						d.server.BroadcastStatus(text, level)
 					})
 					sup.SetBroadcastFunc(func(msg hub.Message) {
@@ -440,6 +486,9 @@ func (d *Daemon) Shutdown() {
 
 	log.Println("daemon: stopping server...")
 	d.server.Stop()
+	if err := deleteServerInfo(d.projectRoot); err != nil && !os.IsNotExist(err) {
+		log.Printf("daemon: failed to remove server info: %v", err)
+	}
 
 	log.Println("daemon: flushing DAG...")
 	d.dagManager.Close()
@@ -500,6 +549,10 @@ func (d *Daemon) SubmitWork(ctx context.Context, userPrompt string) error {
 	if err != nil {
 		d.server.BroadcastStatus(fmt.Sprintf("Planning failed: %v", err), "error")
 		return fmt.Errorf("daemon: planning failed: %w", err)
+	}
+	if err := coordinator.ValidatePlanResponse(plan); err != nil {
+		d.server.BroadcastStatus(fmt.Sprintf("Planning validation failed: %v", err), "error")
+		return fmt.Errorf("daemon: planning validation failed: %w", err)
 	}
 
 	d.server.BroadcastStatus(fmt.Sprintf("Plan received: %d nodes, %d edges. Committing DAG...", len(plan.Nodes), len(plan.Edges)), "info")
@@ -588,6 +641,9 @@ func (d *Daemon) CloseProject() error {
 	log.Println("daemon: flushing state...")
 	d.dagManager.Close()
 	d.server.Stop()
+	if err := deleteServerInfo(d.projectRoot); err != nil && !os.IsNotExist(err) {
+		log.Printf("daemon: failed to remove server info: %v", err)
+	}
 	if d.cancel != nil {
 		d.cancel()
 	}
@@ -599,6 +655,19 @@ func (d *Daemon) CloseProject() error {
 // MonitorExecution blocks until the full DAG reaches a terminal state.
 func (d *Daemon) MonitorExecution(ctx context.Context) error {
 	return d.allocator.MonitorExecution(ctx, 2*time.Second)
+}
+
+func truncateTraceForStatus(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	const limit = 240
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	return string(runes[:limit]) + "…"
 }
 
 func (d *Daemon) handleReplan(msg hub.Message) {

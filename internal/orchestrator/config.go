@@ -205,7 +205,6 @@ inference:
 
   coordinator:
     use_profile: "${AION_COORDINATOR_PROFILE}"
-    deterministic_fallback: ${AION_COORDINATOR_DETERMINISTIC_FALLBACK}
   domain_agents:
     use_profile: "${AION_DOMAIN_AGENTS_PROFILE}"
   fallback:

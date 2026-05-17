@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"aion-kernel/internal/hub"
@@ -19,12 +20,17 @@ import (
 // PiCoordinator is an implementation of Coordinator that uses a persistent
 // Pi Agent to engage in refinement chat and produce a plan.
 type PiCoordinator struct {
-	agent        *supervisor.AgentSupervisor
-	config       PiCoordinatorConfig
-	projectRoot  string
-	sessionRT    *session.Runtime
-	statusFn     func(text, level string)
-	lastUserText string
+	agent          *supervisor.AgentSupervisor
+	plannerAgent   *supervisor.AgentSupervisor
+	config         PiCoordinatorConfig
+	projectRoot    string
+	sessionRT      *session.Runtime
+	statusFn       func(text, level string)
+	broadcastFn    func(msg hub.Message)
+	traceFn        func(text string)
+	plannerMu      sync.Mutex
+	plannerCapture *planCapture
+	lastUserText   string
 }
 
 // PiCoordinatorConfig configures the Pi-backed coordinator.
@@ -51,6 +57,56 @@ type SolutionArchitectMetadata struct {
 	HandoffSummary string   `json:"handoff_summary,omitempty"`
 }
 
+type planCapture struct {
+	mu     sync.Mutex
+	done   chan struct{}
+	text   string
+	closed bool
+}
+
+type planningInputArtifact struct {
+	Type            string       `json:"type"`
+	AttemptHint     string       `json:"attempt_hint,omitempty"`
+	ProjectRoot     string       `json:"project_root"`
+	BuildSpecPath   string       `json:"build_spec_path"`
+	BuildSpec       string       `json:"build_spec"`
+	ProjectScan     *ProjectScan `json:"project_scan"`
+	OutputPath      string       `json:"output_path"`
+	ValidationRules []string     `json:"validation_rules"`
+}
+
+func newPlanCapture() *planCapture {
+	return &planCapture{done: make(chan struct{})}
+}
+
+func (p *planCapture) setText(text string) {
+	p.mu.Lock()
+	if strings.TrimSpace(text) != "" {
+		p.text = text
+	}
+	p.mu.Unlock()
+}
+
+func (p *planCapture) close() {
+	p.mu.Lock()
+	if !p.closed {
+		p.closed = true
+		close(p.done)
+	}
+	p.mu.Unlock()
+}
+
+func (p *planCapture) wait(ctx context.Context) (string, error) {
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-p.done:
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.text, nil
+	}
+}
+
 const (
 	architectSpecDiscovering     = "discovering"
 	architectSpecClarifying      = "clarifying"
@@ -61,6 +117,16 @@ const (
 
 func (c *PiCoordinator) SetStatusFunc(fn func(text, level string)) {
 	c.statusFn = fn
+}
+
+// SetBroadcastFunc registers a hub broadcast callback for planner and architect events.
+func (c *PiCoordinator) SetBroadcastFunc(fn func(msg hub.Message)) {
+	c.broadcastFn = fn
+}
+
+// SetTraceFunc registers a callback for persisting the coordinator planning trace.
+func (c *PiCoordinator) SetTraceFunc(fn func(text string)) {
+	c.traceFn = fn
 }
 
 // NewPiCoordinator creates a new Pi-backed coordinator.
@@ -120,22 +186,312 @@ func (c *PiCoordinator) StartArchitect(ctx context.Context) error {
 	return c.agent.Start(ctx)
 }
 
-// Plan reads the finalized spec from docs/build_spec.md and parses it.
-func (c *PiCoordinator) Plan(ctx context.Context, req PlanRequest) (*PlanResponse, error) {
-	specPath := filepath.Join(c.projectRoot, "docs", "build_spec.md")
-	data, err := os.ReadFile(specPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("pi_coordinator: docs/build_spec.md is missing; ask the Solution Architect to finalize the spec and create docs/build_spec.md before running /build-spec")
-		}
-		return nil, fmt.Errorf("pi_coordinator: failed to read docs/build_spec.md: %w", err)
-	}
-	if strings.TrimSpace(string(data)) == "" {
-		return nil, fmt.Errorf("pi_coordinator: docs/build_spec.md is empty; ask the Solution Architect to write the finalized spec before running /build-spec")
+func (c *PiCoordinator) ensurePlannerAgent(ctx context.Context) error {
+	c.plannerMu.Lock()
+	defer c.plannerMu.Unlock()
+
+	if c.plannerAgent != nil && c.plannerAgent.State() != supervisor.StateStopped {
+		return nil
 	}
 
-	// Parse the markdown spec into a PlanResponse.
-	return ParseSpecMarkdown(string(data)), nil
+	agentDir := projectPath(c.projectRoot, c.config.SessionDir, "coordinator")
+	if err := os.MkdirAll(agentDir, 0755); err != nil {
+		return fmt.Errorf("pi_coordinator: create coordinator planner dir: %w", err)
+	}
+
+	planner := supervisor.NewAgentSupervisor(c.plannerSupervisorConfig(agentDir))
+	if c.broadcastFn != nil {
+		planner.SetBroadcastFunc(c.broadcastFn)
+	}
+	if c.statusFn != nil {
+		planner.SetStatusFunc(c.statusFn)
+	}
+	planner.SetLifecycleFunc(c.handlePlannerLifecycle)
+	if err := planner.Start(ctx); err != nil {
+		return err
+	}
+	c.plannerAgent = planner
+	return nil
+}
+
+func (c *PiCoordinator) plannerSupervisorConfig(agentDir string) supervisor.AgentConfig {
+	return supervisor.AgentConfig{
+		AgentID:          "coordinator",
+		DomainID:         "coordinator",
+		InitialPrompt:    "",
+		HeartbeatTimeout: 30 * time.Minute,
+		ProgressTimeout:  1 * time.Hour,
+		PiAgent: supervisor.PiAgentConfig{
+			Binary:     c.config.Binary,
+			SessionDir: agentDir,
+			WorkingDir: c.projectRoot,
+			Provider:   c.config.Provider,
+			Model:      c.config.Model,
+			SkillPaths: c.config.SkillPaths,
+			Env:        c.config.Env,
+		},
+	}
+}
+
+// Plan asks the Coordinator Pi agent to reason over the finalized spec and
+// project scan, then parses the structured plan response.
+func (c *PiCoordinator) Plan(ctx context.Context, req PlanRequest) (*PlanResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	specText := strings.TrimSpace(req.UserPrompt)
+	if specText == "" {
+		specPath := filepath.Join(c.projectRoot, "docs", "build_spec.md")
+		data, err := os.ReadFile(specPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, fmt.Errorf("pi_coordinator: docs/build_spec.md is missing; ask the Solution Architect to finalize the spec and create docs/build_spec.md before running /build-spec")
+			}
+			return nil, fmt.Errorf("pi_coordinator: failed to read docs/build_spec.md: %w", err)
+		}
+		specText = strings.TrimSpace(string(data))
+		if specText == "" {
+			return nil, fmt.Errorf("pi_coordinator: docs/build_spec.md is empty; ask the Solution Architect to write the finalized spec before running /build-spec")
+		}
+	}
+
+	if strings.TrimSpace(c.config.Binary) == "" {
+		if c.traceFn != nil {
+			c.traceFn("planner binary missing; refusing static build-spec planning")
+		}
+		return nil, fmt.Errorf("pi_coordinator: planner binary is not configured")
+	}
+
+	if err := c.ensurePlannerAgent(ctx); err != nil {
+		return nil, fmt.Errorf("pi_coordinator: ensure planner agent: %w", err)
+	}
+
+	artifactPaths, err := c.preparePlanningArtifacts(specText, req)
+	if err != nil {
+		return nil, err
+	}
+	prompt := GenerateCoordinatorPlanningInstruction(specText, req.ProjectScan, artifactPaths.InputPath, artifactPaths.OutputPath)
+	if c.traceFn != nil {
+		c.traceFn(fmt.Sprintf("planning input artifact written: %s", artifactPaths.InputPath))
+		c.traceFn(fmt.Sprintf("planning output artifact expected: %s", artifactPaths.OutputPath))
+		c.traceFn(fmt.Sprintf("prompt rendered: bytes=%d files=%d modules=%d", len(prompt), req.ProjectScan.FileCount, req.ProjectScan.ModuleCount))
+		c.traceFn("prompt preview:\n" + truncateForTrace(prompt, 2000))
+	}
+	if c.broadcastFn != nil {
+		if msg, err := hub.NewMessage(hub.MsgContextShare, "coordinator", "tui", map[string]string{
+			"type":    "thinking",
+			"content": "Coordinator is reasoning over the build spec and project scan.",
+			"role":    "assistant",
+		}); err == nil {
+			c.broadcastFn(*msg)
+		}
+	}
+	if c.statusFn != nil {
+		c.statusFn("Coordinator reasoning over build-spec input...", "info")
+	}
+	c.plannerMu.Lock()
+	c.plannerCapture = nil
+	planner := c.plannerAgent
+	c.plannerMu.Unlock()
+
+	if planner == nil {
+		return nil, fmt.Errorf("pi_coordinator: planner agent not started")
+	}
+
+	if err := planner.SendPrompt(prompt); err != nil {
+		if c.traceFn != nil {
+			c.traceFn(fmt.Sprintf("send prompt error: %v", err))
+		}
+		return nil, fmt.Errorf("pi_coordinator: send planning prompt: %w", err)
+	}
+	if c.statusFn != nil {
+		c.statusFn("Coordinator prompt dispatched; awaiting plan response...", "info")
+	}
+	if c.broadcastFn != nil {
+		if msg, err := hub.NewMessage(hub.MsgContextShare, "coordinator", "tui", map[string]string{
+			"type":    "text",
+			"content": "Coordinator prompt dispatched to the live planner.",
+			"role":    "assistant",
+		}); err == nil {
+			c.broadcastFn(*msg)
+		}
+	}
+
+	plan, err := c.waitForPlanArtifact(ctx, artifactPaths.OutputPath)
+	if err != nil {
+		if c.traceFn != nil {
+			c.traceFn(fmt.Sprintf("plan artifact wait/read failed: %v", err))
+		}
+		return nil, fmt.Errorf("pi_coordinator: planning failed: %w", err)
+	}
+	if err := ValidatePlanResponse(plan); err != nil {
+		if c.traceFn != nil {
+			c.traceFn(fmt.Sprintf("initial validation failed: %v", err))
+		}
+		plan, err = c.repairPlanArtifact(ctx, artifactPaths.OutputPath, err)
+		if err != nil {
+			if c.traceFn != nil {
+				c.traceFn(fmt.Sprintf("validation failed: %v", err))
+			}
+			return nil, fmt.Errorf("pi_coordinator: planning validation failed: %w", err)
+		}
+	}
+	if c.traceFn != nil {
+		c.traceFn(fmt.Sprintf("plan valid: domains=%d nodes=%d edges=%d", len(plan.Domains), len(plan.Nodes), len(plan.Edges)))
+	}
+	return plan, nil
+}
+
+type planningArtifactPaths struct {
+	Dir        string
+	InputPath  string
+	OutputPath string
+	ErrorPath  string
+}
+
+func (c *PiCoordinator) planningArtifactPaths() planningArtifactPaths {
+	dir := filepath.Join(c.projectRoot, "docs", "aion")
+	return planningArtifactPaths{
+		Dir:        dir,
+		InputPath:  filepath.Join(dir, "planning_input.json"),
+		OutputPath: filepath.Join(dir, "plan_response.json"),
+		ErrorPath:  filepath.Join(dir, "plan_validation_error.txt"),
+	}
+}
+
+func (c *PiCoordinator) preparePlanningArtifacts(specText string, req PlanRequest) (planningArtifactPaths, error) {
+	paths := c.planningArtifactPaths()
+	if err := os.MkdirAll(paths.Dir, 0755); err != nil {
+		return paths, fmt.Errorf("pi_coordinator: create planning artifact dir: %w", err)
+	}
+	for _, path := range []string{paths.OutputPath, paths.ErrorPath} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return paths, fmt.Errorf("pi_coordinator: clear planning artifact %s: %w", path, err)
+		}
+	}
+	input := planningInputArtifact{
+		Type:          "aion_coordinator_planning_input",
+		ProjectRoot:   c.projectRoot,
+		BuildSpecPath: filepath.Join(c.projectRoot, "docs", "build_spec.md"),
+		BuildSpec:     specText,
+		ProjectScan:   req.ProjectScan,
+		OutputPath:    paths.OutputPath,
+		ValidationRules: []string{
+			"domains must be non-empty",
+			"nodes must be non-empty",
+			"domain IDs and node IDs must be stable, non-empty, and non-placeholder",
+			"each node must reference an existing domain",
+			"edges must reference existing nodes and must not be self-referential",
+			"the dependency graph must be acyclic",
+			"broad fallback path '.' must not be assigned to multiple domains",
+		},
+	}
+	data, err := json.MarshalIndent(input, "", "  ")
+	if err != nil {
+		return paths, fmt.Errorf("pi_coordinator: marshal planning input: %w", err)
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(paths.InputPath, data, 0644); err != nil {
+		return paths, fmt.Errorf("pi_coordinator: write planning input: %w", err)
+	}
+	return paths, nil
+}
+
+func (c *PiCoordinator) waitForPlanArtifact(ctx context.Context, outputPath string) (*PlanResponse, error) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	var lastErr error
+	for {
+		plan, err := readPlanArtifact(outputPath)
+		if err == nil {
+			if c.traceFn != nil {
+				c.traceFn(fmt.Sprintf("plan artifact read: domains=%d nodes=%d edges=%d", len(plan.Domains), len(plan.Nodes), len(plan.Edges)))
+			}
+			return plan, nil
+		}
+		if !os.IsNotExist(err) {
+			lastErr = err
+			if c.traceFn != nil {
+				c.traceFn(fmt.Sprintf("plan artifact not ready: %v", err))
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func readPlanArtifact(path string) (*PlanResponse, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var wrapped struct {
+		Type string `json:"type"`
+		PlanResponse
+	}
+	if err := json.Unmarshal(data, &wrapped); err == nil && (wrapped.Type == "" || strings.EqualFold(wrapped.Type, "plan_response")) {
+		plan := wrapped.PlanResponse
+		return &plan, nil
+	}
+	var plan PlanResponse
+	if err := json.Unmarshal(data, &plan); err != nil {
+		return nil, err
+	}
+	return &plan, nil
+}
+
+func (c *PiCoordinator) repairPlanArtifact(ctx context.Context, outputPath string, validationErr error) (*PlanResponse, error) {
+	c.plannerMu.Lock()
+	planner := c.plannerAgent
+	c.plannerMu.Unlock()
+
+	if planner == nil {
+		return nil, validationErr
+	}
+
+	paths := c.planningArtifactPaths()
+	_ = os.WriteFile(paths.ErrorPath, []byte(validationErr.Error()+"\n"), 0644)
+	if err := os.Remove(outputPath); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	repairPrompt := strings.TrimSpace(fmt.Sprintf(`The plan artifact at %s failed validation:
+
+Error:
+%s
+
+Read docs/aion/planning_input.json again and rewrite %s with a valid non-empty plan_response JSON object.
+Do not answer with the plan in chat. Write the file.`, outputPath, validationErr.Error(), outputPath))
+	if c.traceFn != nil {
+		c.traceFn("requesting coordinator plan artifact repair after validation failure")
+	}
+	if c.statusFn != nil {
+		c.statusFn("Coordinator plan artifact failed validation; requesting repair...", "warn")
+	}
+	if err := planner.SendFollowUp(repairPrompt); err != nil {
+		if c.traceFn != nil {
+			c.traceFn(fmt.Sprintf("repair prompt error: %v", err))
+		}
+		return nil, validationErr
+	}
+
+	plan, err := c.waitForPlanArtifact(ctx, outputPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidatePlanResponse(plan); err != nil {
+		return nil, err
+	}
+	return plan, nil
 }
 
 // Replan re-evaluates a subgraph.
@@ -205,6 +561,62 @@ func (c *PiCoordinator) Resume(ctx context.Context) error {
 		return err
 	}
 	return c.agent.SendFollowUp(prompt)
+}
+
+func (c *PiCoordinator) handlePlannerLifecycle(event supervisor.AgentLifecycleEvent) {
+	c.plannerMu.Lock()
+	capture := c.plannerCapture
+	c.plannerMu.Unlock()
+
+	switch event.Kind {
+	case "text":
+		if capture != nil {
+			capture.setText(event.Content)
+		}
+		if c.traceFn != nil && strings.TrimSpace(event.Content) != "" {
+			c.traceFn("planner text:\n" + truncateForTrace(event.Content, 2000))
+		}
+	case "thinking":
+		if c.traceFn != nil && strings.TrimSpace(event.Content) != "" {
+			c.traceFn("planner thinking:\n" + truncateForTrace(event.Content, 2000))
+		}
+		// Keep the latest transcript text for parsing, but preserve thinking in the UI.
+	case "turn_end", "agent_end", "agent_error", "agent_stream_closed":
+		if capture != nil && event.Content != "" {
+			capture.setText(event.Content)
+		}
+		if capture != nil {
+			capture.close()
+		}
+	}
+}
+
+func (c *PiCoordinator) StopPlanner() error {
+	c.plannerMu.Lock()
+	planner := c.plannerAgent
+	c.plannerAgent = nil
+	capture := c.plannerCapture
+	c.plannerCapture = nil
+	c.plannerMu.Unlock()
+
+	if capture != nil {
+		capture.close()
+	}
+	if planner == nil {
+		return nil
+	}
+	if c.traceFn != nil {
+		c.traceFn("stopping coordinator planner after build-spec attempt ended")
+	}
+	return planner.Stop()
+}
+
+func truncateForTrace(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	return text[:limit] + "\n...<truncated>..."
 }
 
 func (c *PiCoordinator) SessionStatus() string {

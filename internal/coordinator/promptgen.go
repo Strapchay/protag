@@ -3,6 +3,7 @@ package coordinator
 import (
 	"bytes"
 	"fmt"
+	"sort"
 	"strings"
 	"text/template"
 )
@@ -88,6 +89,93 @@ func GenerateArchitectInstruction(projectContext string) string {
 		b.WriteString(projectContext)
 		b.WriteString("\n\n")
 	}
+
+	return b.String()
+}
+
+// GenerateCoordinatorInstruction builds the system prompt for the persistent
+// coordinator planner agent that reasons over build specs.
+func GenerateCoordinatorInstruction(projectContext string) string {
+	var b strings.Builder
+	b.WriteString("# COORDINATOR PLANNER MODE\n\n")
+	b.WriteString("You are the Aion-Kernel Coordinator Planner. Your job is to reason over a finalized build spec and the project scan, then emit a valid plan_response JSON object.\n\n")
+	b.WriteString("## GUIDELINES\n")
+	b.WriteString("- Analyze the spec and project scan before deciding on domains, nodes, and edges.\n")
+	b.WriteString("- Do not assume a fixed number of agents or tasks.\n")
+	b.WriteString("- Prefer explicit dependencies only when the work truly requires ordering.\n")
+	b.WriteString("- Output only JSON content that matches the plan_response schema.\n")
+	b.WriteString("- Keep the response structured and machine-readable.\n\n")
+
+	if projectContext != "" {
+		b.WriteString("## CURRENT PROJECT CONTEXT\n")
+		b.WriteString(projectContext)
+		b.WriteString("\n\n")
+	}
+
+	return b.String()
+}
+
+// GenerateCoordinatorPlanningInstruction builds the prompt for the Coordinator
+// Pi agent to transform a build spec into a structured plan.
+func GenerateCoordinatorPlanningInstruction(specText string, scan *ProjectScan, inputPath, outputPath string) string {
+	var b strings.Builder
+	b.WriteString("Read the Coordinator planning input artifact and write the plan artifact.\n")
+	b.WriteString("Do not return the final plan in chat. The chat stream is only for status and observability.\n")
+	b.WriteString("Planning input artifact: ")
+	b.WriteString(inputPath)
+	b.WriteString("\n")
+	b.WriteString("Required output artifact: ")
+	b.WriteString(outputPath)
+	b.WriteString("\n\n")
+	b.WriteString("Write a JSON object to the output artifact with this shape:\n")
+	b.WriteString("{\"type\":\"plan_response\",\"domains\":[{\"domain_id\":\"short-stable-domain-id\",\"description\":\"owned implementation area\",\"assigned_paths\":[\"relative/path\"],\"agent_type\":\"domain\"}],\"nodes\":[{\"id\":\"short-stable-task-id\",\"domain_id\":\"short-stable-domain-id\",\"task_spec\":\"specific implementation task\",\"target_files\":[\"relative/path/file.ext\"],\"priority\":1}],\"edges\":[]}\n\n")
+	b.WriteString("The artifact must contain real, non-empty `domains` and `nodes` arrays. Do not copy placeholder IDs or empty arrays.\n")
+	b.WriteString("Create as many domains and task nodes as the spec requires; do not assume a fixed node count.\n")
+	b.WriteString("After writing the file, you may briefly state that the artifact was written.\n\n")
+
+	if scan != nil {
+		b.WriteString("PROJECT SCAN SUMMARY\n")
+		if scan.RootPath != "" {
+			b.WriteString("Root: ")
+			b.WriteString(scan.RootPath)
+			b.WriteString("\n")
+		}
+		if len(scan.Languages) > 0 {
+			b.WriteString("Languages: ")
+			b.WriteString(strings.Join(scan.Languages, ", "))
+			b.WriteString("\n")
+		}
+		if len(scan.EntryPoints) > 0 {
+			entryPoints := append([]string(nil), scan.EntryPoints...)
+			sort.Strings(entryPoints)
+			b.WriteString("Entry points:\n")
+			for _, ep := range entryPoints {
+				b.WriteString("- ")
+				b.WriteString(ep)
+				b.WriteString("\n")
+			}
+		}
+		if len(scan.DependencyFiles) > 0 {
+			deps := append([]string(nil), scan.DependencyFiles...)
+			sort.Strings(deps)
+			b.WriteString("Dependency files:\n")
+			for _, dep := range deps {
+				b.WriteString("- ")
+				b.WriteString(dep)
+				b.WriteString("\n")
+			}
+		}
+		b.WriteString("File count: ")
+		b.WriteString(fmt.Sprintf("%d", scan.FileCount))
+		b.WriteString("\nModule count: ")
+		b.WriteString(fmt.Sprintf("%d", scan.ModuleCount))
+		b.WriteString("\n\n")
+	}
+
+	b.WriteString("BUILD SPEC\n")
+	b.WriteString(specText)
+	b.WriteString("\n\n")
+	b.WriteString("Write the output artifact now.\n")
 
 	return b.String()
 }

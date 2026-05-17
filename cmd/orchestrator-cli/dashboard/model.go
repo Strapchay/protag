@@ -11,7 +11,7 @@ import (
 type Model struct {
 	Width        int
 	Height       int
-	SelectedPane string // "chat", "dag", "hub", "logs"
+	SelectedPane string // "chat", "ops", "dag", "hub", "agents"
 	Zoomed       bool
 
 	// Child states
@@ -69,12 +69,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.prevPane()
 			handledGlobalKey = true
 		case "q":
-			if m.ChatInput == nil || !m.ChatInput.input.Focused() {
+			if !m.isEditablePaneFocused() {
 				return m, tea.Quit
 			}
 		case "enter":
-			// If not in chat, enter chat
-			if m.ChatInput != nil && !m.ChatInput.input.Focused() {
+			// If not already editing chat or agents, enter chat.
+			if !m.isEditablePaneFocused() && m.ChatInput != nil {
 				m.SelectedPane = "chat"
 				m.ChatInput.input.Focus()
 				handledGlobalKey = true
@@ -95,7 +95,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.HubView.Focused = (m.SelectedPane == "hub")
 	}
 	if m.LogView != nil {
-		m.LogView.Focused = (m.SelectedPane == "logs")
+		m.LogView.Focused = (m.SelectedPane == "agents")
 	}
 	if m.OpsView != nil {
 		m.OpsView.Focused = (m.SelectedPane == "ops")
@@ -110,6 +110,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.ChatInput.input.Focused() {
 				m.ChatInput.input.Blur()
 			}
+		}
+	}
+	if m.LogView != nil {
+		if m.SelectedPane == "agents" {
+			if !m.LogView.input.Focused() {
+				m.LogView.input.Focus()
+			}
+		} else if m.LogView.input.Focused() {
+			m.LogView.input.Blur()
 		}
 	}
 
@@ -146,7 +155,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					cmds = append(cmds, cmd)
 				}
 			}
-		case "logs":
+		case "agents":
 			if m.LogView != nil {
 				newLog, cmd := m.LogView.Update(keyMsg)
 				m.LogView = newLog.(*MultiLogModel)
@@ -221,6 +230,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
+func (m *Model) isEditablePaneFocused() bool {
+	if m.SelectedPane == "chat" && m.ChatInput != nil && m.ChatInput.input.Focused() {
+		return true
+	}
+	if m.SelectedPane == "agents" && m.LogView != nil && m.LogView.input.Focused() {
+		return true
+	}
+	return false
+}
+
 // View concatenates the application screen boundaries.
 func (m *Model) View() string {
 	if m.Width == 0 || m.Height == 0 {
@@ -245,7 +264,7 @@ func (m *Model) View() string {
 		sb.WriteString(m.HubView.View())
 		sb.WriteString("\n")
 	}
-	if m.LogView != nil && m.SelectedPane == "logs" {
+	if m.LogView != nil && m.SelectedPane == "agents" {
 		sb.WriteString(m.LogView.View())
 		sb.WriteString("\n")
 	}
@@ -268,7 +287,7 @@ func (m *Model) View() string {
 }
 
 func (m *Model) paneOrder() []string {
-	return []string{"chat", "ops", "dag", "hub", "logs"}
+	return []string{"chat", "ops", "dag", "hub", "agents"}
 }
 
 func (m *Model) nextPane() {
@@ -332,11 +351,11 @@ func (m *Model) resizePanes() {
 
 func (m *Model) renderTabs() string {
 	labels := map[string]string{
-		"chat": "Architect Chat",
-		"ops":  "Operations",
-		"dag":  "DAG",
-		"hub":  "Context Hub",
-		"logs": "Agent Logs",
+		"chat":   "Architect Chat",
+		"ops":    "Operations",
+		"dag":    "DAG",
+		"hub":    "Context Hub",
+		"agents": "Agents",
 	}
 
 	var tabs []string
@@ -344,11 +363,11 @@ func (m *Model) renderTabs() string {
 		label := labels[pane]
 		if m.Width < 48 {
 			label = map[string]string{
-				"chat": "Chat",
-				"ops":  "Ops",
-				"dag":  "DAG",
-				"hub":  "Hub",
-				"logs": "Logs",
+				"chat":   "Chat",
+				"ops":    "Ops",
+				"dag":    "DAG",
+				"hub":    "Hub",
+				"agents": "Agents",
 			}[pane]
 		}
 		style := lipgloss.NewStyle().Padding(0, 1)

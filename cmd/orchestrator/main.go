@@ -46,7 +46,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	loadEnvironment(projectRoot)
+	kernelRoot, err := resolveKernelRoot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "aion-kernel: failed to resolve kernel root: %v\n", err)
+		os.Exit(1)
+	}
+
+	loadEnvironment(kernelRoot, projectRoot)
 
 	config, configSource, err := orchestrator.LoadConfigWithFallback(*configPath, projectRoot)
 	if err != nil {
@@ -119,6 +125,62 @@ func main() {
 	}
 }
 
+func resolveKernelRoot() (string, error) {
+	if override := os.Getenv("AION_KERNEL_ROOT"); override != "" {
+		abs, err := filepath.Abs(override)
+		if err != nil {
+			return "", err
+		}
+		return validateKernelRoot(abs)
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+
+	return resolveKernelRootFromExecutable(exe)
+}
+
+func resolveKernelRootFromExecutable(exe string) (string, error) {
+	dir := filepath.Dir(exe)
+	for {
+		if root, err := validateKernelRoot(dir); err == nil {
+			return root, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+
+	return "", fmt.Errorf("could not locate kernel root from executable %q", exe)
+}
+
+func validateKernelRoot(dir string) (string, error) {
+	if dir == "" {
+		return "", fmt.Errorf("empty kernel root")
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%s is not a directory", dir)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".env")); err != nil {
+		return "", fmt.Errorf("missing kernel .env in %s", dir)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "configs", "aion.yaml")); err != nil {
+		return "", fmt.Errorf("missing kernel config in %s", dir)
+	}
+	return dir, nil
+}
+
 func resolveProjectRoot(workDir, projectRootFlag string) (string, error) {
 	if workDir != "" && projectRootFlag != "" && workDir != projectRootFlag {
 		return "", fmt.Errorf("--workdir and --project-root disagree")
@@ -148,16 +210,21 @@ func resolveProjectRoot(workDir, projectRootFlag string) (string, error) {
 	return abs, nil
 }
 
-func loadEnvironment(projectRoot string) {
-	globalEnv := filepath.Join(os.Getenv("HOME"), ".config", "aion-kernel", ".env")
-	if home, err := os.UserHomeDir(); err == nil {
-		globalEnv = filepath.Join(home, ".config", "aion-kernel", ".env")
+func loadEnvironment(kernelRoot, projectRoot string) {
+	kernelEnv := filepath.Join(kernelRoot, ".env")
+	if err := godotenv.Load(kernelEnv); err == nil {
+		log.Printf("aion-kernel: loaded kernel env defaults from %s", kernelEnv)
+	} else {
+		log.Printf("aion-kernel: notice: no kernel env defaults found at %s", kernelEnv)
 	}
 
-	if err := godotenv.Load(globalEnv); err == nil {
-		log.Printf("aion-kernel: loaded global env defaults from %s", globalEnv)
-	} else {
-		log.Println("aion-kernel: notice: no global env defaults found")
+	if home, err := os.UserHomeDir(); err == nil {
+		globalEnv := filepath.Join(home, ".config", "aion-kernel", ".env")
+		if err := godotenv.Load(globalEnv); err == nil {
+			log.Printf("aion-kernel: loaded user env defaults from %s", globalEnv)
+		} else {
+			log.Println("aion-kernel: notice: no user env defaults found")
+		}
 	}
 
 	projectEnv := filepath.Join(projectRoot, ".env")

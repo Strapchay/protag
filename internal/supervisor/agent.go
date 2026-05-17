@@ -139,6 +139,29 @@ func (s *AgentSupervisor) emitStatus(text, level string) {
 	}
 }
 
+func (s *AgentSupervisor) displayLabel() string {
+	switch strings.ToLower(strings.TrimSpace(s.config.DomainID)) {
+	case "coordinator":
+		return "Coordinator"
+	case "architect":
+		return "Architect"
+	case "utility":
+		return "Utility Agent"
+	case "":
+	}
+	agentID := strings.ToLower(strings.TrimSpace(s.config.AgentID))
+	if strings.HasPrefix(agentID, "agent-") {
+		return "Domain Agent"
+	}
+	if s.config.DomainID != "" {
+		return strings.Title(strings.ReplaceAll(s.config.DomainID, "_", " "))
+	}
+	if s.config.AgentID != "" {
+		return strings.Title(strings.ReplaceAll(s.config.AgentID, "_", " "))
+	}
+	return "Agent"
+}
+
 func (s *AgentSupervisor) emitLifecycle(event AgentLifecycleEvent) {
 	s.mu.Lock()
 	fn := s.lifecycleFn
@@ -386,7 +409,7 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 		s.mu.Lock()
 		s.isThinking = true
 		s.mu.Unlock()
-		s.emitStatus("Architect is thinking...", "info")
+		s.emitStatus(s.displayLabel()+" is thinking...", "info")
 		if s.healthMonitor != nil {
 			s.healthMonitor.RecordHeartbeat()
 		}
@@ -397,7 +420,7 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 		s.isThinking = false
 		s.mu.Unlock()
 		s.emitLifecycle(AgentLifecycleEvent{Kind: "turn_end"})
-		s.emitStatus("Architect is idle", "ok")
+		s.emitStatus(s.displayLabel()+" is idle", "ok")
 		if s.healthMonitor != nil {
 			s.healthMonitor.RecordHeartbeat()
 		}
@@ -446,7 +469,7 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 		// Extract tool info for status and chat visibility
 		tool := extractToolInvocation(event)
 		if tool.Name != "" {
-			s.emitStatus(fmt.Sprintf("Architect is running tool: %s", tool.Name), "info")
+			s.emitStatus(fmt.Sprintf("%s is running tool: %s", s.displayLabel(), tool.Name), "info")
 			s.emitLifecycle(AgentLifecycleEvent{
 				Kind:        "tool_start",
 				ToolName:    tool.Name,
@@ -466,7 +489,7 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 		s.detectLooping(event)
 	case "tool_execution_end":
 		s.emitLifecycle(AgentLifecycleEvent{Kind: "tool_end"})
-		s.emitStatus("Architect is thinking...", "info")
+		s.emitStatus(s.displayLabel()+" is thinking...", "info")
 		if s.healthMonitor != nil {
 			s.healthMonitor.RecordProgress()
 		}

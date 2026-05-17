@@ -117,7 +117,7 @@ func (m *StatusModel) updateFromTUIEvent(msg tuiEventMsg) bool {
 		m.setStatus(agent+" is running: "+summary, "info", true)
 		return true
 	case tuiKindText:
-		if msg.Role == "assistant" || msg.AgentID == "architect" || msg.AgentID == "orchestrator" {
+		if msg.Role == "assistant" || msg.AgentID == "architect" || msg.AgentID == "orchestrator" || msg.AgentID == "coordinator" {
 			m.setStatus(agent+" is responding", "info", true)
 			return true
 		}

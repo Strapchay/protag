@@ -50,13 +50,15 @@ If `--config` is omitted, config discovery checks:
 4. binary-adjacent `configs/aion.yaml`
 5. built-in defaults
 
-Environment loading uses global defaults with project overrides:
+Environment loading uses kernel defaults with project overrides:
 
-1. `~/.config/aion-kernel/.env`
-2. `<project>/.env`
+1. `<kernel-root>/.env` where `kernel-root` is resolved from the executable path
+   or `AION_KERNEL_ROOT`
+2. `~/.config/aion-kernel/.env`
+3. `<project>/.env`
 
-The project `.env` is loaded after the global file, so project-specific values
-can override global defaults.
+The project `.env` is loaded last, so project-specific values can override the
+kernel defaults when needed.
 
 ### 2. Run an End-to-End Orchestration Task
 Submit a task prompt to the Orchestrator to begin planning and allocating agents over the current directory:

@@ -2,58 +2,108 @@ package coordinator
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func TestPiCoordinator_Plan(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "aion-test-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	// Create docs dir
+func TestPiCoordinator_PlanRequiresPlannerBinary(t *testing.T) {
+	tmpDir := t.TempDir()
 	docsDir := filepath.Join(tmpDir, "docs")
-	os.MkdirAll(docsDir, 0755)
-
-	// Create a structured dummy spec
-	specContent := `
-## Domains
-- Backend: API server (Paths: internal/api, cmd/server)
-## Tasks
-- Init [Backend]: Setup project structure (Priority: 1)
-- Health [Backend]: Add health endpoint (Priority: 2)
-`
-	specPath := filepath.Join(docsDir, "build_spec.md")
-	os.WriteFile(specPath, []byte(specContent), 0644)
+	if err := os.MkdirAll(docsDir, 0755); err != nil {
+		t.Fatalf("mkdir docs: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(docsDir, "build_spec.md"), []byte("## Domains\n- Backend: API (Paths: internal/api)\n## Tasks\n- Init [Backend]: bootstrap"), 0644); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
 
 	coord := NewPiCoordinator(tmpDir, PiCoordinatorConfig{})
+	_, err := coord.Plan(context.Background(), PlanRequest{ProjectScan: &ProjectScan{EntryPoints: []string{"cmd/main.go"}}})
+	if err == nil {
+		t.Fatal("expected planner binary error")
+	}
+	if got := err.Error(); !strings.Contains(got, "planner binary is not configured") {
+		t.Fatalf("unexpected error: %s", got)
+	}
+}
 
-	req := PlanRequest{
-		ProjectScan: &ProjectScan{
-			FileCount:   1,
-			EntryPoints: []string{"main.go"},
-		},
+func TestPiCoordinator_PlanDoesNotParseStructuredSpecWithoutPlanner(t *testing.T) {
+	tmpDir := t.TempDir()
+	docsDir := filepath.Join(tmpDir, "docs")
+	if err := os.MkdirAll(docsDir, 0755); err != nil {
+		t.Fatalf("mkdir docs: %v", err)
+	}
+	spec := "## Domains\n- Backend: API (Paths: internal/api)\n## Tasks\n- Init [Backend]: bootstrap"
+	if err := os.WriteFile(filepath.Join(docsDir, "build_spec.md"), []byte(spec), 0644); err != nil {
+		t.Fatalf("write spec: %v", err)
 	}
 
-	resp, err := coord.Plan(context.Background(), req)
+	coord := NewPiCoordinator(tmpDir, PiCoordinatorConfig{})
+	_, err := coord.Plan(context.Background(), PlanRequest{ProjectScan: &ProjectScan{EntryPoints: []string{"cmd/main.go"}}})
+	if err == nil {
+		t.Fatal("expected planner binary error")
+	}
+	if got := err.Error(); !strings.Contains(got, "planner binary is not configured") {
+		t.Fatalf("unexpected error: %s", got)
+	}
+}
+
+func TestPiCoordinator_PlannerStartsWithoutBootstrapPrompt(t *testing.T) {
+	coord := NewPiCoordinator(t.TempDir(), PiCoordinatorConfig{Binary: "pi"})
+	planner := coord.plannerSupervisorConfig(filepath.Join(t.TempDir(), "coordinator"))
+	if planner.InitialPrompt != "" {
+		t.Fatalf("planner should not send a bootstrap turn, got %q", planner.InitialPrompt)
+	}
+	if planner.AgentID != "coordinator" || planner.DomainID != "coordinator" {
+		t.Fatalf("unexpected planner identity: %#v", planner)
+	}
+}
+
+func TestPiCoordinator_PreparePlanningArtifacts(t *testing.T) {
+	tmpDir := t.TempDir()
+	coord := NewPiCoordinator(tmpDir, PiCoordinatorConfig{Binary: "pi"})
+	paths, err := coord.preparePlanningArtifacts("Build the app", PlanRequest{
+		ProjectRoot: tmpDir,
+		ProjectScan: &ProjectScan{EntryPoints: []string{"cmd/main.go"}},
+	})
 	if err != nil {
-		t.Fatalf("Plan failed: %v", err)
+		t.Fatalf("preparePlanningArtifacts: %v", err)
+	}
+	if paths.InputPath != filepath.Join(tmpDir, "docs", "aion", "planning_input.json") {
+		t.Fatalf("unexpected input path: %s", paths.InputPath)
+	}
+	if paths.OutputPath != filepath.Join(tmpDir, "docs", "aion", "plan_response.json") {
+		t.Fatalf("unexpected output path: %s", paths.OutputPath)
 	}
 
-	if len(resp.Nodes) != 2 {
-		t.Errorf("expected 2 nodes, got %d", len(resp.Nodes))
+	data, err := os.ReadFile(paths.InputPath)
+	if err != nil {
+		t.Fatalf("read planning input: %v", err)
+	}
+	var input planningInputArtifact
+	if err := json.Unmarshal(data, &input); err != nil {
+		t.Fatalf("unmarshal planning input: %v", err)
+	}
+	if input.BuildSpec != "Build the app" || input.OutputPath != paths.OutputPath {
+		t.Fatalf("unexpected planning input: %#v", input)
+	}
+}
+
+func TestReadPlanArtifact(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "plan_response.json")
+	raw := `{"type":"plan_response","domains":[{"domain_id":"api","description":"API","assigned_paths":["cmd/"],"agent_type":"domain"}],"nodes":[{"id":"api-task","domain_id":"api","task_spec":"build api","target_files":["cmd/main.go"],"priority":1}],"edges":[]}`
+	if err := os.WriteFile(path, []byte(raw), 0644); err != nil {
+		t.Fatalf("write plan artifact: %v", err)
 	}
 
-	if resp.Nodes[0].ID != "Init" || resp.Nodes[0].DomainID != "Backend" {
-		t.Errorf("first node mismatch: ID=%s, Domain=%s", resp.Nodes[0].ID, resp.Nodes[0].DomainID)
+	plan, err := readPlanArtifact(path)
+	if err != nil {
+		t.Fatalf("readPlanArtifact: %v", err)
 	}
-
-	if len(resp.Domains) != 1 || resp.Domains[0].DomainID != "Backend" {
-		t.Errorf("domain mismatch: count=%d, ID=%s", len(resp.Domains), resp.Domains[0].DomainID)
+	if len(plan.Domains) != 1 || len(plan.Nodes) != 1 {
+		t.Fatalf("unexpected plan: %#v", plan)
 	}
 }
 
