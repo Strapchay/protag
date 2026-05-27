@@ -41,6 +41,8 @@ type PlanResponse struct {
 	Nodes []TaskNode `json:"nodes"`
 	// Edges are the dependency edges.
 	Edges []TaskEdge `json:"edges"`
+	// Milestones are optional client-facing capability groupings for progress.
+	Milestones []Milestone `json:"milestones,omitempty"`
 }
 
 // Domain describes an area of responsibility.
@@ -65,6 +67,16 @@ type TaskEdge struct {
 	FromNode string `json:"from_node"`
 	ToNode   string `json:"to_node"`
 	Reason   string `json:"reason,omitempty"`
+}
+
+// Milestone groups planned nodes into a client-facing capability area.
+type Milestone struct {
+	ID              string   `json:"id"`
+	Title           string   `json:"title"`
+	Summary         string   `json:"summary,omitempty"`
+	NodeIDs         []string `json:"node_ids"`
+	Weight          int      `json:"weight,omitempty"`
+	SuccessCriteria []string `json:"success_criteria,omitempty"`
 }
 
 // ReplanRequest contains the context needed for replanning.

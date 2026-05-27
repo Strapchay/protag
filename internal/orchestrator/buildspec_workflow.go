@@ -10,10 +10,13 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"aion-kernel/internal/coordinator"
 	"aion-kernel/internal/dag"
+	"aion-kernel/internal/hub"
 )
 
 const buildSpecStaleAfter = 25 * time.Minute
@@ -30,6 +33,106 @@ func (d *Daemon) buildSpecAttemptIsActive() bool {
 	default:
 		return false
 	}
+}
+
+func (d *Daemon) seedBuildSpecAttemptContext(attempt *BuildSpecAttempt) {
+	if attempt == nil || d == nil || d.server == nil {
+		return
+	}
+	switch attempt.Status {
+	case BuildSpecAttemptActive, BuildSpecAttemptAllocating, BuildSpecAttemptPlanning, BuildSpecAttemptCommitting:
+	default:
+		return
+	}
+	d.server.SeedHubSnapshot(buildSpecAttemptHubMessages(d.runState.Root, attempt))
+}
+
+func buildSpecAttemptHubMessages(runRoot string, attempt *BuildSpecAttempt) []hub.Message {
+	if attempt == nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	messages := make([]hub.Message, 0, 4)
+
+	addText := func(idSuffix, content string) {
+		content = strings.TrimSpace(content)
+		if content == "" {
+			return
+		}
+		msg, err := hub.NewMessage(hub.MsgContextShare, "coordinator", "tui", map[string]string{
+			"type":    "text",
+			"content": content,
+			"role":    "assistant",
+		})
+		if err != nil {
+			return
+		}
+		msg.ID = fmt.Sprintf("buildspec-replay-%s-%s", attempt.AttemptID, idSuffix)
+		msg.Timestamp = now
+		messages = append(messages, *msg)
+	}
+
+	addText("status", buildSpecAttemptReplaySummary(attempt))
+	if attempt.Plan != nil {
+		addText("plan", buildSpecPlanReplaySummary(attempt.Plan))
+	}
+	if trace, err := readBuildSpecTrace(runRoot); err == nil {
+		addText("trace", "Recent Coordinator trace:\n"+tailLines(trace, 24))
+	}
+	return messages
+}
+
+func buildSpecAttemptReplaySummary(attempt *BuildSpecAttempt) string {
+	var b strings.Builder
+	b.WriteString("Loaded persisted build-spec attempt.\n")
+	b.WriteString("- status: " + string(attempt.Status) + "\n")
+	b.WriteString("- spec_path: " + attempt.SpecPath + "\n")
+	b.WriteString("- attempt_id: " + attempt.AttemptID + "\n")
+	b.WriteString(fmt.Sprintf("- created_nodes: %d\n", len(attempt.CreatedNodeIDs)))
+	b.WriteString(fmt.Sprintf("- created_edges: %d\n", len(attempt.CreatedEdgeIDs)))
+	b.WriteString(fmt.Sprintf("- allocated_domains: %d", len(attempt.AllocatedDomainIDs)))
+	if attempt.FailureReason != "" {
+		b.WriteString("\n- failure_reason: " + attempt.FailureReason)
+	}
+	return b.String()
+}
+
+func buildSpecPlanReplaySummary(plan *coordinator.PlanResponse) string {
+	if plan == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Persisted Coordinator plan response is loaded.\n")
+	b.WriteString(fmt.Sprintf("- domains: %d\n", len(plan.Domains)))
+	for _, domain := range plan.Domains {
+		b.WriteString(fmt.Sprintf("  - %s: %s\n", domain.DomainID, truncateSingleLine(domain.Description, 100)))
+	}
+	b.WriteString(fmt.Sprintf("- nodes: %d\n", len(plan.Nodes)))
+	for i, node := range plan.Nodes {
+		if i >= 12 {
+			b.WriteString(fmt.Sprintf("  - ... %d more node(s)\n", len(plan.Nodes)-i))
+			break
+		}
+		b.WriteString(fmt.Sprintf("  - %s [%s]: %s\n", node.ID, node.DomainID, truncateSingleLine(node.TaskSpec, 120)))
+	}
+	b.WriteString(fmt.Sprintf("- edges: %d", len(plan.Edges)))
+	return b.String()
+}
+
+func tailLines(text string, maxLines int) string {
+	lines := strings.Split(strings.TrimSpace(text), "\n")
+	if maxLines <= 0 || len(lines) <= maxLines {
+		return strings.Join(lines, "\n")
+	}
+	return strings.Join(lines[len(lines)-maxLines:], "\n")
+}
+
+func truncateSingleLine(text string, limit int) string {
+	text = strings.Join(strings.Fields(text), " ")
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	return text[:limit] + "..."
 }
 
 func (d *Daemon) TriggerBuildSpec(specPath string, specData []byte) error {
@@ -164,6 +267,7 @@ func (d *Daemon) executeBuildSpecAttempt(ctx context.Context, attempt *BuildSpec
 	if err := saveBuildSpecAttempt(d.runState.Root, attempt); err != nil {
 		return fmt.Errorf("save attempt plan: %w", err)
 	}
+	d.refreshBuildProgress("plan_saved")
 	_ = appendBuildSpecTrace(d.runState.Root, "plan saved; committing DAG")
 	d.server.BroadcastAgentStatus("coordinator", fmt.Sprintf("Coordinator produced %d domains, %d nodes, %d edges. Committing DAG...", len(plan.Domains), len(plan.Nodes), len(plan.Edges)), "info")
 	log.Printf("daemon: committing planned DAG (nodes: %d, edges: %d)", len(plan.Nodes), len(plan.Edges))
@@ -172,8 +276,10 @@ func (d *Daemon) executeBuildSpecAttempt(ctx context.Context, attempt *BuildSpec
 		attempt.Status = BuildSpecAttemptCommitFailed
 		attempt.FailureReason = err.Error()
 		_ = saveBuildSpecAttempt(d.runState.Root, attempt)
+		d.refreshBuildProgress("commit_failed")
 		return err
 	}
+	d.refreshBuildProgress("dag_committed")
 
 	if err := ctx.Err(); err != nil {
 		return err
@@ -183,6 +289,7 @@ func (d *Daemon) executeBuildSpecAttempt(ctx context.Context, attempt *BuildSpec
 	if err := saveBuildSpecAttempt(d.runState.Root, attempt); err != nil {
 		return fmt.Errorf("save attempt allocating: %w", err)
 	}
+	d.refreshBuildProgress("allocating")
 	_ = appendBuildSpecTrace(d.runState.Root, "dag committed; allocating agents")
 
 	log.Printf("daemon: generating initial system instructions")
@@ -194,12 +301,17 @@ func (d *Daemon) executeBuildSpecAttempt(ctx context.Context, attempt *BuildSpec
 
 	log.Printf("daemon: allocating agents...")
 	d.server.BroadcastAgentStatus("coordinator", "Coordinator is allocating domain agents...", "info")
+	attempt.AllocatedDomainIDs = attempt.AllocatedDomainIDs[:0]
+	for _, domain := range plan.Domains {
+		attempt.AllocatedDomainIDs = append(attempt.AllocatedDomainIDs, domain.DomainID)
+	}
 	if err := d.allocator.Allocate(ctx, plan.Domains, prompts); err != nil {
 		attempt.Status = BuildSpecAttemptAllocationFailed
 		attempt.FailureReason = err.Error()
 		_ = saveBuildSpecAttempt(d.runState.Root, attempt)
 		_ = appendBuildSpecTrace(d.runState.Root, fmt.Sprintf("allocation failed: %v", err))
 		d.server.BroadcastAgentStatus("coordinator", fmt.Sprintf("Coordinator allocation failed: %v", err), "error")
+		d.refreshBuildProgress("allocation_failed")
 		return fmt.Errorf("allocation failed: %w", err)
 	}
 
@@ -210,6 +322,7 @@ func (d *Daemon) executeBuildSpecAttempt(ctx context.Context, attempt *BuildSpec
 	if err := saveBuildSpecAttempt(d.runState.Root, attempt); err != nil {
 		return fmt.Errorf("finalize build-spec attempt: %w", err)
 	}
+	d.refreshBuildProgress("active")
 	_ = appendBuildSpecTrace(d.runState.Root, "allocation complete; build-spec active")
 	if handoff, ok := d.coordinator.(interface{ MarkBuildSpecHandoff() }); ok {
 		handoff.MarkBuildSpecHandoff()
@@ -358,6 +471,13 @@ func (d *Daemon) resetBuildSpecArtifactsLocked() error {
 }
 
 func (d *Daemon) continueBuildSpecAgents() error {
+	d.buildSpecMu.Lock()
+	armed := d.buildSpecContinueArmed
+	d.buildSpecMu.Unlock()
+	if !armed {
+		return fmt.Errorf("build-spec continuation must be triggered explicitly by /continue-agents")
+	}
+
 	attempt, err := loadBuildSpecAttempt(d.runState.Root)
 	if err != nil {
 		return fmt.Errorf("load build-spec attempt: %w", err)
@@ -365,10 +485,20 @@ func (d *Daemon) continueBuildSpecAgents() error {
 	if attempt == nil {
 		return fmt.Errorf("no persisted build-spec attempt to continue")
 	}
+	if attempt.Plan == nil {
+		return fmt.Errorf("no saved build-spec plan for the current attempt")
+	}
 	if attempt.Status != BuildSpecAttemptActive && attempt.Status != BuildSpecAttemptAllocating {
 		return fmt.Errorf("build-spec agents are only resumable after allocation has started")
 	}
-	return d.resumeActiveBuildSpecAgents(attempt)
+	live := d.allocator.AgentInfos()
+	if len(live) == 0 {
+		d.buildSpecMu.Lock()
+		d.buildSpecAttempt = attempt
+		d.buildSpecMu.Unlock()
+		return d.resumeActiveBuildSpecAgents(attempt)
+	}
+	return d.continueActiveBuildSpecAgents(attempt, live)
 }
 
 func (d *Daemon) resumeActiveBuildSpecAgents(attempt *BuildSpecAttempt) error {
@@ -396,7 +526,10 @@ func (d *Daemon) resumeActiveBuildSpecAgents(attempt *BuildSpecAttempt) error {
 	if err != nil {
 		return fmt.Errorf("generate resumed prompts: %w", err)
 	}
-	if err := d.allocator.Allocate(d.ctx, attempt.Plan.Domains, prompts); err != nil {
+	if err := d.allocator.AllocateWithOptions(d.ctx, attempt.Plan.Domains, prompts, AllocationOptions{
+		Mode:          AllocationModeResume,
+		ResumeMessage: buildSpecDomainAgentResumeMessage(attempt),
+	}); err != nil {
 		return fmt.Errorf("allocate resumed agents: %w", err)
 	}
 	if attempt.Status == BuildSpecAttemptAllocating {
@@ -407,7 +540,68 @@ func (d *Daemon) resumeActiveBuildSpecAgents(attempt *BuildSpecAttempt) error {
 		_ = saveBuildSpecAttempt(d.runState.Root, attempt)
 	}
 	d.server.BroadcastAgentStatus("coordinator", "Persisted build-spec agents resumed.", "ok")
+	d.refreshBuildProgress("agents_resumed")
 	return nil
+}
+
+func buildSpecDomainAgentResumeMessage(attempt *BuildSpecAttempt) string {
+	attemptID := ""
+	if attempt != nil {
+		attemptID = attempt.AttemptID
+	}
+	return strings.TrimSpace(fmt.Sprintf(`Resume your existing Aion domain-agent Pi session for build-spec execution.
+
+Build-spec attempt: %s
+
+The server was restarted or the agent set was explicitly continued. Keep your existing context and continue pending DAG work for your assigned domain.
+Do not re-run the original onboarding/system prompt. Use orchestrator-cli to read the DAG, acquire locks, update task status, create stubs, and coordinate through the context hub.
+If you are unsure what is pending, inspect the DAG first and continue only work assigned to you.`, attemptID))
+}
+
+func (d *Daemon) continueActiveBuildSpecAgents(attempt *BuildSpecAttempt, live []AgentInfo) error {
+	reviveIDs := d.buildSpecFailedAgentIDs(attempt, live)
+	if len(reviveIDs) == 0 {
+		d.server.BroadcastStatus("No failed build-spec agents need continuation.", "ok")
+		return nil
+	}
+
+	_ = appendBuildSpecTrace(d.runState.Root, fmt.Sprintf("continuing failed build-spec agents: %s", strings.Join(reviveIDs, ", ")))
+	d.server.BroadcastStatus(fmt.Sprintf("Continuing %d failed build-spec agent(s)...", len(reviveIDs)), "info")
+
+	for _, agentID := range reviveIDs {
+		if err := d.allocator.ReviveAgent(d.ctx, agentID); err != nil {
+			return fmt.Errorf("revive build-spec agent %s: %w", agentID, err)
+		}
+	}
+	d.server.BroadcastStatus("Failed build-spec agents continued.", "ok")
+	d.refreshBuildProgress("agents_continued")
+	return nil
+}
+
+func (d *Daemon) buildSpecFailedAgentIDs(attempt *BuildSpecAttempt, live []AgentInfo) []string {
+	var reviveIDs []string
+	for _, info := range live {
+		state := strings.TrimSpace(info.State)
+		if state == "" && attempt != nil {
+			if persisted, ok := attempt.AgentStates[info.AgentID]; ok {
+				state = persisted.State
+			}
+		}
+		if isFailedBuildSpecAgentState(state) {
+			reviveIDs = append(reviveIDs, info.AgentID)
+		}
+	}
+	sort.Strings(reviveIDs)
+	return reviveIDs
+}
+
+func isFailedBuildSpecAgentState(state string) bool {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "crashed", "stopped", "failed", "failed_terminal":
+		return true
+	default:
+		return false
+	}
 }
 
 func (d *Daemon) buildSpecStatus() string {

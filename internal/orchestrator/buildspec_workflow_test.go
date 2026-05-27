@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"aion-kernel/internal/coordinator"
 	"aion-kernel/internal/dag"
 	"aion-kernel/internal/hub"
 )
@@ -16,6 +17,7 @@ func TestBuildSpecAttemptSaveLoad(t *testing.T) {
 	root := t.TempDir()
 	attempt := newBuildSpecAttempt("run_1", "docs/build_spec.md", []byte("hello world"))
 	attempt.Status = BuildSpecAttemptPlanning
+	attempt.RecordAgentState("agent-a", "domain-a", "Running", "")
 	if err := saveBuildSpecAttempt(root, attempt); err != nil {
 		t.Fatalf("saveBuildSpecAttempt: %v", err)
 	}
@@ -25,6 +27,49 @@ func TestBuildSpecAttemptSaveLoad(t *testing.T) {
 	}
 	if loaded == nil || loaded.SpecHash != attempt.SpecHash || loaded.Status != BuildSpecAttemptPlanning {
 		t.Fatalf("unexpected loaded attempt: %#v", loaded)
+	}
+	if loaded.AgentStates["agent-a"].State != "Running" {
+		t.Fatalf("expected persisted agent state, got %#v", loaded.AgentStates)
+	}
+}
+
+func TestBuildSpecAttemptHubMessagesIncludeActivePlanContext(t *testing.T) {
+	root := t.TempDir()
+	attempt := newBuildSpecAttempt("run_1", "docs/build_spec.md", []byte("hello world"))
+	attempt.Status = BuildSpecAttemptActive
+	attempt.CreatedNodeIDs = []string{"api-task"}
+	attempt.CreatedEdgeIDs = []string{"api-task->ui-task"}
+	attempt.AllocatedDomainIDs = []string{"api", "ui"}
+	attempt.Plan = &coordinator.PlanResponse{
+		Domains: []coordinator.Domain{
+			{DomainID: "api", Description: "API work"},
+		},
+		Nodes: []coordinator.TaskNode{
+			{ID: "api-task", DomainID: "api", TaskSpec: "Build the API"},
+		},
+		Edges: []coordinator.TaskEdge{
+			{FromNode: "api-task", ToNode: "ui-task"},
+		},
+	}
+	if err := os.WriteFile(buildSpecTracePath(root), []byte("coordinator plan received\n"), 0o644); err != nil {
+		t.Fatalf("write trace: %v", err)
+	}
+
+	messages := buildSpecAttemptHubMessages(root, attempt)
+	if len(messages) < 3 {
+		t.Fatalf("expected replay messages, got %d", len(messages))
+	}
+	combined := ""
+	for _, msg := range messages {
+		if msg.FromAgent != "coordinator" || msg.ToAgent != "tui" {
+			t.Fatalf("unexpected replay routing: %#v", msg)
+		}
+		combined += string(msg.Payload) + "\n"
+	}
+	for _, want := range []string{"Loaded persisted build-spec attempt", "Persisted Coordinator plan response", "coordinator plan received"} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("replay payload missing %q:\n%s", want, combined)
+		}
 	}
 }
 
@@ -137,5 +182,31 @@ func TestPrepareBuildSpecAttemptRefusesDagWithoutMetadata(t *testing.T) {
 	}
 	if _, err := daemon.prepareBuildSpecAttempt("docs/build_spec.md", []byte("hello")); err == nil {
 		t.Fatal("expected refusal when DAG exists without attempt metadata")
+	}
+}
+
+func TestBuildSpecFailedAgentIDs(t *testing.T) {
+	daemon := testBuildSpecDaemon(t)
+	attempt := newBuildSpecAttempt(daemon.runState.RunID, "docs/build_spec.md", []byte("hello"))
+	attempt.AgentStates = map[string]BuildSpecAgentState{
+		"agent-a": {AgentID: "agent-a", DomainID: "domain-a", State: "Running"},
+		"agent-b": {AgentID: "agent-b", DomainID: "domain-b", State: "Crashed"},
+	}
+
+	ids := daemon.buildSpecFailedAgentIDs(attempt, []AgentInfo{
+		{AgentID: "agent-a", DomainID: "domain-a", State: "Running"},
+		{AgentID: "agent-b", DomainID: "domain-b", State: "Stopped"},
+		{AgentID: "agent-c", DomainID: "domain-c", State: "Running"},
+	})
+
+	if len(ids) != 1 || ids[0] != "agent-b" {
+		t.Fatalf("unexpected failed agent ids: %#v", ids)
+	}
+}
+
+func TestContinueBuildSpecAgentsRequiresExplicitArm(t *testing.T) {
+	daemon := testBuildSpecDaemon(t)
+	if err := daemon.continueBuildSpecAgents(); err == nil {
+		t.Fatal("expected explicit arm requirement")
 	}
 }

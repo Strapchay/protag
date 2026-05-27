@@ -21,18 +21,31 @@ type Model struct {
 	OpsView   *OpsModel
 	ChatInput *ChatModel
 	StatusBar *StatusModel
+
+	options Options
+}
+
+// Options configures dashboard diagnostics and display behavior.
+type Options struct {
+	Verbose bool
 }
 
 // NewModel returns an initialized root dashboard model.
 func NewModel(addr string) *Model {
+	return NewModelWithOptions(addr, Options{})
+}
+
+// NewModelWithOptions returns an initialized root dashboard model.
+func NewModelWithOptions(addr string, options Options) *Model {
 	return &Model{
 		SelectedPane: "chat",
 		DagView:      NewDagModel(addr),
-		HubView:      NewHubModel(addr),
-		LogView:      NewMultiLogModel(addr),
+		HubView:      NewHubModelWithOptions(addr, options),
+		LogView:      NewMultiLogModelWithOptions(addr, options),
 		OpsView:      NewOpsModel(),
 		ChatInput:    NewChatModel(addr),
 		StatusBar:    NewStatusModel(),
+		options:      options,
 	}
 }
 
@@ -46,7 +59,17 @@ func (m *Model) Init() tea.Cmd {
 		m.OpsView.Init(),
 		m.ChatInput.Init(),
 		m.StatusBar.Init(),
+		m.dashboardStartStatusCmd(),
 	)
+}
+
+func (m *Model) dashboardStartStatusCmd() tea.Cmd {
+	return func() tea.Msg {
+		if m.options.Verbose {
+			return StatusMsg{Text: "Resolving orchestrator stream at " + m.HubView.addr, Level: "info"}
+		}
+		return StatusMsg{Text: "Connecting to orchestrator...", Level: "info"}
+	}
 }
 
 // Update processes BubbleTea events like keystrokes or resize payloads.

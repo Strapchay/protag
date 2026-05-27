@@ -196,6 +196,7 @@ func (s *AgentSupervisor) Start(ctx context.Context) error {
 		return fmt.Errorf("supervisor: start agent %s: %w", s.config.AgentID, err)
 	}
 
+	s.emitLifecycle(AgentLifecycleEvent{Kind: "agent_started"})
 	return nil
 }
 
@@ -307,6 +308,7 @@ func (s *AgentSupervisor) Stop() error {
 
 	// Clean up cgroup
 	DestroyCgroup(s.config.Cgroup.BasePath, s.config.AgentID)
+	s.emitLifecycle(AgentLifecycleEvent{Kind: "agent_stopped"})
 
 	log.Printf("supervisor: agent %s stopped", s.config.AgentID)
 	return nil
@@ -498,6 +500,7 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 		s.mu.Lock()
 		s.recentTools = s.recentTools[:0]
 		s.mu.Unlock()
+		s.emitLifecycle(AgentLifecycleEvent{Kind: "file_modified", Content: string(event.Message)})
 	case "tool_error":
 		s.emitLifecycle(AgentLifecycleEvent{Kind: "tool_error", IsError: true, Error: event.ErrorMessage})
 		s.handleNetworkFault(event)
@@ -757,6 +760,7 @@ func (s *AgentSupervisor) handleCrash(reason string) {
 
 	log.Printf("supervisor: agent %s crashed (reason: %s, crashes: %d/%d)", s.config.AgentID, reason, count, maxRestarts)
 	s.emitStatus(fmt.Sprintf("[%s] Crashed: %s (%d/%d)", s.config.AgentID, reason, count, maxRestarts), "error")
+	s.emitLifecycle(AgentLifecycleEvent{Kind: "agent_crashed", Error: reason})
 
 	// Kill process group if still running
 	if piAgent != nil {
@@ -776,6 +780,7 @@ func (s *AgentSupervisor) handleCrash(reason string) {
 		s.mu.Lock()
 		s.state = StateStopped
 		s.mu.Unlock()
+		s.emitLifecycle(AgentLifecycleEvent{Kind: "agent_stopped", Error: reason})
 		return
 	}
 
@@ -791,5 +796,6 @@ func (s *AgentSupervisor) handleCrash(reason string) {
 		s.mu.Lock()
 		s.state = StateStopped
 		s.mu.Unlock()
+		s.emitLifecycle(AgentLifecycleEvent{Kind: "agent_stopped", Error: err.Error()})
 	}
 }

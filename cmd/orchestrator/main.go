@@ -32,6 +32,8 @@ func main() {
 	configPath := flagSet.String("config", "", "path to configuration file")
 	workDir := flagSet.String("workdir", "", "project working directory (defaults to current directory)")
 	projectRootFlag := flagSet.String("project-root", "", "alias for --workdir")
+	logLevelFlag := flagSet.String("log-level", "", "server log level: info, debug, trace")
+	verboseFlag := flagSet.Bool("verbose", false, "enable debug-level server diagnostics")
 
 	var userPrompt string
 	if command == "run" {
@@ -61,6 +63,12 @@ func main() {
 	}
 	log.Printf("aion-kernel: project root: %s", projectRoot)
 	log.Printf("aion-kernel: config source: %s", configSource)
+	if *verboseFlag {
+		config.Orchestrator.LogLevel = "debug"
+	} else if *logLevelFlag != "" {
+		config.Orchestrator.LogLevel = *logLevelFlag
+	}
+	log.Printf("aion-kernel: log level: %s", config.Orchestrator.LogLevel)
 
 	daemon, err := orchestrator.NewDaemon(config, projectRoot)
 	if err != nil {
@@ -249,4 +257,6 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  --workdir <dir>       Project directory to operate on (default: current directory)\n")
 	fmt.Fprintf(os.Stderr, "  --project-root <dir>  Alias for --workdir\n")
 	fmt.Fprintf(os.Stderr, "  --config <file>       Config file path relative to project root, or absolute\n")
+	fmt.Fprintf(os.Stderr, "  --log-level <level>   Server diagnostics level: info, debug, trace\n")
+	fmt.Fprintf(os.Stderr, "  --verbose             Alias for --log-level debug\n")
 }

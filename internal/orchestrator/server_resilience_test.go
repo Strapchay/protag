@@ -74,6 +74,60 @@ func TestArchitectCommandHandlerError(t *testing.T) {
 	}
 }
 
+func TestDebugStatusReportsRuntimeSnapshot(t *testing.T) {
+	s := NewServer(newTestDagManager(t), locking.NewManager(nil), stub.NewRegistry(), nil)
+	dir := t.TempDir()
+	s.SetLogsDir(dir)
+	s.SetLogLevel("debug")
+	s.SetBuildSpecStatusCallback(func() string { return "active" })
+	s.SetAgentListCallback(func() []AgentInfo {
+		return []AgentInfo{{AgentID: "agent-api", DomainID: "api", State: "Running"}}
+	})
+	s.BroadcastHubEvent(hubMessageForTest(t, "coordinator", "agent-api", "hello"))
+
+	resp := s.handleRequest(Request{ID: "debug-1", Method: "debug-status"})
+	if resp.Error != "" {
+		t.Fatalf("debug-status error: %s", resp.Error)
+	}
+	result, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("unexpected result type: %#v", resp.Result)
+	}
+	if result["log_level"] != "debug" {
+		t.Fatalf("unexpected log level: %#v", result["log_level"])
+	}
+	if result["build_spec_status"] != "active" {
+		t.Fatalf("unexpected build status: %#v", result["build_spec_status"])
+	}
+	if result["hub_snapshot_count"] != 1 {
+		t.Fatalf("unexpected hub snapshot count: %#v", result["hub_snapshot_count"])
+	}
+}
+
+func TestHubSnapshotRegularRequestRoute(t *testing.T) {
+	s := NewServer(newTestDagManager(t), locking.NewManager(nil), stub.NewRegistry(), nil)
+	s.BroadcastHubEvent(hubMessageForTest(t, "coordinator", "agent-api", "hello"))
+
+	resp := s.handleRequest(Request{ID: "snap-1", Method: "hub-snapshot"})
+	if resp.Error != "" {
+		t.Fatalf("hub-snapshot error: %s", resp.Error)
+	}
+
+	raw, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatalf("marshal snapshot result: %v", err)
+	}
+	var result struct {
+		Messages []hub.Message `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("decode snapshot result: %v", err)
+	}
+	if len(result.Messages) != 1 {
+		t.Fatalf("snapshot messages = %d, want 1", len(result.Messages))
+	}
+}
+
 func TestTailHubEventsReplaysPersistedHistory(t *testing.T) {
 	dir := t.TempDir()
 	seed := NewServer(newTestDagManager(t), locking.NewManager(nil), stub.NewRegistry(), nil)

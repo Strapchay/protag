@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"aion-kernel/internal/hub"
 
@@ -14,7 +15,14 @@ import (
 )
 
 type hubEventMsg struct {
-	Text string
+	Text       string
+	Level      string
+	Diagnostic bool
+}
+type hubSnapshotMsg struct {
+	Messages []hub.Message
+	AsOf     time.Time
+	Err      error
 }
 type streamHubClosedMsg struct{}
 
@@ -26,9 +34,14 @@ type HubModel struct {
 	err       error
 	connected bool
 	Focused   bool
+	verbose   bool
 }
 
 func NewHubModel(addr string) *HubModel {
+	return NewHubModelWithOptions(addr, Options{})
+}
+
+func NewHubModelWithOptions(addr string, options Options) *HubModel {
 	vp := viewport.New(80, 10)
 	vp.SetContent("Waiting for Hub Events...")
 	return &HubModel{
@@ -36,38 +49,74 @@ func NewHubModel(addr string) *HubModel {
 		viewport:  vp,
 		eventCh:   make(chan hubEventMsg, 100),
 		connected: false,
+		verbose:   options.Verbose,
 	}
 }
 
 func (m *HubModel) Init() tea.Cmd {
-	return tea.Batch(
-		m.startStreamCmd(),
-		m.readNextCmd(),
-	)
+	return m.fetchSnapshotCmd()
 }
 
-func (m *HubModel) startStreamCmd() tea.Cmd {
+func (m *HubModel) fetchSnapshotCmd() tea.Cmd {
+	return func() tea.Msg {
+		reqBytes, _ := json.Marshal(map[string]interface{}{
+			"method": "hub-snapshot",
+			"id":     "hub-snapshot-1",
+			"params": map[string]interface{}{},
+		})
+
+		conn, err := net.Dial("tcp", m.addr)
+		if err != nil {
+			return hubSnapshotMsg{Err: err}
+		}
+		defer conn.Close()
+
+		if _, err := conn.Write(reqBytes); err != nil {
+			return hubSnapshotMsg{Err: err}
+		}
+
+		var resp struct {
+			Result struct {
+				Messages []hub.Message `json:"messages"`
+				AsOf     time.Time     `json:"as_of"`
+			} `json:"result"`
+			Error string `json:"error"`
+		}
+		if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+			return hubSnapshotMsg{Err: err}
+		}
+		if resp.Error != "" {
+			return hubSnapshotMsg{Err: fmt.Errorf("%s", resp.Error)}
+		}
+		return hubSnapshotMsg{Messages: resp.Result.Messages, AsOf: resp.Result.AsOf}
+	}
+}
+
+func (m *HubModel) startLiveStreamCmd(since time.Time) tea.Cmd {
 	return func() tea.Msg {
 		go func() {
 			req := map[string]interface{}{
 				"method": "tail-hub-events",
 				"id":     "hub-1",
-				"params": map[string]interface{}{},
+				"params": map[string]interface{}{"since": since},
 			}
 			reqBytes, _ := json.Marshal(req)
 
 			conn, err := net.Dial("tcp", m.addr)
 			if err != nil {
-				m.eventCh <- hubEventMsg{Text: fmt.Sprintf("Error dialing: %v", err)}
+				m.eventCh <- hubEventMsg{Text: fmt.Sprintf("Hub stream dial failed: %v", err), Level: "error", Diagnostic: true}
 				close(m.eventCh)
 				return
 			}
 			defer conn.Close()
 
 			if _, err := conn.Write(reqBytes); err != nil {
-				m.eventCh <- hubEventMsg{Text: fmt.Sprintf("Error wiring: %v", err)}
+				m.eventCh <- hubEventMsg{Text: fmt.Sprintf("Hub stream request failed: %v", err), Level: "error", Diagnostic: true}
 				close(m.eventCh)
 				return
+			}
+			if m.verbose {
+				m.eventCh <- hubEventMsg{Text: "Hub live stream connected", Level: "ok", Diagnostic: true}
 			}
 
 			decoder := json.NewDecoder(conn)
@@ -112,7 +161,40 @@ func (m *HubModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.LineDown(3)
 			return m, nil
 		}
+	case hubSnapshotMsg:
+		if msg.Err != nil {
+			m.lines = append(m.lines, "Error loading hub snapshot: "+msg.Err.Error())
+			m.renderLines()
+			return m, func() tea.Msg { return StatusMsg{Text: "Hub snapshot failed: " + msg.Err.Error(), Level: "error"} }
+		}
+		if m.verbose {
+			m.lines = append(m.lines, fmt.Sprintf("[diagnostic] Hub snapshot loaded: %d event(s)", len(msg.Messages)))
+			cmds = append(cmds, func() tea.Msg {
+				return StatusMsg{Text: fmt.Sprintf("Hub snapshot loaded: %d event(s); opening live stream", len(msg.Messages)), Level: "info"}
+			})
+		}
+		for _, raw := range msg.Messages {
+			b, _ := json.Marshal(raw)
+			m.lines = append(m.lines, string(b))
+		}
+		if len(m.lines) > 1000 {
+			m.lines = m.lines[len(m.lines)-1000:]
+		}
+		m.renderLines()
+		m.viewport.GotoBottom()
+		cmds = append(cmds, m.startLiveStreamCmd(msg.AsOf), m.readNextCmd())
 	case hubEventMsg:
+		if msg.Diagnostic {
+			if m.verbose {
+				m.lines = append(m.lines, "[diagnostic] "+msg.Text)
+				m.renderLines()
+				m.viewport.GotoBottom()
+			}
+			cmds = append(cmds, func() tea.Msg {
+				return StatusMsg{Text: msg.Text, Level: msg.Level}
+			}, m.readNextCmd())
+			return m, tea.Batch(cmds...)
+		}
 		m.connected = true
 		// Parse the raw hub message
 		var hMsg hub.Message

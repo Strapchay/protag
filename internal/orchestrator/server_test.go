@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"encoding/json"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -217,8 +218,8 @@ func TestStreamingObservability(t *testing.T) {
 	go func() {
 		for i := 0; i < 10; i++ {
 			msg := hub.Message{
-				ID:   "msg-idx",
-				Type: hub.MsgStubFulfilled,
+				ID:      "msg-idx",
+				Type:    hub.MsgStubFulfilled,
 				Payload: []byte(`{"status":"running"}`),
 			}
 			srv.BroadcastHubEvent(msg)
@@ -246,3 +247,116 @@ func TestStreamingObservability(t *testing.T) {
 	}
 }
 
+func TestHubSnapshotCachePersists(t *testing.T) {
+	dir := t.TempDir()
+	dagMgr, err := dag.NewManager(dag.ManagerConfig{
+		StoreFilePath: filepath.Join(dir, "dag.bin"),
+		WalFilePath:   filepath.Join(dir, "dag.wal"),
+		MaxNodes:      200,
+		FlushDeadline: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer dagMgr.Close()
+
+	srv := NewServer(dagMgr, locking.NewManager([]string{"go.mod"}), stub.NewRegistry(), nil)
+	srv.SetLogsDir(dir)
+	srv.BroadcastHubEvent(hub.Message{
+		ID:        "snap-1",
+		Type:      hub.MsgStubFulfilled,
+		FromAgent: "coordinator",
+		Payload:   []byte(`{"status":"ready"}`),
+		Timestamp: time.Now(),
+	})
+
+	if _, err := os.Stat(filepath.Join(dir, "hub_snapshot.json")); err != nil {
+		t.Fatalf("expected snapshot file: %v", err)
+	}
+
+	srv2 := NewServer(dagMgr, locking.NewManager([]string{"go.mod"}), stub.NewRegistry(), nil)
+	srv2.SetLogsDir(dir)
+	snap := srv2.loadHubSnapshot()
+	if len(snap) != 1 || snap[0].ID != "snap-1" {
+		t.Fatalf("unexpected snapshot contents: %#v", snap)
+	}
+}
+
+func TestHubSnapshotAndSinceTail(t *testing.T) {
+	srv, addr := startTestServer(t)
+
+	oldMsg := hub.Message{
+		ID:        "old-msg",
+		Type:      hub.MsgStubFulfilled,
+		FromAgent: "coordinator",
+		Payload:   []byte(`{"status":"old"}`),
+		Timestamp: time.Now().Add(-2 * time.Second),
+	}
+	srv.BroadcastHubEvent(oldMsg)
+
+	snap := sendTestRequest(t, addr, "hub-snapshot", map[string]interface{}{})
+	if snap.Error != "" {
+		t.Fatalf("hub-snapshot error: %s", snap.Error)
+	}
+	result, ok := snap.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("unexpected snapshot response: %#v", snap.Result)
+	}
+	messages, ok := result["messages"].([]interface{})
+	if !ok || len(messages) != 1 {
+		t.Fatalf("unexpected snapshot messages: %#v", result["messages"])
+	}
+	asOfRaw, ok := result["as_of"].(string)
+	if !ok || asOfRaw == "" {
+		t.Fatalf("unexpected snapshot as_of: %#v", result["as_of"])
+	}
+	asOf, err := time.Parse(time.RFC3339Nano, asOfRaw)
+	if err != nil {
+		t.Fatalf("parse as_of: %v", err)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	freshMsg := hub.Message{
+		ID:        "fresh-msg",
+		Type:      hub.MsgStubFulfilled,
+		FromAgent: "coordinator",
+		Payload:   []byte(`{"status":"fresh"}`),
+		Timestamp: time.Now(),
+	}
+	srv.BroadcastHubEvent(freshMsg)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial stream: %v", err)
+	}
+	defer conn.Close()
+
+	req := Request{
+		Method: "tail-hub-events",
+		ID:     "stream-since-1",
+		Params: mustJSON(t, map[string]interface{}{"since": asOf}),
+	}
+	encoder := json.NewEncoder(conn)
+	decoder := json.NewDecoder(conn)
+	if err := encoder.Encode(req); err != nil {
+		t.Fatalf("encode stream request: %v", err)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	var got hub.Message
+	if err := decoder.Decode(&got); err != nil {
+		t.Fatalf("decode stream since: %v", err)
+	}
+	if got.ID != "fresh-msg" {
+		t.Fatalf("expected fresh message, got %#v", got)
+	}
+}
+
+func mustJSON(t testing.TB, v interface{}) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return b
+}

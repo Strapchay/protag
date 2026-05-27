@@ -38,6 +38,7 @@ type OrchestratorConfig struct {
 	WalFile         string `yaml:"wal_file"`
 	MaxActiveNodes  uint32 `yaml:"max_active_nodes"`
 	FlushDeadlineMs int    `yaml:"flush_deadline_ms"`
+	LogLevel        string `yaml:"log_level,omitempty"`
 }
 
 // AgentsConfig configures agent management.
@@ -162,6 +163,7 @@ orchestrator:
   wal_file: ".aion/orchestrator.wal"
   max_active_nodes: 200
   flush_deadline_ms: 50
+  log_level: "${AION_LOG_LEVEL}"
 
 health:
   heartbeat_timeout_sec: 30
@@ -251,6 +253,12 @@ func applyDefaults(c *Config) {
 	}
 	if c.Orchestrator.FlushDeadlineMs == 0 {
 		c.Orchestrator.FlushDeadlineMs = 50
+	}
+	if c.Orchestrator.LogLevel == "" {
+		c.Orchestrator.LogLevel = os.Getenv("AION_LOG_LEVEL")
+	}
+	if c.Orchestrator.LogLevel == "" {
+		c.Orchestrator.LogLevel = "info"
 	}
 	if c.Agents.SessionDir == "" {
 		c.Agents.SessionDir = ".aion/sessions/"

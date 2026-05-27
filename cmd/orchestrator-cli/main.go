@@ -40,11 +40,12 @@ func main() {
 
 	// Parse flags for the command
 	if command == "dashboard" {
+		verbose := hasFlag(os.Args[2:], "--verbose") || hasFlag(os.Args[2:], "-v")
 		addr := resolveDashboardAddr()
 		if addr == "" {
 			exitError("dashboard requires a running project server or AION_ORCHESTRATOR_ADDR/AION_ORCHESTRATOR_CORE_ADDR")
 		}
-		p := tea.NewProgram(dashboard.NewModel(addr), tea.WithMouseCellMotion())
+		p := tea.NewProgram(dashboard.NewModelWithOptions(addr, dashboard.Options{Verbose: verbose}), tea.WithMouseCellMotion())
 		if _, err := p.Run(); err != nil {
 			fmt.Printf("Error running dashboard: %v", err)
 			os.Exit(1)
@@ -72,9 +73,9 @@ func main() {
 	}
 
 	// Connect to orchestrator
-	addr := resolveOrchestratorAddr()
+	addr := resolveCommandAddr(command)
 	if addr == "" {
-		exitError("connection error: no orchestrator address resolved from env")
+		exitError("connection error: no orchestrator address resolved from project server info or env")
 	}
 
 	resp, err := sendRequest(addr, req)
@@ -89,6 +90,15 @@ func main() {
 	// Output result as JSON
 	output, _ := json.MarshalIndent(json.RawMessage(resp.Result), "", "  ")
 	fmt.Println(string(output))
+}
+
+func resolveCommandAddr(command string) string {
+	switch command {
+	case "debug-status":
+		return resolveDashboardAddr()
+	default:
+		return resolveOrchestratorAddr()
+	}
 }
 
 func sendRequest(addr string, req Request) (*Response, error) {
@@ -306,9 +316,25 @@ func parseCommand(command string, args []string) (map[string]interface{}, error)
 		}
 		return map[string]interface{}{"agent_id": agentID, "text": text}, nil
 
+	case "debug-status":
+		return map[string]interface{}{}, nil
+	case "build-progress":
+		return map[string]interface{}{}, nil
+
 	default:
 		return nil, fmt.Errorf("unknown command: %s", command)
 	}
+}
+
+func hasFlag(args []string, names ...string) bool {
+	for _, arg := range args {
+		for _, name := range names {
+			if arg == name {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func parseFlags(args []string) map[string]string {
@@ -347,7 +373,9 @@ Commands:
   read-dag        [--node-id <uuid>]
   heartbeat       --agent-id <uuid>
   query-memory    --text <query> [--top-k N]
-  dashboard       Launch real-time monitoring TUI
+  debug-status    Print server/run/hub/DAG/agent diagnostics
+  build-progress  Print current build-spec progress projection
+  dashboard       Launch real-time monitoring TUI [--verbose]
 
 Environment:
   AION_ORCHESTRATOR_ADDR   Orchestrator address

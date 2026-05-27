@@ -27,7 +27,21 @@ type Allocator struct {
 	mu            sync.Mutex
 	statusFn      func(text, level string) // optional: broadcasts to TUI status bar
 	agentStatusFn func(agentID, text, level string)
+	agentStateFn  func(agentID, domainID, state, reason string)
+	lifecycleFn   func(agentID, domainID string, event supervisor.AgentLifecycleEvent)
 	broadcastFn   func(hub.Message)
+}
+
+type AllocationMode string
+
+const (
+	AllocationModeInitial AllocationMode = "initial"
+	AllocationModeResume  AllocationMode = "resume"
+)
+
+type AllocationOptions struct {
+	Mode          AllocationMode
+	ResumeMessage string
 }
 
 // NewAllocator creates a new allocator.
@@ -50,6 +64,14 @@ func (a *Allocator) SetAgentStatusFunc(fn func(agentID, text, level string)) {
 	a.agentStatusFn = fn
 }
 
+func (a *Allocator) SetAgentStateFunc(fn func(agentID, domainID, state, reason string)) {
+	a.agentStateFn = fn
+}
+
+func (a *Allocator) SetLifecycleFunc(fn func(agentID, domainID string, event supervisor.AgentLifecycleEvent)) {
+	a.lifecycleFn = fn
+}
+
 func (a *Allocator) SetBroadcastFunc(fn func(hub.Message)) {
 	a.broadcastFn = fn
 }
@@ -62,8 +84,18 @@ func (a *Allocator) emitStatus(text, level string) {
 
 // Allocate writes the context files and spins up the agents for the planned domains.
 func (a *Allocator) Allocate(ctx context.Context, domains []coordinator.Domain, prompts map[string]string) error {
+	return a.AllocateWithOptions(ctx, domains, prompts, AllocationOptions{Mode: AllocationModeInitial})
+}
+
+// AllocateWithOptions writes the context files and spins up agents, optionally
+// resuming existing Pi sessions with a concise resume prompt instead of sending
+// the full initial domain prompt again.
+func (a *Allocator) AllocateWithOptions(ctx context.Context, domains []coordinator.Domain, prompts map[string]string, options AllocationOptions) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if options.Mode == "" {
+		options.Mode = AllocationModeInitial
+	}
 
 	agentBaseDir := resolveProjectPath(a.projectRoot, a.config.Agents.SessionDir)
 	if err := os.MkdirAll(agentBaseDir, 0755); err != nil {
@@ -126,11 +158,17 @@ func (a *Allocator) Allocate(ctx context.Context, domains []coordinator.Domain, 
 			}
 		}
 
+		initialPrompt := prompt
+		resumeAgent := options.Mode == AllocationModeResume && hasReusablePiSession(agentDir)
+		if resumeAgent {
+			initialPrompt = ""
+		}
+
 		agentConfig := supervisor.AgentConfig{
 			AgentID:       agentID,
 			DomainID:      domain.DomainID,
 			AssignedPaths: domain.AssignedPaths,
-			InitialPrompt: prompt,
+			InitialPrompt: initialPrompt,
 			PiAgent: supervisor.PiAgentConfig{
 				Binary:     a.config.Agents.CommandPath,
 				SessionDir: agentDir,
@@ -165,6 +203,22 @@ func (a *Allocator) Allocate(ctx context.Context, domains []coordinator.Domain, 
 		if a.broadcastFn != nil {
 			agent.SetBroadcastFunc(a.broadcastFn)
 		}
+		if a.agentStateFn != nil || a.lifecycleFn != nil {
+			domainID := domain.DomainID
+			agent.SetLifecycleFunc(func(event supervisor.AgentLifecycleEvent) {
+				if a.lifecycleFn != nil {
+					a.lifecycleFn(agentID, domainID, event)
+				}
+				if a.agentStateFn == nil {
+					return
+				}
+				state, reason := mapAgentLifecycleState(event)
+				if state == "" {
+					return
+				}
+				a.agentStateFn(agentID, domainID, state, reason)
+			})
+		}
 		a.activeAgents[agentID] = agent
 
 		// Register with Hub Router
@@ -174,6 +228,16 @@ func (a *Allocator) Allocate(ctx context.Context, domains []coordinator.Domain, 
 		if err := agent.Start(ctx); err != nil {
 			return fmt.Errorf("allocator: spawn agent %s: %w", agentID, err)
 		}
+		if resumeAgent {
+			resumeMessage := options.ResumeMessage
+			if strings.TrimSpace(resumeMessage) == "" {
+				resumeMessage = defaultDomainAgentResumeMessage(agentID, domain.DomainID)
+			}
+			if err := agent.SendPrompt(resumeMessage); err != nil {
+				return fmt.Errorf("allocator: resume agent %s: %w", agentID, err)
+			}
+			a.emitStatus(fmt.Sprintf("Agent %s resumed from existing Pi session (domain: %s)", agentID, domain.DomainID), "info")
+		}
 
 		a.emitStatus(fmt.Sprintf("Agent %s spawned (domain: %s)", agentID, domain.DomainID), "info")
 		log.Printf("allocator: spawned agent %s (domain: %s)", agentID, domain.DomainID)
@@ -181,6 +245,45 @@ func (a *Allocator) Allocate(ctx context.Context, domains []coordinator.Domain, 
 
 	a.emitStatus(fmt.Sprintf("%d agent(s) allocated — awaiting task dispatch", len(domains)), "ok")
 	return nil
+}
+
+func defaultDomainAgentResumeMessage(agentID, domainID string) string {
+	return fmt.Sprintf(`Resume your existing Aion domain-agent session.
+
+Agent: %s
+Domain: %s
+
+Continue from your persisted Pi session context. Do not restart from the original system prompt.
+Use orchestrator-cli to inspect the DAG, acquire locks, update node status, create stubs, and coordinate with other agents.
+Continue only the pending work assigned to your domain.`, agentID, domainID)
+}
+
+func hasReusablePiSession(agentDir string) bool {
+	entries, err := os.ReadDir(agentDir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == "AGENTS.md" || name == "pi_raw.log" {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func mapAgentLifecycleState(event supervisor.AgentLifecycleEvent) (string, string) {
+	switch event.Kind {
+	case "agent_started":
+		return "Running", ""
+	case "agent_stopped":
+		return "Stopped", event.Error
+	case "agent_crashed", "agent_stream_closed", "agent_error", "provider_auth_error":
+		return "Crashed", event.Error
+	default:
+		return "", ""
+	}
 }
 
 type AgentInfo struct {

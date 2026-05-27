@@ -46,12 +46,23 @@ func (m *OpsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	case tuiEventMsg:
-		if msg.Kind != tuiKindToolStart || msg.Audience != tuiAudienceLogs {
+		if msg.Audience != tuiAudienceLogs && msg.Audience != tuiAudienceStatus {
 			return m, nil
 		}
-		line := msg.Summary
-		if line == "" {
-			line = msg.Tool + "(" + msg.Input + ")"
+		line := ""
+		switch msg.Kind {
+		case tuiKindToolStart:
+			line = msg.Summary
+			if line == "" {
+				line = msg.Tool + "(" + msg.Input + ")"
+			}
+		case tuiKindStatus:
+			if !strings.HasPrefix(msg.Content, "Build progress:") {
+				return m, nil
+			}
+			line = msg.Content
+		default:
+			return m, nil
 		}
 		if msg.AgentID != "" {
 			line = "[" + msg.AgentID + "] " + line

@@ -31,9 +31,16 @@ type MultiLogModel struct {
 	height      int
 	Focused     bool
 	input       textarea.Model
+	verbose     bool
 }
 
 type agentListTickMsg struct{}
+
+type agentHistorySnapshotMsg struct {
+	Messages []hub.Message
+	AsOf     time.Time
+	Err      error
+}
 
 type agentListMsg struct {
 	Agents []agentListItem
@@ -53,6 +60,10 @@ type agentTraceMeta struct {
 }
 
 func NewMultiLogModel(addr string) *MultiLogModel {
+	return NewMultiLogModelWithOptions(addr, Options{})
+}
+
+func NewMultiLogModelWithOptions(addr string, options Options) *MultiLogModel {
 	ti := textarea.New()
 	ti.Placeholder = "Type a message for the selected agent... (Esc to leave input)"
 	ti.Focus()
@@ -71,14 +82,14 @@ func NewMultiLogModel(addr string) *MultiLogModel {
 		renderDirty: make(map[string]bool),
 		eventCh:     make(chan tea.Msg, 100),
 		input:       ti,
+		verbose:     options.Verbose,
 	}
 }
 
 func (m *MultiLogModel) Init() tea.Cmd {
 	return tea.Batch(
 		textarea.Blink,
-		m.startStreamCmd(),
-		m.readNextCmd(),
+		m.fetchSnapshotCmd(),
 		m.fetchAgentsCmd(),
 		m.agentListTickCmd(),
 	)
@@ -121,13 +132,52 @@ func (m *MultiLogModel) fetchAgentsCmd() tea.Cmd {
 	}
 }
 
-func (m *MultiLogModel) startStreamCmd() tea.Cmd {
+func (m *MultiLogModel) fetchSnapshotCmd() tea.Cmd {
+	return func() tea.Msg {
+		req := map[string]interface{}{
+			"method": "hub-snapshot",
+			"id":     "multilog-snapshot-1",
+			"params": map[string]interface{}{},
+		}
+		reqBytes, _ := json.Marshal(req)
+
+		conn, err := net.Dial("tcp", m.addr)
+		if err != nil {
+			return agentHistorySnapshotMsg{Err: err}
+		}
+		defer conn.Close()
+
+		if _, err := conn.Write(reqBytes); err != nil {
+			return agentHistorySnapshotMsg{Err: err}
+		}
+
+		var resp struct {
+			Result struct {
+				Messages []hub.Message `json:"messages"`
+				AsOf     time.Time     `json:"as_of"`
+			} `json:"result"`
+			Error string `json:"error"`
+		}
+		if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+			return agentHistorySnapshotMsg{Err: err}
+		}
+		if resp.Error != "" {
+			return agentHistorySnapshotMsg{Err: fmt.Errorf("%s", resp.Error)}
+		}
+		return agentHistorySnapshotMsg{Messages: resp.Result.Messages, AsOf: resp.Result.AsOf}
+	}
+}
+
+func (m *MultiLogModel) startStreamCmd(since time.Time) tea.Cmd {
 	return func() tea.Msg {
 		go func() {
+			if m.verbose {
+				m.eventCh <- StatusMsg{Text: "Opening live agent/hub stream at " + m.addr, Level: "info"}
+			}
 			req := map[string]interface{}{
 				"method": "tail-hub-events",
 				"id":     "multilog-1",
-				"params": map[string]interface{}{},
+				"params": map[string]interface{}{"since": since},
 			}
 			reqBytes, _ := json.Marshal(req)
 
@@ -142,7 +192,11 @@ func (m *MultiLogModel) startStreamCmd() tea.Cmd {
 				m.eventCh <- StatusMsg{Text: "Orchestrator stream failed: " + err.Error(), Level: "error"}
 				return
 			}
-			m.eventCh <- StatusMsg{Text: "Connected to orchestrator", Level: "ok"}
+			if m.verbose {
+				m.eventCh <- StatusMsg{Text: "Live agent/hub stream connected", Level: "ok"}
+			} else {
+				m.eventCh <- StatusMsg{Text: "Connected to orchestrator", Level: "ok"}
+			}
 
 			decoder := json.NewDecoder(conn)
 			normalizer := &tuiEventNormalizer{}
@@ -308,6 +362,49 @@ func (m *MultiLogModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.agentMeta[agent.AgentID] = meta
 			}
 		}
+
+	case agentHistorySnapshotMsg:
+		if msg.Err != nil {
+			m.appendSystemLine("History snapshot failed: " + msg.Err.Error())
+			cmds = append(cmds, func() tea.Msg {
+				return StatusMsg{Text: "Agent history snapshot failed: " + msg.Err.Error(), Level: "error"}
+			})
+			return m, tea.Batch(cmds...)
+		}
+		if m.verbose {
+			cmds = append(cmds, func() tea.Msg {
+				return StatusMsg{Text: fmt.Sprintf("Agent history snapshot loaded: %d event(s)", len(msg.Messages)), Level: "info"}
+			})
+		}
+		normalizer := &tuiEventNormalizer{}
+		for _, raw := range msg.Messages {
+			for _, event := range normalizer.Normalize(raw) {
+				if event.Audience != tuiAudienceLogs {
+					continue
+				}
+				id := event.AgentID
+				if !isDisplayAgent(id) {
+					continue
+				}
+				m.ensureAgent(id)
+				m.agentOutput[id] = append(m.agentOutput[id], formatLogEvent(event))
+				if len(m.agentOutput[id]) > 500 {
+					m.agentOutput[id] = m.agentOutput[id][len(m.agentOutput[id])-500:]
+				}
+				m.renderDirty[id] = true
+				meta := m.agentMeta[id]
+				meta.LastKind = event.Kind
+				meta.LastStatus = event.Content
+				meta.LastLevel = event.Level
+				m.agentMeta[id] = meta
+			}
+		}
+		for id, vp := range m.viewports {
+			vp.SetContent(m.renderAgentOutput(id, vp.Width))
+			vp.GotoBottom()
+			m.viewports[id] = vp
+		}
+		cmds = append(cmds, m.startStreamCmd(msg.AsOf), m.readNextCmd())
 
 	case tuiEventMsg:
 		if msg.Audience != tuiAudienceLogs {

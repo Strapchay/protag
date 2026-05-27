@@ -60,6 +60,7 @@ var architectCommands = []architectCommand{
 	{Name: "/show-plan", Description: "show the current build-spec plan"},
 	{Name: "/show-build-spec-trace", Description: "show the current build-spec planning trace"},
 	{Name: "/coordinator-status", Description: "show the current build-spec attempt state"},
+	{Name: "/progress", Description: "show client-facing build-spec progress"},
 	{Name: "/clear", Description: "clear visible chat history only"},
 	{Name: "/reset-session", Description: "delete current run state and start a fresh Architect session"},
 	{Name: "/replan", Description: "trigger DAG replan"},
@@ -221,66 +222,29 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Audience != tuiAudienceChat {
 			return m, nil
 		}
+		m.addTUIEvent(msg)
+		return m, nil
 
-		// Skip echoes
-		if msg.AgentID != "user" && msg.Role == "user" && len(m.history) > 0 {
-			last := m.history[len(m.history)-1]
-			if last.Author == "User" && last.Text == msg.Content {
-				return m, nil
+	case agentHistorySnapshotMsg:
+		if msg.Err != nil {
+			if m.logger != nil {
+				m.logger.Printf("Chat snapshot failed: %v", msg.Err)
+			}
+			return m, nil
+		}
+		normalizer := &tuiEventNormalizer{}
+		added := 0
+		for _, raw := range msg.Messages {
+			for _, event := range normalizer.Normalize(raw) {
+				if event.Audience != tuiAudienceChat {
+					continue
+				}
+				m.addTUIEvent(event)
+				added++
 			}
 		}
-
-		// Determine author and style
-		author := msg.Author
-		if author == "" {
-			author = "Architect"
-		}
-		authorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
-
-		if author == "User" {
-			authorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("82"))
-		} else if author == "Architect" || msg.Role == "assistant" {
-			authorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
-		} else {
-			authorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-		}
-
-		displayText := msg.Content
-		msgType := msg.Kind
-		if msgType == "" {
-			msgType = tuiKindText
-		}
-
-		if msgType == tuiKindThinking {
-			author = "Architect Thinking"
-			authorStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("240")).
-				Italic(true)
-		}
-
-		// Format tool_start for chat specifically
-		if msgType == tuiKindToolStart {
-			summary := msg.Summary
-			if summary == "" {
-				summary = fmt.Sprintf("%s(%s)", msg.Tool, msg.Input)
-			}
-			displayText = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("208")).
-				Bold(true).
-				Render(summary)
-		}
-
-		m.AddMessage(msg.AgentID, author, displayText, authorStyle, msgType)
-		if msg.AgentID == "orchestrator" {
-			lower := strings.ToLower(msg.Content)
-			switch {
-			case strings.Contains(lower, "build-spec planning and allocation complete"),
-				strings.Contains(lower, "build-spec planning canceled"),
-				strings.Contains(lower, "planning failed"),
-				strings.Contains(lower, "allocation failed"),
-				strings.Contains(lower, "build-spec failed"):
-				m.buildSpecActive = false
-			}
+		if added == 0 && len(m.history) == 0 {
+			m.viewport.SetContent("Awaiting interaction with Solution Architect...")
 		}
 		return m, nil
 
@@ -329,6 +293,67 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+func (m *ChatModel) addTUIEvent(msg tuiEventMsg) {
+	// Skip echoes
+	if msg.AgentID != "user" && msg.Role == "user" && len(m.history) > 0 {
+		last := m.history[len(m.history)-1]
+		if last.Author == "User" && last.Text == msg.Content {
+			return
+		}
+	}
+
+	author := msg.Author
+	if author == "" {
+		author = "Architect"
+	}
+	authorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+
+	if author == "User" {
+		authorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("82"))
+	} else if author == "Architect" || msg.Role == "assistant" {
+		authorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+	} else {
+		authorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	}
+
+	displayText := msg.Content
+	msgType := msg.Kind
+	if msgType == "" {
+		msgType = tuiKindText
+	}
+
+	if msgType == tuiKindThinking {
+		author = "Architect Thinking"
+		authorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("240")).
+			Italic(true)
+	}
+
+	if msgType == tuiKindToolStart {
+		summary := msg.Summary
+		if summary == "" {
+			summary = fmt.Sprintf("%s(%s)", msg.Tool, msg.Input)
+		}
+		displayText = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("208")).
+			Bold(true).
+			Render(summary)
+	}
+
+	m.AddMessage(msg.AgentID, author, displayText, authorStyle, msgType)
+	if msg.AgentID == "orchestrator" {
+		lower := strings.ToLower(msg.Content)
+		switch {
+		case strings.Contains(lower, "build-spec planning and allocation complete"),
+			strings.Contains(lower, "build-spec planning canceled"),
+			strings.Contains(lower, "planning failed"),
+			strings.Contains(lower, "allocation failed"),
+			strings.Contains(lower, "build-spec failed"):
+			m.buildSpecActive = false
+		}
+	}
 }
 
 func (m *ChatModel) AddMessage(agentID, author, text string, style lipgloss.Style, msgType string) {
@@ -606,6 +631,10 @@ func (m *ChatModel) executeCommand(cmdStr string) {
 		methodName = "build-spec-status"
 		params = map[string]interface{}{}
 		showResponse = true
+	case "/progress":
+		methodName = "build-progress"
+		params = map[string]interface{}{}
+		showResponse = true
 	case "/reset-session":
 		methodName = "architect-reset"
 		params = map[string]interface{}{}
@@ -657,8 +686,8 @@ func (m *ChatModel) executeCommand(cmdStr string) {
 	}
 	if showResponse {
 		var resp struct {
-			Result map[string]string `json:"result"`
-			Error  string            `json:"error"`
+			Result json.RawMessage `json:"result"`
+			Error  string          `json:"error"`
 		}
 		if err := json.NewDecoder(conn).Decode(&resp); err != nil {
 			m.AddMessage("system", "TUI", "Command response failed: "+err.Error(), lipgloss.NewStyle().Foreground(lipgloss.Color("196")), tuiKindText)
@@ -668,16 +697,7 @@ func (m *ChatModel) executeCommand(cmdStr string) {
 			m.AddMessage("system", "TUI", resp.Error, lipgloss.NewStyle().Foreground(lipgloss.Color("196")), tuiKindText)
 			return
 		}
-		text := resp.Result["status"]
-		if text == "" {
-			text = resp.Result["spec"]
-		}
-		if text == "" {
-			text = resp.Result["plan"]
-		}
-		if text == "" {
-			text = resp.Result["trace"]
-		}
+		text := responseText(resp.Result)
 		if text == "" {
 			text = "No status returned"
 		}
@@ -687,6 +707,84 @@ func (m *ChatModel) executeCommand(cmdStr string) {
 		}
 		m.AddMessage("system", "TUI", text, lipgloss.NewStyle().Foreground(lipgloss.Color("39")), tuiKindText)
 	}
+}
+
+func responseText(raw json.RawMessage) string {
+	var textFields map[string]string
+	if err := json.Unmarshal(raw, &textFields); err == nil {
+		for _, key := range []string{"status", "spec", "plan", "trace"} {
+			if textFields[key] != "" {
+				return textFields[key]
+			}
+		}
+	}
+	var progress struct {
+		ClientSummary  string `json:"client_summary"`
+		OverallPercent int    `json:"overall_percent"`
+		Milestones     []struct {
+			Title         string `json:"title"`
+			Status        string `json:"status"`
+			Percent       int    `json:"percent"`
+			ClientSummary string `json:"client_summary"`
+		} `json:"milestones"`
+		OpenRecoveries []struct {
+			Kind             string `json:"kind"`
+			Severity         string `json:"severity"`
+			Summary          string `json:"summary"`
+			SuggestedCommand string `json:"suggested_command"`
+		} `json:"open_recoveries"`
+		RecentEvents []struct {
+			Kind     string `json:"kind"`
+			Severity string `json:"severity"`
+			Summary  string `json:"summary"`
+		} `json:"recent_events"`
+		Warnings []string `json:"warnings"`
+	}
+	if err := json.Unmarshal(raw, &progress); err == nil && (progress.ClientSummary != "" || len(progress.Milestones) > 0) {
+		var b strings.Builder
+		if progress.ClientSummary != "" {
+			b.WriteString(progress.ClientSummary)
+			b.WriteString("\n\n")
+		}
+		for _, milestone := range progress.Milestones {
+			b.WriteString(fmt.Sprintf("- %s: %d%% %s\n", milestone.Title, milestone.Percent, milestone.Status))
+			if milestone.ClientSummary != "" {
+				b.WriteString("  " + milestone.ClientSummary + "\n")
+			}
+		}
+		if len(progress.Warnings) > 0 {
+			b.WriteString("\nWarnings:\n")
+			for _, warning := range progress.Warnings {
+				b.WriteString("- " + warning + "\n")
+			}
+		}
+		if len(progress.OpenRecoveries) > 0 {
+			b.WriteString("\nNeeds attention:\n")
+			for _, recovery := range progress.OpenRecoveries {
+				b.WriteString("- " + recovery.Summary)
+				if recovery.SuggestedCommand != "" {
+					b.WriteString(" (" + recovery.SuggestedCommand + ")")
+				}
+				b.WriteString("\n")
+			}
+		}
+		if len(progress.RecentEvents) > 0 {
+			b.WriteString("\nRecent outcomes:\n")
+			for _, event := range progress.RecentEvents {
+				if event.Summary == "" {
+					continue
+				}
+				b.WriteString("- " + event.Summary + "\n")
+			}
+		}
+		return strings.TrimSpace(b.String())
+	}
+	var fallback interface{}
+	if err := json.Unmarshal(raw, &fallback); err == nil {
+		data, _ := json.MarshalIndent(fallback, "", "  ")
+		return string(data)
+	}
+	return string(raw)
 }
 
 func architectCommandHelp() string {

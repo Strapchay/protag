@@ -385,6 +385,7 @@ func (c *PiCoordinator) preparePlanningArtifacts(specText string, req PlanReques
 			"edges must reference existing nodes and must not be self-referential",
 			"the dependency graph must be acyclic",
 			"broad fallback path '.' must not be assigned to multiple domains",
+			"milestones are optional but recommended; prefer 3-8 coarse capability milestones and map each node to at most one milestone",
 		},
 	}
 	data, err := json.MarshalIndent(input, "", "  ")

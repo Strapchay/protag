@@ -18,6 +18,7 @@ type Auditor struct {
 	hubRouter       *hub.Router
 	progressTimeout time.Duration
 	scanInterval    time.Duration
+	staleNodeFn     func(dag.DagNode, time.Duration)
 }
 
 // NewAuditor creates a new passive auditor.
@@ -35,6 +36,10 @@ func NewAuditor(
 		progressTimeout: progressTimeout,
 		scanInterval:    scanInterval,
 	}
+}
+
+func (a *Auditor) SetStaleNodeFunc(fn func(dag.DagNode, time.Duration)) {
+	a.staleNodeFn = fn
 }
 
 // Start launches the auditor loop in the background.
@@ -67,6 +72,9 @@ func (a *Auditor) scan() {
 			if elapsed > a.progressTimeout.Milliseconds() {
 				log.Printf("auditor: [WARNING] Node %s for agent %s has been InProgress for %d ms (exceeds timeout)",
 					node.ID, node.AssignedAgent, elapsed)
+				if a.staleNodeFn != nil {
+					a.staleNodeFn(node, time.Duration(elapsed)*time.Millisecond)
+				}
 			}
 		}
 	}

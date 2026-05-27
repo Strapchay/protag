@@ -25,24 +25,29 @@ import (
 // Daemon is the main Orchestrator process. It initializes all subsystems
 // and manages the full lifecycle from startup through shutdown.
 type Daemon struct {
-	config           *Config
-	dagManager       *dag.Manager
-	lockManager      *locking.Manager
-	stubRegistry     *stub.Registry
-	hubRouter        *hub.Router
-	allocator        *Allocator
-	server           *Server
-	coordinator      coordinator.Coordinator
-	memoryStore      memory.Store
-	projectRoot      string
-	auditor          *Auditor
-	runState         *RunState
-	ctx              context.Context
-	cancel           context.CancelFunc
-	resetMu          sync.Mutex
-	buildSpecMu      sync.Mutex
-	buildSpecCancel  context.CancelFunc
-	buildSpecAttempt *BuildSpecAttempt
+	config                 *Config
+	dagManager             *dag.Manager
+	lockManager            *locking.Manager
+	stubRegistry           *stub.Registry
+	hubRouter              *hub.Router
+	allocator              *Allocator
+	server                 *Server
+	coordinator            coordinator.Coordinator
+	memoryStore            memory.Store
+	projectRoot            string
+	auditor                *Auditor
+	runState               *RunState
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	resetMu                sync.Mutex
+	buildSpecMu            sync.Mutex
+	buildSpecContinueArmed bool
+	buildSpecCancel        context.CancelFunc
+	buildSpecAttempt       *BuildSpecAttempt
+	progressMu             sync.Mutex
+	lastProgressSignature  string
+	staleMu                sync.Mutex
+	staleReported          map[string]bool
 }
 
 // NewDaemon creates a new Orchestrator daemon with the given config.
@@ -108,6 +113,7 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	// Initialize Server
 	server := NewServer(dagMgr, lockMgr, stubReg, memStore)
 	server.SetLogsDir(runState.LogsDir)
+	server.SetLogLevel(config.Orchestrator.LogLevel)
 	if broadcaster, ok := coord.(interface{ SetBroadcastFunc(func(hub.Message)) }); ok {
 		broadcaster.SetBroadcastFunc(func(msg hub.Message) {
 			server.BroadcastHubEvent(msg)
@@ -130,20 +136,21 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	daemon := &Daemon{
-		config:       config,
-		dagManager:   dagMgr,
-		lockManager:  lockMgr,
-		stubRegistry: stubReg,
-		hubRouter:    hubRouter,
-		allocator:    alloc,
-		server:       server,
-		coordinator:  coord,
-		memoryStore:  memStore,
-		auditor:      aud,
-		runState:     runState,
-		projectRoot:  projectRoot,
-		ctx:          ctx,
-		cancel:       cancel,
+		config:        config,
+		dagManager:    dagMgr,
+		lockManager:   lockMgr,
+		stubRegistry:  stubReg,
+		hubRouter:     hubRouter,
+		allocator:     alloc,
+		server:        server,
+		coordinator:   coord,
+		memoryStore:   memStore,
+		auditor:       aud,
+		runState:      runState,
+		projectRoot:   projectRoot,
+		ctx:           ctx,
+		cancel:        cancel,
+		staleReported: make(map[string]bool),
 	}
 
 	server.SetHubCallback(func(msg hub.Message) {
@@ -209,6 +216,14 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	})
 
 	server.SetBuildSpecContinueCallback(func() error {
+		daemon.buildSpecMu.Lock()
+		daemon.buildSpecContinueArmed = true
+		daemon.buildSpecMu.Unlock()
+		defer func() {
+			daemon.buildSpecMu.Lock()
+			daemon.buildSpecContinueArmed = false
+			daemon.buildSpecMu.Unlock()
+		}()
 		return daemon.continueBuildSpecAgents()
 	})
 
@@ -281,6 +296,24 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	server.SetBuildSpecCancelCallback(func() error {
 		return daemon.cancelBuildSpecAttempt()
 	})
+	server.SetBuildProgressCallback(func() (*BuildProgressSnapshot, error) {
+		return daemon.buildProgressSnapshot()
+	})
+	server.SetProgressChangedCallback(func(reason string) {
+		daemon.refreshBuildProgress(reason)
+	})
+	server.SetExecutionEventCallback(func(event ExecutionJournalEvent) {
+		daemon.recordExecutionEvent(event)
+	})
+	server.SetRecoveryCallback(func(record RecoveryRecord) {
+		daemon.recordRecovery(record)
+	})
+	server.SetRecoveryResolvedCallback(func(kind, nodeID, agentID string) {
+		daemon.resolveRecovery(kind, nodeID, agentID)
+	})
+	server.SetBehaviorCallback(func(agentID, domainID, kind, evidence string) {
+		daemon.observeAgentCoordinationBehavior(agentID, domainID, kind, evidence)
+	})
 	server.SetAgentListCallback(func() []AgentInfo {
 		infos := []AgentInfo{{
 			AgentID:  "coordinator",
@@ -306,9 +339,214 @@ func (d *Daemon) configureAllocatorCallbacks() {
 	d.allocator.SetAgentStatusFunc(func(agentID, text, level string) {
 		d.server.BroadcastAgentStatus(agentID, text, level)
 	})
+	d.allocator.SetAgentStateFunc(func(agentID, domainID, state, reason string) {
+		d.recordBuildSpecAgentState(agentID, domainID, state, reason)
+		d.recordAgentLifecycleProgress(agentID, domainID, state, reason)
+	})
+	d.allocator.SetLifecycleFunc(func(agentID, domainID string, event supervisor.AgentLifecycleEvent) {
+		d.observeAgentLifecycleBehavior(agentID, domainID, event)
+		d.recordAgentLifecycleRecovery(agentID, domainID, event)
+	})
 	d.allocator.SetBroadcastFunc(func(msg hub.Message) {
 		d.server.BroadcastHubEvent(msg)
 	})
+	d.auditor.SetStaleNodeFunc(func(node dag.DagNode, elapsed time.Duration) {
+		d.recordStaleNode(node, elapsed)
+	})
+}
+
+func (d *Daemon) recordBuildSpecAgentState(agentID, domainID, state, reason string) {
+	if strings.TrimSpace(agentID) == "" || strings.TrimSpace(state) == "" {
+		return
+	}
+
+	d.buildSpecMu.Lock()
+	defer d.buildSpecMu.Unlock()
+
+	attempt := d.buildSpecAttempt
+	if attempt == nil {
+		loaded, err := loadBuildSpecAttempt(d.runState.Root)
+		if err != nil || loaded == nil {
+			return
+		}
+		switch loaded.Status {
+		case BuildSpecAttemptPlanning, BuildSpecAttemptCommitting, BuildSpecAttemptAllocating, BuildSpecAttemptActive:
+			attempt = loaded
+			d.buildSpecAttempt = attempt
+		default:
+			return
+		}
+	}
+
+	attempt.RecordAgentState(agentID, domainID, state, reason)
+	_ = saveBuildSpecAttempt(d.runState.Root, attempt)
+}
+
+func (d *Daemon) recordExecutionEvent(event ExecutionJournalEvent) {
+	if d == nil || d.runState == nil {
+		return
+	}
+	attempt, _ := loadBuildSpecAttempt(d.runState.Root)
+	event.RunID = d.runState.RunID
+	if attempt != nil {
+		event.AttemptID = attempt.AttemptID
+	}
+	if event.Severity == "" {
+		event.Severity = "info"
+	}
+	_ = appendExecutionJournalEvent(d.runState.Root, event)
+}
+
+func (d *Daemon) recordRecovery(record RecoveryRecord) {
+	if d == nil || d.runState == nil {
+		return
+	}
+	attempt, _ := loadBuildSpecAttempt(d.runState.Root)
+	record.RunID = d.runState.RunID
+	if attempt != nil {
+		record.AttemptID = attempt.AttemptID
+	}
+	_ = upsertRecoveryRecord(d.runState.Root, record)
+}
+
+func (d *Daemon) resolveRecovery(kind, nodeID, agentID string) {
+	if d == nil || d.runState == nil {
+		return
+	}
+	_ = markRecoveryResolved(d.runState.Root, kind, nodeID, agentID)
+}
+
+func (d *Daemon) recordAgentLifecycleProgress(agentID, domainID, state, reason string) {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return
+	}
+	severity := "info"
+	kind := "agent_state"
+	summary := fmt.Sprintf("%s is %s", agentID, state)
+	if strings.TrimSpace(reason) != "" {
+		summary += ": " + strings.TrimSpace(reason)
+	}
+	switch state {
+	case "Crashed":
+		kind = "agent_failed"
+		severity = "error"
+		d.recordRecovery(RecoveryRecord{
+			FailureID:        recoveryID("agent_failed", "", agentID),
+			Kind:             "agent_failed",
+			Severity:         "error",
+			Status:           "open",
+			AgentID:          agentID,
+			DomainID:         domainID,
+			Summary:          summary,
+			LastError:        reason,
+			SuggestedCommand: "/continue-agents",
+		})
+	case "Stopped":
+		kind = "agent_stopped"
+		severity = "warn"
+	case "Running":
+		d.resolveRecovery("agent_failed", "", agentID)
+	}
+	d.recordExecutionEvent(ExecutionJournalEvent{
+		Kind:     kind,
+		Severity: severity,
+		AgentID:  agentID,
+		DomainID: domainID,
+		Summary:  summary,
+	})
+	d.refreshBuildProgress(kind)
+}
+
+func (d *Daemon) recordAgentLifecycleRecovery(agentID, domainID string, event supervisor.AgentLifecycleEvent) {
+	if !event.IsError {
+		return
+	}
+	kind, severity, summary, command := classifyLifecycleFailure(agentID, event)
+	if kind == "" {
+		return
+	}
+	d.recordRecovery(RecoveryRecord{
+		FailureID:        recoveryID(kind, "", agentID),
+		Kind:             kind,
+		Severity:         severity,
+		Status:           "open",
+		AgentID:          agentID,
+		DomainID:         domainID,
+		Summary:          summary,
+		LastError:        event.Error,
+		SuggestedCommand: command,
+	})
+	d.recordExecutionEvent(ExecutionJournalEvent{
+		Kind:     kind,
+		Severity: severity,
+		AgentID:  agentID,
+		DomainID: domainID,
+		Summary:  summary,
+	})
+	d.refreshBuildProgress(kind)
+}
+
+func classifyLifecycleFailure(agentID string, event supervisor.AgentLifecycleEvent) (kind, severity, summary, command string) {
+	text := strings.ToLower(strings.TrimSpace(event.Kind + " " + event.Error + " " + event.Content))
+	severity = "warn"
+	command = "/continue-agents"
+	switch {
+	case strings.Contains(text, "401") || strings.Contains(text, "403") || strings.Contains(text, "auth") || strings.Contains(text, "unauthorized") || strings.Contains(text, "forbidden"):
+		return "provider_auth_error", "error", fmt.Sprintf("%s has provider authentication/configuration failure.", agentID), "/progress"
+	case strings.Contains(text, "429") || strings.Contains(text, "rate limit"):
+		return "provider_rate_limited", "warn", fmt.Sprintf("%s is rate limited by its inference provider.", agentID), "/continue-agents"
+	case strings.Contains(text, "timeout") || strings.Contains(text, "econnreset") || strings.Contains(text, "network"):
+		return "network_timeout", "warn", fmt.Sprintf("%s hit an inference/network timeout.", agentID), "/continue-agents"
+	case strings.Contains(text, "unavailable") || strings.Contains(text, "overloaded") || strings.Contains(text, "503"):
+		return "provider_unavailable", "warn", fmt.Sprintf("%s inference provider is unavailable.", agentID), "/continue-agents"
+	case strings.Contains(text, "context") && (strings.Contains(text, "length") || strings.Contains(text, "window") || strings.Contains(text, "too long")):
+		return "context_window_error", "error", fmt.Sprintf("%s hit a context-window failure.", agentID), "/progress"
+	case strings.Contains(text, "stream closed"):
+		return "agent_stream_closed", "warn", fmt.Sprintf("%s event stream closed unexpectedly.", agentID), "/continue-agents"
+	case event.Kind == "agent_error" || event.Kind == "tool_error":
+		return "agent_error", "error", fmt.Sprintf("%s reported an execution error.", agentID), "/continue-agents"
+	default:
+		return "", "", "", ""
+	}
+}
+
+func (d *Daemon) recordStaleNode(node dag.DagNode, elapsed time.Duration) {
+	if strings.TrimSpace(node.ID) == "" {
+		return
+	}
+	d.staleMu.Lock()
+	if d.staleReported == nil {
+		d.staleReported = make(map[string]bool)
+	}
+	if d.staleReported[node.ID] {
+		d.staleMu.Unlock()
+		return
+	}
+	d.staleReported[node.ID] = true
+	d.staleMu.Unlock()
+
+	summary := fmt.Sprintf("Task %s has been active without progress for %s.", node.ID, elapsed.Round(time.Second))
+	d.recordRecovery(RecoveryRecord{
+		FailureID:        recoveryID("stale_active_work", node.ID, node.AssignedAgent),
+		Kind:             "stale_active_work",
+		Severity:         "warn",
+		Status:           "open",
+		AgentID:          node.AssignedAgent,
+		DomainID:         node.DomainID,
+		NodeID:           node.ID,
+		Summary:          summary,
+		SuggestedCommand: "/continue-agents",
+	})
+	d.recordExecutionEvent(ExecutionJournalEvent{
+		Kind:     "stale_active_work",
+		Severity: "warn",
+		AgentID:  node.AssignedAgent,
+		DomainID: node.DomainID,
+		NodeID:   node.ID,
+		Summary:  summary,
+	})
+	d.refreshBuildProgress("stale_active_work")
 }
 
 func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunState) *coordinator.PiCoordinator {
@@ -367,6 +605,8 @@ func (d *Daemon) Start() error {
 	if attempt, err := loadBuildSpecAttempt(d.runState.Root); err == nil && attempt != nil {
 		switch attempt.Status {
 		case BuildSpecAttemptActive, BuildSpecAttemptAllocating, BuildSpecAttemptPlanning, BuildSpecAttemptCommitting:
+			d.seedBuildSpecAttemptContext(attempt)
+			d.refreshBuildProgress("startup")
 			d.server.BroadcastTransientStatus("Persisted build-spec attempt loaded. Issue /continue-agents to resume domain work.", "info")
 		}
 	}

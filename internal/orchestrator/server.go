@@ -63,12 +63,20 @@ type Server struct {
 	buildSpecPlanCb     func() (string, error)
 	buildSpecTraceCb    func() (string, error)
 	buildSpecCancelCb   func() error
+	buildProgressCb     func() (*BuildProgressSnapshot, error)
+	progressChangedCb   func(string)
+	executionEventCb    func(ExecutionJournalEvent)
+	recoveryCb          func(RecoveryRecord)
+	recoveryResolvedCb  func(string, string, string)
+	behaviorCb          func(agentID, domainID, kind, evidence string)
 	agentListCb         func() []AgentInfo
 
-	listener   net.Listener
-	heartbeats map[string]int64 // agentID → last heartbeat unix ms
-	hubSubs    map[chan hub.Message]struct{}
-	hubHistory []hub.Message
+	listener    net.Listener
+	heartbeats  map[string]int64 // agentID → last heartbeat unix ms
+	hubSubs     map[chan hub.Message]struct{}
+	hubHistory  []hub.Message
+	hubSnapshot []hub.Message
+	logLevel    string
 }
 
 // NewServer creates an Orchestrator server with the given subsystems.
@@ -85,6 +93,7 @@ func NewServer(
 		memoryStore:  memoryStore,
 		heartbeats:   make(map[string]int64),
 		hubSubs:      make(map[chan hub.Message]struct{}),
+		logLevel:     "info",
 	}
 }
 
@@ -93,6 +102,17 @@ func (s *Server) SetLogsDir(dir string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.logsDir = dir
+}
+
+// SetLogLevel configures run-scoped RPC diagnostics.
+func (s *Server) SetLogLevel(level string) {
+	level = strings.ToLower(strings.TrimSpace(level))
+	if level == "" {
+		level = "info"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.logLevel = level
 }
 
 // SetHubCallback sets the function called when hub messages need routing.
@@ -119,17 +139,44 @@ func (s *Server) BroadcastHubEvent(msg hub.Message) {
 	if len(s.hubHistory) > 500 {
 		s.hubHistory = s.hubHistory[len(s.hubHistory)-500:]
 	}
+	s.hubSnapshot = append(s.hubSnapshot, msg)
+	if len(s.hubSnapshot) > 500 {
+		s.hubSnapshot = s.hubSnapshot[len(s.hubSnapshot)-500:]
+	}
+	snapshot := append([]hub.Message(nil), s.hubSnapshot...)
+	logsDir := s.logsDir
 	subs := make([]chan hub.Message, 0, len(s.hubSubs))
 	for ch := range s.hubSubs {
 		subs = append(subs, ch)
 	}
 	s.mu.Unlock()
 
+	_ = persistHubSnapshot(logsDir, snapshot)
+
 	for _, ch := range subs {
 		select {
 		case ch <- msg:
 		default: // non-blocking, drop if slow
 		}
+	}
+}
+
+// SeedHubSnapshot adds reconstructed context to the in-memory snapshot without
+// appending it to persistent hub history. This is used for run startup
+// hydration where persisted domain-specific state already exists elsewhere.
+func (s *Server) SeedHubSnapshot(messages []hub.Message) {
+	if len(messages) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hubHistory = append(s.hubHistory, messages...)
+	if len(s.hubHistory) > 500 {
+		s.hubHistory = s.hubHistory[len(s.hubHistory)-500:]
+	}
+	s.hubSnapshot = append(s.hubSnapshot, messages...)
+	if len(s.hubSnapshot) > 500 {
+		s.hubSnapshot = s.hubSnapshot[len(s.hubSnapshot)-500:]
 	}
 }
 
@@ -189,6 +236,71 @@ func (s *Server) loadHubHistory() []hub.Message {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return append([]hub.Message(nil), s.hubHistory...)
+}
+
+func (s *Server) loadHubSnapshot() []hub.Message {
+	s.mu.RLock()
+	logsDir := s.logsDir
+	currentSnapshot := append([]hub.Message(nil), s.hubSnapshot...)
+	s.mu.RUnlock()
+	if len(currentSnapshot) > 0 {
+		return currentSnapshot
+	}
+	if strings.TrimSpace(logsDir) == "" {
+		return currentSnapshot
+	}
+
+	path := filepath.Join(logsDir, "hub_snapshot.json")
+	data, err := os.ReadFile(path)
+	if err == nil {
+		var snap struct {
+			Messages []hub.Message `json:"messages"`
+		}
+		if json.Unmarshal(data, &snap) == nil && len(snap.Messages) > 0 {
+			s.mu.Lock()
+			s.hubSnapshot = append([]hub.Message(nil), snap.Messages...)
+			s.mu.Unlock()
+			return snap.Messages
+		}
+	}
+
+	history := s.loadHubHistory()
+	if len(history) == 0 {
+		return history
+	}
+	s.mu.Lock()
+	s.hubSnapshot = append([]hub.Message(nil), history...)
+	if len(s.hubSnapshot) > 500 {
+		s.hubSnapshot = s.hubSnapshot[len(s.hubSnapshot)-500:]
+	}
+	snapshot := append([]hub.Message(nil), s.hubSnapshot...)
+	logsDir = s.logsDir
+	s.mu.Unlock()
+	_ = persistHubSnapshot(logsDir, snapshot)
+	return history
+}
+
+func persistHubSnapshot(logsDir string, snapshot []hub.Message) error {
+	if strings.TrimSpace(logsDir) == "" || len(snapshot) == 0 {
+		return nil
+	}
+
+	path := filepath.Join(logsDir, "hub_snapshot.json")
+	type snapshotFile struct {
+		AsOf     time.Time     `json:"as_of"`
+		Messages []hub.Message `json:"messages"`
+	}
+	asOf := time.Time{}
+	for _, msg := range snapshot {
+		if msg.Timestamp.After(asOf) {
+			asOf = msg.Timestamp
+		}
+	}
+	data, err := json.MarshalIndent(snapshotFile{AsOf: asOf, Messages: snapshot}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(path, append(data, '\n'))
 }
 
 // BroadcastStatus emits a SystemStatus message to all TUI subscribers.
@@ -273,11 +385,38 @@ func (s *Server) debugLog(dir, text string) {
 	if strings.Contains(text, "read-dag") || strings.Contains(text, "dag-tick") {
 		return
 	}
-	f, _ := os.OpenFile("rpc_debug.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	s.mu.RLock()
+	level := s.logLevel
+	logsDir := s.logsDir
+	s.mu.RUnlock()
+	if dir != "ERR" && level != "debug" && level != "trace" {
+		return
+	}
+	path := "rpc_debug.log"
+	if strings.TrimSpace(logsDir) != "" {
+		path = filepath.Join(logsDir, "rpc_debug.log")
+	}
+	f, _ := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if f != nil {
 		defer f.Close()
 		fmt.Fprintf(f, "[%s] %s %s\n", time.Now().Format(time.Kitchen), dir, text)
 	}
+}
+
+func (s *Server) redactRequestForDebug(req Request) string {
+	params := map[string]interface{}{}
+	_ = json.Unmarshal(req.Params, &params)
+	for _, key := range []string{"text", "content", "contract"} {
+		if raw, ok := params[key]; ok {
+			params[key] = fmt.Sprintf("<redacted %T>", raw)
+		}
+	}
+	b, _ := json.Marshal(map[string]interface{}{
+		"id":     req.ID,
+		"method": req.Method,
+		"params": params,
+	})
+	return string(b)
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
@@ -295,11 +434,15 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	reqBytes, _ := json.Marshal(req)
-	s.debugLog("REQ", string(reqBytes))
+	s.debugLog("REQ", s.redactRequestForDebug(req))
 
 	if req.Method == "tail-hub-events" {
 		s.handleTailHubEvents(req, encoder, conn)
+		return
+	}
+
+	if req.Method == "hub-snapshot" {
+		s.handleHubSnapshot(req, encoder)
 		return
 	}
 
@@ -315,6 +458,12 @@ func (s *Server) handleConnection(conn net.Conn) {
 }
 
 func (s *Server) handleTailHubEvents(req Request, encoder *json.Encoder, conn net.Conn) {
+	var params struct {
+		Since time.Time `json:"since"`
+	}
+	_ = json.Unmarshal(req.Params, &params)
+	s.debugLog("STREAM", fmt.Sprintf("tail-hub-events opened since=%s", params.Since.Format(time.RFC3339Nano)))
+
 	ch := make(chan hub.Message, 100)
 	s.mu.Lock()
 	s.hubSubs[ch] = struct{}{}
@@ -327,10 +476,14 @@ func (s *Server) handleTailHubEvents(req Request, encoder *json.Encoder, conn ne
 	}()
 
 	for _, msg := range s.loadHubHistory() {
+		if !params.Since.IsZero() && !msg.Timestamp.After(params.Since) {
+			continue
+		}
 		if err := encoder.Encode(msg); err != nil {
 			return
 		}
 	}
+	s.debugLog("STREAM", "tail-hub-events replay complete; waiting for live events")
 
 	for {
 		msg, ok := <-ch
@@ -343,6 +496,30 @@ func (s *Server) handleTailHubEvents(req Request, encoder *json.Encoder, conn ne
 		b, _ := json.Marshal(msg)
 		s.debugLog("HUB", string(b))
 	}
+}
+
+func (s *Server) handleHubSnapshot(req Request, encoder *json.Encoder) {
+	resp, count, asOf := s.hubSnapshotResponse()
+	s.debugLog("SNAPSHOT", fmt.Sprintf("hub-snapshot returned messages=%d as_of=%s", count, asOf.Format(time.RFC3339Nano)))
+	_ = encoder.Encode(Response{
+		ID:     req.ID,
+		Result: resp,
+	})
+}
+
+func (s *Server) hubSnapshotResponse() (interface{}, int, time.Time) {
+	type snapshotResponse struct {
+		Messages []hub.Message `json:"messages"`
+		AsOf     time.Time     `json:"as_of"`
+	}
+	messages := s.loadHubSnapshot()
+	asOf := time.Time{}
+	for _, msg := range messages {
+		if msg.Timestamp.After(asOf) {
+			asOf = msg.Timestamp
+		}
+	}
+	return snapshotResponse{Messages: messages, AsOf: asOf}, len(messages), asOf
 }
 
 func (s *Server) handleTailAgentLogs(req Request, encoder *json.Encoder, conn net.Conn) {
@@ -406,6 +583,9 @@ func (s *Server) handleRequest(req Request) Response {
 		return s.handleReadDag(req)
 	case "heartbeat":
 		return s.handleHeartbeat(req)
+	case "hub-snapshot":
+		resp, _, _ := s.hubSnapshotResponse()
+		return Response{ID: req.ID, Result: resp}
 	case "validate-write":
 		return s.handleValidateWrite(req)
 	case "query-memory":
@@ -434,8 +614,12 @@ func (s *Server) handleRequest(req Request) Response {
 		return s.handleBuildSpecCancel(req)
 	case "build-spec-continue-agents":
 		return s.handleBuildSpecContinueAgents(req)
+	case "build-progress":
+		return s.handleBuildProgress(req)
 	case "list-agents":
 		return s.handleListAgents(req)
+	case "debug-status":
+		return s.handleDebugStatus(req)
 	case "trigger-replan":
 		return s.handleTriggerReplan(req)
 	case "revive-agent":
@@ -491,6 +675,30 @@ func (s *Server) SetBuildSpecTraceCallback(cb func() (string, error)) {
 
 func (s *Server) SetBuildSpecCancelCallback(cb func() error) {
 	s.buildSpecCancelCb = cb
+}
+
+func (s *Server) SetBuildProgressCallback(cb func() (*BuildProgressSnapshot, error)) {
+	s.buildProgressCb = cb
+}
+
+func (s *Server) SetProgressChangedCallback(cb func(string)) {
+	s.progressChangedCb = cb
+}
+
+func (s *Server) SetExecutionEventCallback(cb func(ExecutionJournalEvent)) {
+	s.executionEventCb = cb
+}
+
+func (s *Server) SetRecoveryCallback(cb func(RecoveryRecord)) {
+	s.recoveryCb = cb
+}
+
+func (s *Server) SetRecoveryResolvedCallback(cb func(kind, nodeID, agentID string)) {
+	s.recoveryResolvedCb = cb
+}
+
+func (s *Server) SetBehaviorCallback(cb func(agentID, domainID, kind, evidence string)) {
+	s.behaviorCb = cb
 }
 
 func (s *Server) SetAgentListCallback(cb func() []AgentInfo) {
@@ -665,11 +873,85 @@ func (s *Server) handleBuildSpecContinueAgents(req Request) Response {
 	return Response{ID: req.ID, Result: map[string]string{"status": "continue_started"}}
 }
 
+func (s *Server) handleBuildProgress(req Request) Response {
+	if s.buildProgressCb == nil {
+		return Response{ID: req.ID, Error: "build progress callback not configured"}
+	}
+	snapshot, err := s.buildProgressCb()
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	return Response{ID: req.ID, Result: snapshot}
+}
+
 func (s *Server) handleListAgents(req Request) Response {
 	if s.agentListCb == nil {
 		return Response{ID: req.ID, Result: map[string][]AgentInfo{"agents": nil}}
 	}
 	return Response{ID: req.ID, Result: map[string][]AgentInfo{"agents": s.agentListCb()}}
+}
+
+func (s *Server) handleDebugStatus(req Request) Response {
+	snapshotMessages := s.loadHubSnapshot()
+	historyMessages := s.loadHubHistory()
+
+	s.mu.RLock()
+	logsDir := s.logsDir
+	logLevel := s.logLevel
+	hubSubscribers := len(s.hubSubs)
+	hubMemoryCount := len(historyMessages)
+	hubSnapshotCount := len(snapshotMessages)
+	lastHubEventAt := time.Time{}
+	if hubSnapshotCount > 0 {
+		lastHubEventAt = snapshotMessages[hubSnapshotCount-1].Timestamp
+	} else if hubMemoryCount > 0 {
+		lastHubEventAt = historyMessages[hubMemoryCount-1].Timestamp
+	}
+	heartbeatCount := len(s.heartbeats)
+	s.mu.RUnlock()
+
+	dagNodes := 0
+	dagEdges := 0
+	if s.dagManager != nil {
+		snapshot := s.dagManager.Snapshot()
+		dagNodes = len(snapshot.Nodes)
+		dagEdges = len(snapshot.Edges)
+	}
+
+	agents := []AgentInfo{}
+	if s.agentListCb != nil {
+		agents = s.agentListCb()
+	}
+
+	buildSpecStatus := ""
+	if s.buildSpecStatusCb != nil {
+		buildSpecStatus = s.buildSpecStatusCb()
+	}
+
+	result := map[string]interface{}{
+		"addr":                     s.Addr(),
+		"log_level":                logLevel,
+		"logs_dir":                 logsDir,
+		"rpc_debug_log":            debugLogPath(logsDir),
+		"hub_history_memory_count": hubMemoryCount,
+		"hub_history_count":        hubMemoryCount,
+		"hub_snapshot_count":       hubSnapshotCount,
+		"hub_subscribers":          hubSubscribers,
+		"last_hub_event_at":        lastHubEventAt,
+		"heartbeat_count":          heartbeatCount,
+		"dag_nodes":                dagNodes,
+		"dag_edges":                dagEdges,
+		"build_spec_status":        buildSpecStatus,
+		"agents":                   agents,
+	}
+	return Response{ID: req.ID, Result: result}
+}
+
+func debugLogPath(logsDir string) string {
+	if strings.TrimSpace(logsDir) == "" {
+		return "rpc_debug.log"
+	}
+	return filepath.Join(logsDir, "rpc_debug.log")
 }
 
 func (s *Server) handleTriggerReplan(req Request) Response {
@@ -716,7 +998,33 @@ func (s *Server) handleAcquireLock(req Request) Response {
 	}
 
 	if err := s.lockManager.Acquire(params.File, params.AgentID, assignedPaths); err != nil {
+		if s.executionEventCb != nil {
+			s.executionEventCb(ExecutionJournalEvent{
+				Kind:     "lock_denied",
+				Severity: "warn",
+				AgentID:  params.AgentID,
+				Summary:  fmt.Sprintf("Lock denied for %s on %s: %v", params.AgentID, params.File, err),
+			})
+		}
+		if s.recoveryCb != nil {
+			s.recoveryCb(RecoveryRecord{
+				FailureID:        recoveryID("lock_denied", params.File, params.AgentID),
+				Kind:             "lock_denied",
+				Severity:         "warn",
+				Status:           "open",
+				AgentID:          params.AgentID,
+				Summary:          fmt.Sprintf("%s could not acquire lock for %s.", params.AgentID, params.File),
+				LastError:        err.Error(),
+				SuggestedCommand: "/progress",
+			})
+		}
+		if s.behaviorCb != nil {
+			s.behaviorCb(params.AgentID, "", "lock_denied", params.File+": "+err.Error())
+		}
 		return Response{ID: req.ID, Error: err.Error()}
+	}
+	if s.recoveryResolvedCb != nil {
+		s.recoveryResolvedCb("lock_denied", params.File, params.AgentID)
 	}
 
 	return Response{ID: req.ID, Result: map[string]interface{}{
@@ -749,6 +1057,7 @@ func (s *Server) handleUpdateNode(req Request) Response {
 		CompletedAt      int64  `json:"completed_at,omitempty"`
 		PromptTokens     int32  `json:"prompt_tokens,omitempty"`
 		CompletionTokens int32  `json:"completion_tokens,omitempty"`
+		AgentID          string `json:"agent_id,omitempty"`
 	}
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return Response{ID: req.ID, Error: fmt.Sprintf("invalid params: %v", err)}
@@ -770,7 +1079,19 @@ func (s *Server) handleUpdateNode(req Request) Response {
 	}
 
 	if err != nil {
+		if s.behaviorCb != nil && strings.TrimSpace(params.AgentID) != "" {
+			s.behaviorCb(params.AgentID, "", "invalid_node_update", params.NodeID+": "+err.Error())
+		}
 		return Response{ID: req.ID, Error: err.Error()}
+	}
+	if node, err := s.dagManager.GetNode(params.NodeID); err == nil && node != nil {
+		if s.behaviorCb != nil && strings.TrimSpace(node.AssignedAgent) != "" {
+			s.behaviorCb(node.AssignedAgent, node.DomainID, "node_update", node.ID+" -> "+status.String())
+		}
+		s.recordNodeProgressFact(*node, status)
+	}
+	if s.progressChangedCb != nil {
+		go s.progressChangedCb("node_update")
 	}
 
 	if status == dag.StatusDone {
@@ -791,6 +1112,18 @@ func (s *Server) handleUpdateNode(req Request) Response {
 					FromAgent: stub.ProducerID,
 					ToAgent:   stub.ConsumerID,
 					Payload:   payload,
+				})
+			}
+			if s.recoveryResolvedCb != nil {
+				s.recoveryResolvedCb("stub_waiting", stub.ConsumerID, "")
+			}
+			if s.executionEventCb != nil {
+				s.executionEventCb(ExecutionJournalEvent{
+					Kind:     "stub_fulfilled",
+					Severity: "ok",
+					AgentID:  stub.ProducerID,
+					NodeID:   stub.ConsumerID,
+					Summary:  fmt.Sprintf("Stub %s was fulfilled for %s.", stub.ID, stub.ConsumerID),
 				})
 			}
 		}
@@ -829,6 +1162,66 @@ func (s *Server) handleUpdateNode(req Request) Response {
 	}}
 }
 
+func (s *Server) recordNodeProgressFact(node dag.DagNode, status dag.NodeStatus) {
+	kind := "task_updated"
+	severity := "info"
+	summary := fmt.Sprintf("Task %s moved to %s.", node.ID, status.String())
+	switch status {
+	case dag.StatusInProgress:
+		kind = "task_started"
+	case dag.StatusDone:
+		kind = "task_completed"
+		severity = "ok"
+		if s.recoveryResolvedCb != nil {
+			s.recoveryResolvedCb("task_failed", node.ID, "")
+			s.recoveryResolvedCb("task_blocked", node.ID, "")
+			s.recoveryResolvedCb("stale_active_work", node.ID, "")
+		}
+	case dag.StatusFailed:
+		kind = "task_failed"
+		severity = "error"
+		if s.recoveryCb != nil {
+			s.recoveryCb(RecoveryRecord{
+				FailureID:        recoveryID("task_failed", node.ID, node.AssignedAgent),
+				Kind:             "task_failed",
+				Severity:         "error",
+				Status:           "open",
+				AgentID:          node.AssignedAgent,
+				DomainID:         node.DomainID,
+				NodeID:           node.ID,
+				Summary:          fmt.Sprintf("Task %s failed and needs recovery.", node.ID),
+				SuggestedCommand: "/continue-agents",
+			})
+		}
+	case dag.StatusBlocked:
+		kind = "task_blocked"
+		severity = "warn"
+		if s.recoveryCb != nil {
+			s.recoveryCb(RecoveryRecord{
+				FailureID:        recoveryID("task_blocked", node.ID, node.AssignedAgent),
+				Kind:             "task_blocked",
+				Severity:         "warn",
+				Status:           "open",
+				AgentID:          node.AssignedAgent,
+				DomainID:         node.DomainID,
+				NodeID:           node.ID,
+				Summary:          fmt.Sprintf("Task %s is blocked.", node.ID),
+				SuggestedCommand: "/progress",
+			})
+		}
+	}
+	if s.executionEventCb != nil && strings.TrimSpace(node.ID) != "" {
+		s.executionEventCb(ExecutionJournalEvent{
+			Kind:     kind,
+			Severity: severity,
+			AgentID:  node.AssignedAgent,
+			DomainID: node.DomainID,
+			NodeID:   node.ID,
+			Summary:  summary,
+		})
+	}
+}
+
 func (s *Server) handleCreateStub(req Request) Response {
 	var params struct {
 		Contract stub.Contract `json:"contract"`
@@ -850,6 +1243,30 @@ func (s *Server) handleCreateStub(req Request) Response {
 	}
 	// Best-effort edge addition (nodes might not match DAG node IDs)
 	s.dagManager.AddEdge(edge)
+	if s.executionEventCb != nil {
+		s.executionEventCb(ExecutionJournalEvent{
+			Kind:     "stub_created",
+			Severity: "warn",
+			AgentID:  params.Contract.ConsumerID,
+			NodeID:   params.Contract.ConsumerID,
+			Summary:  fmt.Sprintf("Stub %s created; %s is waiting on %s.", params.Contract.ID, params.Contract.ConsumerID, params.Contract.ProducerID),
+		})
+	}
+	if s.recoveryCb != nil {
+		s.recoveryCb(RecoveryRecord{
+			FailureID:        recoveryID("stub_waiting", params.Contract.ConsumerID, ""),
+			Kind:             "stub_waiting",
+			Severity:         "warn",
+			Status:           "open",
+			AgentID:          params.Contract.ConsumerID,
+			NodeID:           params.Contract.ConsumerID,
+			Summary:          fmt.Sprintf("%s is waiting on stub %s from %s.", params.Contract.ConsumerID, params.Contract.ID, params.Contract.ProducerID),
+			SuggestedCommand: "/progress",
+		})
+	}
+	if s.progressChangedCb != nil {
+		go s.progressChangedCb("stub_created")
+	}
 
 	return Response{ID: req.ID, Result: map[string]string{
 		"status":  "created",
