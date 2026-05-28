@@ -19,6 +19,26 @@ health:
   # Seconds without progress (lock/write/update) before agent is killed
   progress_timeout_sec: ${AION_PROGRESS_TIMEOUT_SEC}
 
+execution:
+  # Request-control mode. "gateway" routes Pi provider traffic through Aion.
+  mode: ${AION_EXECUTION_MODE}
+  # Maximum concurrent upstream inference requests admitted by the gateway
+  max_concurrent_requests: ${AION_EXECUTION_MAX_CONCURRENT_REQUESTS}
+  # Seconds an agent may wait in the FIFO gateway queue
+  request_queue_timeout_sec: ${AION_EXECUTION_REQUEST_QUEUE_TIMEOUT_SEC}
+
+inference_gateway:
+  # Local provider-compatible proxy used by the Pi provider extension
+  enabled: ${AION_INFERENCE_GATEWAY_ENABLED}
+  # HTTP listener for OpenAI-compatible and Anthropic-compatible requests
+  listen_addr: ${AION_INFERENCE_GATEWAY_LISTEN_ADDR}
+  # Base URL injected into Pi provider overrides
+  public_base_url: ${AION_INFERENCE_GATEWAY_URL}
+  # Optional local gateway key used only between Pi agents and the kernel
+  gateway_key: ${AION_INFERENCE_GATEWAY_KEY}
+  # Optional fallback profile when an agent does not pass a target profile
+  target_profile: ${AION_INFERENCE_GATEWAY_TARGET_PROFILE}
+
 cgroups:
   # Enable cgroup resource limits (requires Linux + permissions)
   enabled: ${AION_CGROUPS_ENABLED}
@@ -37,27 +57,32 @@ inference:
     oracle:
       provider: "${AION_PROFILE_ORACLE_PROVIDER}"
       model: "${AION_PROFILE_ORACLE_MODEL}"
+      endpoint: "${AION_PROFILE_ORACLE_ENDPOINT}"
       env:
         ${AION_PROFILE_ORACLE_ENV_KEY}: "${AION_PROFILE_ORACLE_API_KEY}"
     forge:
       provider: "${AION_PROFILE_FORGE_PROVIDER}"
       model: "${AION_PROFILE_FORGE_MODEL}"
+      endpoint: "${AION_PROFILE_FORGE_ENDPOINT}"
       env:
         ${AION_PROFILE_FORGE_ENV_KEY}: "${AION_PROFILE_FORGE_API_KEY}"
     glimmer:
       provider: "${AION_PROFILE_GLIMMER_PROVIDER}"
       model: "${AION_PROFILE_GLIMMER_MODEL}"
+      endpoint: "${AION_PROFILE_GLIMMER_ENDPOINT}"
       env:
         ${AION_PROFILE_GLIMMER_ACCOUNT_ENV_KEY}: "${AION_PROFILE_GLIMMER_ACCOUNT_ID}"
         ${AION_PROFILE_GLIMMER_API_KEY_ENV_KEY}: "${AION_PROFILE_GLIMMER_API_KEY}"
     ember:
       provider: "${AION_PROFILE_EMBER_PROVIDER}"
       model: "${AION_PROFILE_EMBER_MODEL}"
+      endpoint: "${AION_PROFILE_EMBER_ENDPOINT}"
       env:
         ${AION_PROFILE_EMBER_ENV_KEY}: "${AION_PROFILE_EMBER_API_KEY}"
     lyric:
       provider: "${AION_PROFILE_LYRIC_PROVIDER}"
       model: "${AION_PROFILE_LYRIC_MODEL}"
+      endpoint: "${AION_PROFILE_LYRIC_ENDPOINT}"
       env:
         ${AION_PROFILE_LYRIC_ENV_KEY}: "${AION_PROFILE_LYRIC_API_KEY}"
 
@@ -80,6 +105,8 @@ agents:
   # Paths to Pi skills/extensions
   skill_paths:
     - "${AION_AGENT_SKILL_PATH}"
+  extension_paths:
+    - "${AION_PI_GATEWAY_EXTENSION_PATH}"
   # Files that cannot be locked directly — must use Utility Agent
   shared_files:
     - "go.mod"

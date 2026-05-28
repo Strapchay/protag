@@ -207,6 +207,9 @@ func (s *AgentSupervisor) spawnAgent(ctx context.Context) error {
 
 	// Create cgroup
 	if err := CreateCgroup(s.config.Cgroup); err != nil {
+		if s.config.Cgroup.Strict() {
+			return err
+		}
 		log.Printf("supervisor: cgroup creation failed for %s: %v", s.config.AgentID, err)
 	}
 
@@ -218,7 +221,11 @@ func (s *AgentSupervisor) spawnAgent(ctx context.Context) error {
 
 	// Assign to cgroup
 	if s.config.Cgroup.Enabled {
-		if err := AssignProcess(s.config.Cgroup.BasePath, s.config.AgentID, piAgent.PID()); err != nil {
+		if err := AssignProcessWithConfig(s.config.Cgroup, piAgent.PID()); err != nil {
+			if s.config.Cgroup.Strict() {
+				piAgent.Kill()
+				return err
+			}
 			log.Printf("supervisor: cgroup assign failed for %s: %v", s.config.AgentID, err)
 		}
 	}

@@ -10,3 +10,12 @@ Files:
 
 The runtime binary still reads `aion.yaml` on startup. The unit only provides
 the process envelope, restart behavior, and cgroup delegation.
+
+Cgroup mode policy:
+
+- local development should normally use `AION_CGROUPS_ENABLED=false` and
+  `AION_CGROUPS_MODE=disabled`;
+- direct manual cgroup experiments can use `AION_CGROUPS_MODE=direct`, which
+  degrades if the cgroup root is not writable;
+- installed systemd runs use `AION_CGROUPS_MODE=systemd`, which treats missing
+  delegation as a real resource-governance failure.

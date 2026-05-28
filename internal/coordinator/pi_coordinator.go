@@ -40,7 +40,9 @@ type PiCoordinatorConfig struct {
 	SessionStoreDir string
 	Provider        string
 	Model           string
+	Endpoint        string
 	SkillPaths      []string
+	ExtensionPaths  []string
 	Env             []string
 }
 
@@ -172,13 +174,15 @@ func (c *PiCoordinator) StartArchitect(ctx context.Context) error {
 		HeartbeatTimeout: 30 * time.Minute, // Architect takes time to think/wait for user
 		ProgressTimeout:  1 * time.Hour,
 		PiAgent: supervisor.PiAgentConfig{
-			Binary:     c.config.Binary,
-			SessionDir: agentDir,
-			WorkingDir: c.projectRoot,
-			Provider:   c.config.Provider,
-			Model:      c.config.Model,
-			SkillPaths: c.config.SkillPaths,
-			Env:        c.config.Env,
+			Binary:         c.config.Binary,
+			SessionDir:     agentDir,
+			WorkingDir:     c.projectRoot,
+			Provider:       c.config.Provider,
+			Model:          c.config.Model,
+			Endpoint:       c.config.Endpoint,
+			SkillPaths:     c.config.SkillPaths,
+			ExtensionPaths: c.config.ExtensionPaths,
+			Env:            append(c.config.Env, "AION_AGENT_ID=orchestrator", "AION_DOMAIN_ID=architect"),
 		},
 	})
 	c.agent.SetLifecycleFunc(c.handleArchitectLifecycle)
@@ -222,13 +226,15 @@ func (c *PiCoordinator) plannerSupervisorConfig(agentDir string) supervisor.Agen
 		HeartbeatTimeout: 30 * time.Minute,
 		ProgressTimeout:  1 * time.Hour,
 		PiAgent: supervisor.PiAgentConfig{
-			Binary:     c.config.Binary,
-			SessionDir: agentDir,
-			WorkingDir: c.projectRoot,
-			Provider:   c.config.Provider,
-			Model:      c.config.Model,
-			SkillPaths: c.config.SkillPaths,
-			Env:        c.config.Env,
+			Binary:         c.config.Binary,
+			SessionDir:     agentDir,
+			WorkingDir:     c.projectRoot,
+			Provider:       c.config.Provider,
+			Model:          c.config.Model,
+			Endpoint:       c.config.Endpoint,
+			SkillPaths:     c.config.SkillPaths,
+			ExtensionPaths: c.config.ExtensionPaths,
+			Env:            append(c.config.Env, "AION_AGENT_ID=coordinator", "AION_DOMAIN_ID=coordinator"),
 		},
 	}
 }

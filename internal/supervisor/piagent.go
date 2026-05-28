@@ -33,9 +33,12 @@ type PiAgentConfig struct {
 	Env []string
 	// SkillPaths are paths to Pi Agent skill directories.
 	SkillPaths []string
+	// ExtensionPaths are paths to Pi Agent extension files.
+	ExtensionPaths []string
 	// Binary is the path to the Pi Agent binary (default: "pi").
 	Binary string
-	// Endpoint is an optional custom API endpoint resolved behind the profile.
+	// Endpoint is resolved behind the profile for kernel-side routing. Pi
+	// provider base URLs are overridden through extensions, not a CLI flag.
 	Endpoint string
 	// MockMode uses a mock subprocess for testing.
 	MockMode bool
@@ -232,14 +235,20 @@ func SpawnPiAgent(config PiAgentConfig) (*PiAgentProcess, error) {
 	if config.Model != "" {
 		args = append(args, "--model", config.Model)
 	}
-	if config.Endpoint != "" {
-		args = append(args, "--endpoint", config.Endpoint)
-	}
 	if config.SessionDir != "" {
 		args = append(args, "--session-dir", config.SessionDir)
 	}
 	for _, skill := range config.SkillPaths {
+		if strings.TrimSpace(skill) == "" {
+			continue
+		}
 		args = append(args, "--skill", skill)
+	}
+	for _, extension := range config.ExtensionPaths {
+		if strings.TrimSpace(extension) == "" {
+			continue
+		}
+		args = append(args, "--extension", resolvePiPath(config.WorkingDir, extension))
 	}
 
 	// Setup raw logging for debugging
@@ -306,6 +315,33 @@ func SpawnPiAgent(config PiAgentConfig) (*PiAgentProcess, error) {
 	go p.waitForExit()
 
 	return p, nil
+}
+
+func resolvePiPath(workingDir, path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" || filepath.IsAbs(path) {
+		return path
+	}
+	candidates := []string{}
+	if workingDir != "" {
+		candidates = append(candidates, filepath.Join(workingDir, path))
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(cwd, path))
+	}
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(exeDir, path),
+			filepath.Join(exeDir, "..", path),
+		)
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return path
 }
 
 // SendPrompt sends an initial prompt to the Pi Agent.

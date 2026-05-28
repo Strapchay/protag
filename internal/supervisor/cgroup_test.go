@@ -32,6 +32,9 @@ func TestCgroupsLifecycle(t *testing.T) {
 
 	cgroupPath := filepath.Join(cgroupBasePath, config.AgentID)
 	if _, err := os.Stat(cgroupPath); os.IsNotExist(err) {
+		if isCgroupSkipped(config.BasePath) {
+			t.Skipf("cgroup root unavailable, skipping direct lifecycle test")
+		}
 		t.Fatalf("cgroup directory not created at %s", cgroupPath)
 	}
 
@@ -77,6 +80,39 @@ func TestCgroupsLifecycle(t *testing.T) {
 	// Just attempt destruction and verify it drops errors or succeeds.
 	if err != nil {
 		t.Logf("DestroyCgroup failed (expected if process inside): %v", err)
+	}
+}
+
+func TestCgroupDirectModeDegradesWhenRootUnavailable(t *testing.T) {
+	config := CgroupConfig{
+		Enabled:        true,
+		Mode:           "direct",
+		BasePath:       "/proc/aion-kernel-cgroup-test",
+		AgentID:        "agent-direct-degrade",
+		MemoryMaxBytes: 64 * 1024 * 1024,
+		PidsMax:        16,
+	}
+
+	if err := CreateCgroup(config); err != nil {
+		t.Fatalf("direct mode should degrade without returning error: %v", err)
+	}
+	if err := AssignProcessWithConfig(config, os.Getpid()); err != nil {
+		t.Fatalf("direct mode skipped root should not fail assignment: %v", err)
+	}
+}
+
+func TestCgroupSystemdModeFailsWhenRootUnavailable(t *testing.T) {
+	config := CgroupConfig{
+		Enabled:        true,
+		Mode:           "systemd",
+		BasePath:       "/proc/aion-kernel-cgroup-test-systemd",
+		AgentID:        "agent-systemd-strict",
+		MemoryMaxBytes: 64 * 1024 * 1024,
+		PidsMax:        16,
+	}
+
+	if err := CreateCgroup(config); err == nil {
+		t.Fatal("expected systemd mode to report missing delegation as an error")
 	}
 }
 

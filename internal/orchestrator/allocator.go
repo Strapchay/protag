@@ -130,6 +130,7 @@ func (a *Allocator) AllocateWithOptions(ctx context.Context, domains []coordinat
 		envVars := []string{
 			fmt.Sprintf("AION_ORCHESTRATOR_ADDR=%s", a.config.Orchestrator.ListenAddr),
 			fmt.Sprintf("AION_AGENT_ID=%s", agentID),
+			fmt.Sprintf("AION_DOMAIN_ID=%s", domain.DomainID),
 		}
 
 		if infConfig.UseProfile != "" {
@@ -157,6 +158,25 @@ func (a *Allocator) AllocateWithOptions(ctx context.Context, domains []coordinat
 				endpoint = a.config.Inference.Fallback.Endpoint
 			}
 		}
+		if a.config.GatewayEnabled() {
+			profileName := infConfig.UseProfile
+			if profileName == "" {
+				profileName = a.config.InferenceGateway.TargetProfile
+			}
+			gatewayURL := a.config.InferenceGateway.PublicBaseURL
+			if gatewayURL == "" {
+				gatewayURL = "http://" + a.config.InferenceGateway.ListenAddr
+			}
+			endpoint = gatewayURL
+			envVars = append(envVars,
+				"AION_INFERENCE_GATEWAY_ENABLED=true",
+				fmt.Sprintf("AION_INFERENCE_GATEWAY_URL=%s", gatewayURL),
+				fmt.Sprintf("AION_INFERENCE_GATEWAY_KEY=%s", a.config.InferenceGateway.GatewayKey),
+				fmt.Sprintf("AION_TARGET_PROVIDER=%s", provider),
+				fmt.Sprintf("AION_TARGET_PROFILE=%s", profileName),
+				fmt.Sprintf("AION_TARGET_API=%s", gatewayAPIForProvider(provider)),
+			)
+		}
 
 		initialPrompt := prompt
 		resumeAgent := options.Mode == AllocationModeResume && hasReusablePiSession(agentDir)
@@ -170,14 +190,15 @@ func (a *Allocator) AllocateWithOptions(ctx context.Context, domains []coordinat
 			AssignedPaths: domain.AssignedPaths,
 			InitialPrompt: initialPrompt,
 			PiAgent: supervisor.PiAgentConfig{
-				Binary:     a.config.Agents.CommandPath,
-				SessionDir: agentDir,
-				WorkingDir: a.projectRoot,
-				Provider:   provider,
-				Model:      model,
-				Endpoint:   endpoint,
-				SkillPaths: a.config.Agents.SkillPaths,
-				Env:        envVars,
+				Binary:         a.config.Agents.CommandPath,
+				SessionDir:     agentDir,
+				WorkingDir:     a.projectRoot,
+				Provider:       provider,
+				Model:          model,
+				Endpoint:       endpoint,
+				SkillPaths:     a.config.Agents.SkillPaths,
+				ExtensionPaths: a.config.Agents.ExtensionPaths,
+				Env:            envVars,
 			},
 			Cgroup: supervisor.CgroupConfig{
 				Enabled:        a.config.Cgroups.Enabled && strings.ToLower(strings.TrimSpace(a.config.Cgroups.Mode)) != "disabled",
@@ -224,7 +245,6 @@ func (a *Allocator) AllocateWithOptions(ctx context.Context, domains []coordinat
 		// Register with Hub Router
 		a.hubRouter.RegisterAgent(agentID, agent)
 
-		// Start agent asynchronously, or block and wait for it to be ready
 		if err := agent.Start(ctx); err != nil {
 			return fmt.Errorf("allocator: spawn agent %s: %w", agentID, err)
 		}

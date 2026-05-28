@@ -47,29 +47,30 @@ type Server struct {
 	memoryStore  memory.Store
 	logsDir      string
 
-	hubCallback         func(hub.Message) // called when hub messages need routing
-	replanCb            func()
-	reviveCb            func(string) error
-	buildSpecCb         func(string) // called when user issues /build-spec
-	refineCb            func(string) // called when user sends message to orchestrator
-	retryCb             func() error
-	continueCb          func() error
-	resumeCb            func() error
-	buildSpecContinueCb func() error
-	statusCb            func() string
-	showSpecCb          func() (string, error)
-	resetCb             func() error
-	buildSpecStatusCb   func() string
-	buildSpecPlanCb     func() (string, error)
-	buildSpecTraceCb    func() (string, error)
-	buildSpecCancelCb   func() error
-	buildProgressCb     func() (*BuildProgressSnapshot, error)
-	progressChangedCb   func(string)
-	executionEventCb    func(ExecutionJournalEvent)
-	recoveryCb          func(RecoveryRecord)
-	recoveryResolvedCb  func(string, string, string)
-	behaviorCb          func(agentID, domainID, kind, evidence string)
-	agentListCb         func() []AgentInfo
+	hubCallback              func(hub.Message) // called when hub messages need routing
+	replanCb                 func()
+	reviveCb                 func(string) error
+	buildSpecCb              func(string) // called when user issues /build-spec
+	refineCb                 func(string) // called when user sends message to orchestrator
+	retryCb                  func() error
+	continueCb               func() error
+	resumeCb                 func() error
+	buildSpecContinueCb      func() error
+	statusCb                 func() string
+	showSpecCb               func() (string, error)
+	resetCb                  func() error
+	buildSpecStatusCb        func() string
+	buildSpecPlanCb          func() (string, error)
+	buildSpecTraceCb         func() (string, error)
+	buildSpecCancelCb        func() error
+	buildProgressCb          func() (*BuildProgressSnapshot, error)
+	progressChangedCb        func(string)
+	executionEventCb         func(ExecutionJournalEvent)
+	recoveryCb               func(RecoveryRecord)
+	recoveryResolvedCb       func(string, string, string)
+	behaviorCb               func(agentID, domainID, kind, evidence string)
+	inferenceGatewayStatusCb func() InferenceGatewayStatus
+	agentListCb              func() []AgentInfo
 
 	listener    net.Listener
 	heartbeats  map[string]int64 // agentID → last heartbeat unix ms
@@ -701,6 +702,10 @@ func (s *Server) SetBehaviorCallback(cb func(agentID, domainID, kind, evidence s
 	s.behaviorCb = cb
 }
 
+func (s *Server) SetInferenceGatewayStatusCallback(cb func() InferenceGatewayStatus) {
+	s.inferenceGatewayStatusCb = cb
+}
+
 func (s *Server) SetAgentListCallback(cb func() []AgentInfo) {
 	s.agentListCb = cb
 }
@@ -927,6 +932,10 @@ func (s *Server) handleDebugStatus(req Request) Response {
 	if s.buildSpecStatusCb != nil {
 		buildSpecStatus = s.buildSpecStatusCb()
 	}
+	var inferenceGateway InferenceGatewayStatus
+	if s.inferenceGatewayStatusCb != nil {
+		inferenceGateway = s.inferenceGatewayStatusCb()
+	}
 
 	result := map[string]interface{}{
 		"addr":                     s.Addr(),
@@ -942,6 +951,7 @@ func (s *Server) handleDebugStatus(req Request) Response {
 		"dag_nodes":                dagNodes,
 		"dag_edges":                dagEdges,
 		"build_spec_status":        buildSpecStatus,
+		"inference_gateway":        inferenceGateway,
 		"agents":                   agents,
 	}
 	return Response{ID: req.ID, Result: result}

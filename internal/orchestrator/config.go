@@ -12,12 +12,14 @@ import (
 
 // Config is the root configuration for the Aion-Kernel.
 type Config struct {
-	Orchestrator OrchestratorConfig `yaml:"orchestrator"`
-	Agents       AgentsConfig       `yaml:"agents"`
-	Health       HealthConfig       `yaml:"health"`
-	Cgroups      CgroupsConfig      `yaml:"cgroups"`
-	Inference    InferenceConfig    `yaml:"inference"`
-	Memory       MemoryConfig       `yaml:"memory"`
+	Orchestrator     OrchestratorConfig     `yaml:"orchestrator"`
+	Agents           AgentsConfig           `yaml:"agents"`
+	Health           HealthConfig           `yaml:"health"`
+	Execution        ExecutionConfig        `yaml:"execution"`
+	InferenceGateway InferenceGatewayConfig `yaml:"inference_gateway"`
+	Cgroups          CgroupsConfig          `yaml:"cgroups"`
+	Inference        InferenceConfig        `yaml:"inference"`
+	Memory           MemoryConfig           `yaml:"memory"`
 }
 
 // MemoryConfig configures the semantic memory store.
@@ -43,18 +45,35 @@ type OrchestratorConfig struct {
 
 // AgentsConfig configures agent management.
 type AgentsConfig struct {
-	SessionDir  string   `yaml:"session_dir"`
-	MaxAgents   int      `yaml:"max_agents"`
-	SharedFiles []string `yaml:"shared_files"`
-	CommandPath string   `yaml:"command_path"`
-	CommandArgs []string `yaml:"command_args"`
-	SkillPaths  []string `yaml:"skill_paths,omitempty"`
+	SessionDir     string   `yaml:"session_dir"`
+	MaxAgents      int      `yaml:"max_agents"`
+	SharedFiles    []string `yaml:"shared_files"`
+	CommandPath    string   `yaml:"command_path"`
+	CommandArgs    []string `yaml:"command_args"`
+	SkillPaths     []string `yaml:"skill_paths,omitempty"`
+	ExtensionPaths []string `yaml:"extension_paths,omitempty"`
 }
 
 // HealthConfig configures agent health monitoring.
 type HealthConfig struct {
 	HeartbeatTimeoutSec int `yaml:"heartbeat_timeout_sec"`
 	ProgressTimeoutSec  int `yaml:"progress_timeout_sec"`
+}
+
+type ExecutionConfig struct {
+	Mode                   string `yaml:"mode"`
+	MaxConcurrentRequests  int    `yaml:"max_concurrent_requests"`
+	RequestQueueTimeoutSec int    `yaml:"request_queue_timeout_sec"`
+}
+
+// InferenceGatewayConfig configures the local provider-compatible proxy used
+// to serialize Pi inference requests before they reach upstream providers.
+type InferenceGatewayConfig struct {
+	Enabled       bool   `yaml:"enabled"`
+	ListenAddr    string `yaml:"listen_addr"`
+	PublicBaseURL string `yaml:"public_base_url"`
+	GatewayKey    string `yaml:"gateway_key,omitempty"`
+	TargetProfile string `yaml:"target_profile,omitempty"`
 }
 
 // CgroupsConfig configures cgroup resource limits.
@@ -169,6 +188,18 @@ health:
   heartbeat_timeout_sec: 30
   progress_timeout_sec: 120
 
+execution:
+  mode: "${AION_EXECUTION_MODE}"
+  max_concurrent_requests: ${AION_EXECUTION_MAX_CONCURRENT_REQUESTS}
+  request_queue_timeout_sec: ${AION_EXECUTION_REQUEST_QUEUE_TIMEOUT_SEC}
+
+inference_gateway:
+  enabled: ${AION_INFERENCE_GATEWAY_ENABLED}
+  listen_addr: "${AION_INFERENCE_GATEWAY_LISTEN_ADDR}"
+  public_base_url: "${AION_INFERENCE_GATEWAY_URL}"
+  gateway_key: "${AION_INFERENCE_GATEWAY_KEY}"
+  target_profile: "${AION_INFERENCE_GATEWAY_TARGET_PROFILE}"
+
 cgroups:
   enabled: true
   mode: "${AION_CGROUPS_MODE}"
@@ -182,18 +213,21 @@ inference:
     oracle:
       provider: "${AION_PROFILE_ORACLE_PROVIDER}"
       model: "${AION_PROFILE_ORACLE_MODEL}"
+      endpoint: "${AION_PROFILE_ORACLE_ENDPOINT}"
       env:
         ${AION_PROFILE_ORACLE_ENV_KEY}: "${AION_PROFILE_ORACLE_API_KEY}"
     # forge
     forge:
       provider: "${AION_PROFILE_FORGE_PROVIDER}"
       model: "${AION_PROFILE_FORGE_MODEL}"
+      endpoint: "${AION_PROFILE_FORGE_ENDPOINT}"
       env:
         ${AION_PROFILE_FORGE_ENV_KEY}: "${AION_PROFILE_FORGE_API_KEY}"
     # glimmer
     glimmer:
       provider: "${AION_PROFILE_GLIMMER_PROVIDER}"
       model: "${AION_PROFILE_GLIMMER_MODEL}"
+      endpoint: "${AION_PROFILE_GLIMMER_ENDPOINT}"
       env:
         ${AION_PROFILE_GLIMMER_ACCOUNT_ENV_KEY}: "${AION_PROFILE_GLIMMER_ACCOUNT_ID}"
         ${AION_PROFILE_GLIMMER_API_KEY_ENV_KEY}: "${AION_PROFILE_GLIMMER_API_KEY}"
@@ -201,12 +235,14 @@ inference:
     ember:
       provider: "${AION_PROFILE_EMBER_PROVIDER}"
       model: "${AION_PROFILE_EMBER_MODEL}"
+      endpoint: "${AION_PROFILE_EMBER_ENDPOINT}"
       env:
         ${AION_PROFILE_EMBER_ENV_KEY}: "${AION_PROFILE_EMBER_API_KEY}"
     # lyric
     lyric:
       provider: "${AION_PROFILE_LYRIC_PROVIDER}"
       model: "${AION_PROFILE_LYRIC_MODEL}"
+      endpoint: "${AION_PROFILE_LYRIC_ENDPOINT}"
       env:
         ${AION_PROFILE_LYRIC_ENV_KEY}: "${AION_PROFILE_LYRIC_API_KEY}"
 
@@ -225,6 +261,8 @@ agents:
   command_path: "${AION_AGENT_COMMAND_PATH}"
   skill_paths:
     - "${AION_AGENT_SKILL_PATH}"
+  extension_paths:
+    - "${AION_PI_GATEWAY_EXTENSION_PATH}"
   shared_files:
     - "go.mod"
     - "go.sum"
@@ -272,6 +310,24 @@ func applyDefaults(c *Config) {
 	if c.Health.ProgressTimeoutSec == 0 {
 		c.Health.ProgressTimeoutSec = 120
 	}
+	if c.Execution.MaxConcurrentRequests == 0 {
+		c.Execution.MaxConcurrentRequests = 1
+	}
+	if c.Execution.RequestQueueTimeoutSec == 0 {
+		c.Execution.RequestQueueTimeoutSec = 600
+	}
+	if c.Execution.Mode == "" {
+		c.Execution.Mode = "gateway"
+	}
+	if c.InferenceGateway.ListenAddr == "" {
+		c.InferenceGateway.ListenAddr = "127.0.0.1:50151"
+	}
+	if c.InferenceGateway.PublicBaseURL == "" {
+		c.InferenceGateway.PublicBaseURL = "http://" + c.InferenceGateway.ListenAddr
+	}
+	if c.InferenceGateway.TargetProfile == "" {
+		c.InferenceGateway.TargetProfile = c.Inference.DomainAgents.UseProfile
+	}
 	if c.Cgroups.MemoryMaxMB == 0 {
 		c.Cgroups.MemoryMaxMB = 2048
 	}
@@ -310,6 +366,28 @@ func validateConfig(c *Config) error {
 	if c.Agents.MaxAgents > 32 {
 		return fmt.Errorf("max_agents %d exceeds reasonable limit", c.Agents.MaxAgents)
 	}
+	if c.Execution.MaxConcurrentRequests < 1 {
+		return fmt.Errorf("execution.max_concurrent_requests must be >= 1")
+	}
+	if c.Execution.MaxConcurrentRequests > 16 {
+		return fmt.Errorf("execution.max_concurrent_requests %d exceeds reasonable limit", c.Execution.MaxConcurrentRequests)
+	}
+	if c.Execution.RequestQueueTimeoutSec < 1 {
+		return fmt.Errorf("execution.request_queue_timeout_sec must be >= 1")
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Execution.Mode)) {
+	case "", "gateway", "none":
+	default:
+		return fmt.Errorf("invalid execution.mode %q", c.Execution.Mode)
+	}
+	if c.InferenceGateway.Enabled {
+		if strings.TrimSpace(c.InferenceGateway.ListenAddr) == "" {
+			return fmt.Errorf("inference_gateway.listen_addr is required when gateway is enabled")
+		}
+		if strings.TrimSpace(c.InferenceGateway.PublicBaseURL) == "" {
+			return fmt.Errorf("inference_gateway.public_base_url is required when gateway is enabled")
+		}
+	}
 	switch strings.ToLower(strings.TrimSpace(c.Cgroups.Mode)) {
 	case "", "direct", "systemd", "disabled":
 	default:
@@ -336,4 +414,13 @@ func (c *Config) ProgressTimeout() time.Duration {
 // MemoryMaxBytes returns the memory limit in bytes.
 func (c *Config) MemoryMaxBytes() int64 {
 	return c.Cgroups.MemoryMaxMB * 1024 * 1024
+}
+
+// GatewayEnabled reports whether Pi inference requests should be routed
+// through the local provider-compatible gateway.
+func (c *Config) GatewayEnabled() bool {
+	if c == nil {
+		return false
+	}
+	return c.InferenceGateway.Enabled && strings.EqualFold(strings.TrimSpace(c.Execution.Mode), "gateway")
 }

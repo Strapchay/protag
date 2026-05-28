@@ -34,6 +34,7 @@ type Daemon struct {
 	server                 *Server
 	coordinator            coordinator.Coordinator
 	memoryStore            memory.Store
+	inferenceGateway       *InferenceGateway
 	projectRoot            string
 	auditor                *Auditor
 	runState               *RunState
@@ -110,6 +111,11 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 		}
 	}
 
+	var inferenceGateway *InferenceGateway
+	if config.GatewayEnabled() {
+		inferenceGateway = NewInferenceGateway(config)
+	}
+
 	// Initialize Server
 	server := NewServer(dagMgr, lockMgr, stubReg, memStore)
 	server.SetLogsDir(runState.LogsDir)
@@ -136,21 +142,22 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	daemon := &Daemon{
-		config:        config,
-		dagManager:    dagMgr,
-		lockManager:   lockMgr,
-		stubRegistry:  stubReg,
-		hubRouter:     hubRouter,
-		allocator:     alloc,
-		server:        server,
-		coordinator:   coord,
-		memoryStore:   memStore,
-		auditor:       aud,
-		runState:      runState,
-		projectRoot:   projectRoot,
-		ctx:           ctx,
-		cancel:        cancel,
-		staleReported: make(map[string]bool),
+		config:           config,
+		dagManager:       dagMgr,
+		lockManager:      lockMgr,
+		stubRegistry:     stubReg,
+		hubRouter:        hubRouter,
+		allocator:        alloc,
+		server:           server,
+		coordinator:      coord,
+		memoryStore:      memStore,
+		inferenceGateway: inferenceGateway,
+		auditor:          aud,
+		runState:         runState,
+		projectRoot:      projectRoot,
+		ctx:              ctx,
+		cancel:           cancel,
+		staleReported:    make(map[string]bool),
 	}
 
 	server.SetHubCallback(func(msg hub.Message) {
@@ -314,6 +321,12 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	server.SetBehaviorCallback(func(agentID, domainID, kind, evidence string) {
 		daemon.observeAgentCoordinationBehavior(agentID, domainID, kind, evidence)
 	})
+	server.SetInferenceGatewayStatusCallback(func() InferenceGatewayStatus {
+		if daemon.inferenceGateway == nil {
+			return InferenceGatewayStatus{Enabled: false}
+		}
+		return daemon.inferenceGateway.Status()
+	})
 	server.SetAgentListCallback(func() []AgentInfo {
 		infos := []AgentInfo{{
 			AgentID:  "coordinator",
@@ -350,9 +363,68 @@ func (d *Daemon) configureAllocatorCallbacks() {
 	d.allocator.SetBroadcastFunc(func(msg hub.Message) {
 		d.server.BroadcastHubEvent(msg)
 	})
-	d.auditor.SetStaleNodeFunc(func(node dag.DagNode, elapsed time.Duration) {
-		d.recordStaleNode(node, elapsed)
-	})
+	if d.auditor != nil {
+		d.auditor.SetSuppressStaleNodeFunc(func(node dag.DagNode) bool {
+			return d.shouldSuppressStaleNodeAudit(node)
+		})
+		d.auditor.SetStaleNodeFunc(func(node dag.DagNode, elapsed time.Duration) {
+			d.recordStaleNode(node, elapsed)
+		})
+	}
+}
+
+func (d *Daemon) shouldSuppressStaleNodeAudit(node dag.DagNode) bool {
+	if d == nil || d.runState == nil || strings.TrimSpace(node.ID) == "" {
+		return false
+	}
+	attempt := d.buildSpecAttempt
+	if attempt == nil {
+		loaded, err := loadBuildSpecAttempt(d.runState.Root)
+		if err != nil {
+			return false
+		}
+		attempt = loaded
+	}
+	if attempt == nil || !attemptOwnsNode(attempt, node.ID) {
+		return false
+	}
+	switch attempt.Status {
+	case BuildSpecAttemptActive, BuildSpecAttemptAllocating:
+	default:
+		return false
+	}
+	expectedAgent := strings.TrimSpace(node.AssignedAgent)
+	if expectedAgent == "" && strings.TrimSpace(node.DomainID) != "" {
+		expectedAgent = "agent-" + strings.TrimSpace(node.DomainID)
+	}
+	if expectedAgent == "" || d.allocator == nil {
+		return true
+	}
+	for _, info := range d.allocator.AgentInfos() {
+		if info.AgentID == expectedAgent && info.State == "Running" {
+			return false
+		}
+	}
+	return true
+}
+
+func attemptOwnsNode(attempt *BuildSpecAttempt, nodeID string) bool {
+	if attempt == nil || strings.TrimSpace(nodeID) == "" {
+		return false
+	}
+	for _, id := range attempt.CreatedNodeIDs {
+		if id == nodeID {
+			return true
+		}
+	}
+	if attempt.Plan != nil {
+		for _, node := range attempt.Plan.Nodes {
+			if node.ID == nodeID {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (d *Daemon) recordBuildSpecAgentState(agentID, domainID, state, reason string) {
@@ -553,15 +625,38 @@ func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunSta
 	infConfig := config.Inference.Coordinator
 	provider := infConfig.Provider
 	model := infConfig.Model
+	endpoint := infConfig.Endpoint
 	var envVars []string
 	if infConfig.UseProfile != "" {
 		if profile, ok := config.Inference.Models[infConfig.UseProfile]; ok {
 			provider = profile.Provider
 			model = profile.Model
+			if profile.Endpoint != "" {
+				endpoint = profile.Endpoint
+			}
 			for k, v := range profile.Env {
 				envVars = append(envVars, fmt.Sprintf("%s=%s", k, v))
 			}
 		}
+	}
+	if config.GatewayEnabled() {
+		profileName := infConfig.UseProfile
+		if profileName == "" {
+			profileName = config.InferenceGateway.TargetProfile
+		}
+		gatewayURL := config.InferenceGateway.PublicBaseURL
+		if gatewayURL == "" {
+			gatewayURL = "http://" + config.InferenceGateway.ListenAddr
+		}
+		endpoint = gatewayURL
+		envVars = append(envVars,
+			"AION_INFERENCE_GATEWAY_ENABLED=true",
+			fmt.Sprintf("AION_INFERENCE_GATEWAY_URL=%s", gatewayURL),
+			fmt.Sprintf("AION_INFERENCE_GATEWAY_KEY=%s", config.InferenceGateway.GatewayKey),
+			fmt.Sprintf("AION_TARGET_PROVIDER=%s", provider),
+			fmt.Sprintf("AION_TARGET_PROFILE=%s", profileName),
+			fmt.Sprintf("AION_TARGET_API=%s", gatewayAPIForProvider(provider)),
+		)
 	}
 
 	return coordinator.NewPiCoordinator(projectRoot, coordinator.PiCoordinatorConfig{
@@ -570,7 +665,9 @@ func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunSta
 		SessionStoreDir: runState.AgentSessionsDir,
 		Provider:        provider,
 		Model:           model,
+		Endpoint:        endpoint,
 		SkillPaths:      config.Agents.SkillPaths,
+		ExtensionPaths:  config.Agents.ExtensionPaths,
 		Env:             envVars,
 	})
 }
@@ -579,6 +676,12 @@ func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunSta
 func (d *Daemon) Start() error {
 	log.Printf("daemon: starting aion-kernel on %s", d.config.Orchestrator.ListenAddr)
 	log.Printf("daemon: project root: %s", d.projectRoot)
+
+	if d.inferenceGateway != nil {
+		if err := d.inferenceGateway.Start(); err != nil {
+			return err
+		}
+	}
 
 	// Start server in background
 	go func() {
@@ -759,6 +862,13 @@ func (d *Daemon) Shutdown() {
 	d.allocator.StopAll()
 
 	log.Println("daemon: stopping server...")
+	if d.inferenceGateway != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := d.inferenceGateway.Shutdown(shutdownCtx); err != nil {
+			log.Printf("daemon: inference gateway shutdown failed: %v", err)
+		}
+		cancel()
+	}
 	d.server.Stop()
 	if err := deleteServerInfo(d.projectRoot); err != nil && !os.IsNotExist(err) {
 		log.Printf("daemon: failed to remove server info: %v", err)

@@ -33,6 +33,12 @@ func TestLoadConfig(t *testing.T) {
 	if config.Agents.MaxAgents != 4 {
 		t.Fatalf("expected 4 max agents, got %d", config.Agents.MaxAgents)
 	}
+	if !config.GatewayEnabled() {
+		t.Fatal("expected inference gateway to be enabled from test config")
+	}
+	if config.InferenceGateway.PublicBaseURL == "" {
+		t.Fatal("expected inference gateway public base URL")
+	}
 }
 
 func TestConfigDefaults(t *testing.T) {
@@ -59,6 +65,9 @@ func TestConfigDefaults(t *testing.T) {
 	}
 	if config.Cgroups.BasePath != "/sys/fs/cgroup/aion" {
 		t.Fatalf("expected default cgroup base path, got %q", config.Cgroups.BasePath)
+	}
+	if config.Execution.Mode != "gateway" {
+		t.Fatalf("expected default execution mode gateway, got %q", config.Execution.Mode)
 	}
 }
 

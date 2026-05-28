@@ -19,6 +19,7 @@ type Auditor struct {
 	progressTimeout time.Duration
 	scanInterval    time.Duration
 	staleNodeFn     func(dag.DagNode, time.Duration)
+	suppressStaleFn func(dag.DagNode) bool
 }
 
 // NewAuditor creates a new passive auditor.
@@ -40,6 +41,10 @@ func NewAuditor(
 
 func (a *Auditor) SetStaleNodeFunc(fn func(dag.DagNode, time.Duration)) {
 	a.staleNodeFn = fn
+}
+
+func (a *Auditor) SetSuppressStaleNodeFunc(fn func(dag.DagNode) bool) {
+	a.suppressStaleFn = fn
 }
 
 // Start launches the auditor loop in the background.
@@ -70,6 +75,9 @@ func (a *Auditor) scan() {
 		if node.Status == dag.StatusInProgress {
 			elapsed := now - node.UpdatedAt
 			if elapsed > a.progressTimeout.Milliseconds() {
+				if a.suppressStaleFn != nil && a.suppressStaleFn(node) {
+					continue
+				}
 				log.Printf("auditor: [WARNING] Node %s for agent %s has been InProgress for %d ms (exceeds timeout)",
 					node.ID, node.AssignedAgent, elapsed)
 				if a.staleNodeFn != nil {
