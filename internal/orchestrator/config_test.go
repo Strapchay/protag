@@ -41,6 +41,30 @@ func TestLoadConfig(t *testing.T) {
 	}
 }
 
+func TestEnvExampleLoadsConfig(t *testing.T) {
+	envPath := filepath.Join("..", "..", ".env.example")
+	if err := godotenv.Overload(envPath); err != nil {
+		t.Fatalf("load env example %s: %v", envPath, err)
+	}
+
+	config, err := LoadConfig(filepath.Join("..", "..", "configs", "aion.yaml"))
+	if err != nil {
+		t.Fatalf("LoadConfig with env example: %v", err)
+	}
+	if config.Orchestrator.ListenAddr != "127.0.0.1:50051" {
+		t.Fatalf("unexpected listen addr from env example: %s", config.Orchestrator.ListenAddr)
+	}
+	if !config.GatewayEnabled() {
+		t.Fatal("expected env example to enable gateway mode")
+	}
+	if config.Inference.Coordinator.UseProfile != "oracle" {
+		t.Fatalf("unexpected coordinator profile: %s", config.Inference.Coordinator.UseProfile)
+	}
+	if config.Inference.Models["forge"].Provider != "provider-beta" {
+		t.Fatalf("env example should use neutral provider labels, got %q", config.Inference.Models["forge"].Provider)
+	}
+}
+
 func TestConfigDefaults(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "minimal.yaml")
