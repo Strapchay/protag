@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,20 +18,41 @@ import (
 )
 
 const gatewayAuthHeader = "X-Aion-Gateway-Key"
+const gatewayExtensionLoadedPath = "/aion/gateway/extension-loaded"
 
 // InferenceGatewayStatus is exposed through debug-status for operational
 // observability without leaking upstream provider credentials.
 type InferenceGatewayStatus struct {
-	Enabled       bool   `json:"enabled"`
-	ListenAddr    string `json:"listen_addr"`
-	PublicBaseURL string `json:"public_base_url"`
-	Capacity      int    `json:"capacity"`
-	InUse         int    `json:"in_use"`
-	Queued        int    `json:"queued"`
-	TotalRequests int64  `json:"total_requests"`
-	Rejected      int64  `json:"rejected"`
-	Upstream429   int64  `json:"upstream_429"`
-	LastError     string `json:"last_error,omitempty"`
+	Enabled       bool           `json:"enabled"`
+	ListenAddr    string         `json:"listen_addr"`
+	PublicBaseURL string         `json:"public_base_url"`
+	Capacity      int            `json:"capacity"`
+	InUse         int            `json:"in_use"`
+	Queued        int            `json:"queued"`
+	TotalRequests int64          `json:"total_requests"`
+	Rejected      int64          `json:"rejected"`
+	Upstream429   int64          `json:"upstream_429"`
+	LastError     string         `json:"last_error,omitempty"`
+	LogPath       string         `json:"log_path,omitempty"`
+	StatusCounts  map[int]int64  `json:"status_counts,omitempty"`
+	RecentEvents  []GatewayEvent `json:"recent_events,omitempty"`
+}
+
+type GatewayEvent struct {
+	At         string `json:"at"`
+	Level      string `json:"level"`
+	RequestID  string `json:"request_id,omitempty"`
+	AgentID    string `json:"agent_id,omitempty"`
+	DomainID   string `json:"domain_id,omitempty"`
+	Profile    string `json:"profile,omitempty"`
+	Provider   string `json:"provider,omitempty"`
+	Method     string `json:"method,omitempty"`
+	Path       string `json:"path,omitempty"`
+	Status     int    `json:"status,omitempty"`
+	QueueMS    int64  `json:"queue_ms,omitempty"`
+	DurationMS int64  `json:"duration_ms,omitempty"`
+	Bytes      int64  `json:"bytes,omitempty"`
+	Message    string `json:"message"`
 }
 
 type InferenceGateway struct {
@@ -43,18 +66,27 @@ type InferenceGateway struct {
 	rejected      atomic.Int64
 	upstream429   atomic.Int64
 
-	mu        sync.Mutex
-	lastError string
+	mu           sync.Mutex
+	lastError    string
+	logPath      string
+	statusCounts map[int]int64
+	recentEvents []GatewayEvent
 }
 
-func NewInferenceGateway(config *Config) *InferenceGateway {
+func NewInferenceGateway(config *Config, logsDir ...string) *InferenceGateway {
 	capacity := 1
 	if config != nil && config.Execution.MaxConcurrentRequests > 0 {
 		capacity = config.Execution.MaxConcurrentRequests
 	}
+	logPath := ""
+	if len(logsDir) > 0 && strings.TrimSpace(logsDir[0]) != "" {
+		logPath = filepath.Join(logsDir[0], "inference_gateway_debug.log")
+	}
 	g := &InferenceGateway{
-		config:  config,
-		limiter: newGatewayLimiter(capacity),
+		config:       config,
+		limiter:      newGatewayLimiter(capacity),
+		logPath:      logPath,
+		statusCounts: make(map[int]int64),
 		client: &http.Client{
 			Timeout: 0,
 		},
@@ -62,9 +94,13 @@ func NewInferenceGateway(config *Config) *InferenceGateway {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", g.handleHealth)
 	mux.HandleFunc("/aion/gateway/status", g.handleStatus)
+	mux.HandleFunc(gatewayExtensionLoadedPath, g.handleExtensionLoaded)
 	mux.HandleFunc("/v1/models", g.handleModels)
 	mux.HandleFunc("/v1/chat/completions", g.handleProxy)
 	mux.HandleFunc("/v1/messages", g.handleProxy)
+	mux.HandleFunc("/chat/completions", g.handleProxy)
+	mux.HandleFunc("/messages", g.handleProxy)
+	mux.HandleFunc("/", g.handleUnknown)
 	g.server = &http.Server{Handler: mux}
 	return g
 }
@@ -84,6 +120,7 @@ func (g *InferenceGateway) Start() error {
 	}
 	g.listener = ln
 	log.Printf("inference-gateway: listening on %s", addr)
+	g.recordStartup(addr)
 	go func() {
 		if err := g.server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			g.recordError(err)
@@ -91,6 +128,17 @@ func (g *InferenceGateway) Start() error {
 		}
 	}()
 	return nil
+}
+
+func (g *InferenceGateway) recordStartup(addr string) {
+	g.recordEvent(GatewayEvent{
+		At:      time.Now().UTC().Format(time.RFC3339Nano),
+		Level:   "info",
+		Method:  "START",
+		Path:    addr,
+		Message: fmt.Sprintf("gateway started capacity=%d public_base_url=%s", g.limiter.capacity, g.config.InferenceGateway.PublicBaseURL),
+		Profile: strings.TrimSpace(g.config.InferenceGateway.TargetProfile),
+	})
 }
 
 func (g *InferenceGateway) Shutdown(ctx context.Context) error {
@@ -106,6 +154,12 @@ func (g *InferenceGateway) Status() InferenceGatewayStatus {
 	}
 	g.mu.Lock()
 	lastError := g.lastError
+	statusCounts := make(map[int]int64, len(g.statusCounts))
+	for status, count := range g.statusCounts {
+		statusCounts[status] = count
+	}
+	recentEvents := append([]GatewayEvent(nil), g.recentEvents...)
+	logPath := g.logPath
 	g.mu.Unlock()
 	capacity, inUse, queued := 0, 0, 0
 	if g.limiter != nil {
@@ -122,6 +176,9 @@ func (g *InferenceGateway) Status() InferenceGatewayStatus {
 		Rejected:      g.rejected.Load(),
 		Upstream429:   g.upstream429.Load(),
 		LastError:     lastError,
+		LogPath:       logPath,
+		StatusCounts:  statusCounts,
+		RecentEvents:  recentEvents,
 	}
 }
 
@@ -134,11 +191,58 @@ func (g *InferenceGateway) handleStatus(w http.ResponseWriter, _ *http.Request) 
 	writeGatewayJSON(w, http.StatusOK, g.Status())
 }
 
-func (g *InferenceGateway) handleModels(w http.ResponseWriter, r *http.Request) {
+func (g *InferenceGateway) handleExtensionLoaded(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	info := gatewayRequestInfo{
+		RequestID: fmt.Sprintf("gw-ext-%d", time.Now().UnixNano()),
+		AgentID:   strings.TrimSpace(r.Header.Get("X-Aion-Agent-ID")),
+		DomainID:  strings.TrimSpace(r.Header.Get("X-Aion-Domain-ID")),
+		Profile:   strings.TrimSpace(r.Header.Get("X-Aion-Target-Profile")),
+		Provider:  strings.TrimSpace(r.Header.Get("X-Aion-Target-Provider")),
+		Method:    r.Method,
+		Path:      r.URL.Path,
+	}
 	if !g.authorized(r) {
+		g.rejected.Add(1)
+		g.recordFailure(info, http.StatusUnauthorized, start, "extension loaded signal unauthorized")
 		writeGatewayJSON(w, http.StatusUnauthorized, map[string]string{"error": "gateway unauthorized"})
 		return
 	}
+	g.recordEvent(GatewayEvent{
+		At:         time.Now().UTC().Format(time.RFC3339Nano),
+		Level:      "info",
+		RequestID:  info.RequestID,
+		AgentID:    info.AgentID,
+		DomainID:   info.DomainID,
+		Profile:    info.Profile,
+		Provider:   info.Provider,
+		Method:     info.Method,
+		Path:       info.Path,
+		Status:     http.StatusOK,
+		DurationMS: time.Since(start).Milliseconds(),
+		Message:    "pi gateway extension loaded",
+	})
+	writeGatewayJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (g *InferenceGateway) handleModels(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	info := gatewayRequestInfo{
+		RequestID: fmt.Sprintf("gw-models-%d", time.Now().UnixNano()),
+		AgentID:   strings.TrimSpace(r.Header.Get("X-Aion-Agent-ID")),
+		DomainID:  strings.TrimSpace(r.Header.Get("X-Aion-Domain-ID")),
+		Profile:   strings.TrimSpace(r.Header.Get("X-Aion-Target-Profile")),
+		Provider:  strings.TrimSpace(r.Header.Get("X-Aion-Target-Provider")),
+		Method:    r.Method,
+		Path:      r.URL.Path,
+	}
+	if !g.authorized(r) {
+		g.rejected.Add(1)
+		g.recordFailure(info, http.StatusUnauthorized, start, "models request unauthorized")
+		writeGatewayJSON(w, http.StatusUnauthorized, map[string]string{"error": "gateway unauthorized"})
+		return
+	}
+	g.totalRequests.Add(1)
 	models := make([]map[string]any, 0, len(g.config.Inference.Models))
 	for name, profile := range g.config.Inference.Models {
 		id := strings.TrimSpace(profile.Model)
@@ -155,42 +259,122 @@ func (g *InferenceGateway) handleModels(w http.ResponseWriter, r *http.Request) 
 		"object": "list",
 		"data":   models,
 	})
+	g.recordStatus(http.StatusOK)
+	g.recordEvent(GatewayEvent{
+		At:         time.Now().UTC().Format(time.RFC3339Nano),
+		Level:      "debug",
+		RequestID:  info.RequestID,
+		AgentID:    info.AgentID,
+		DomainID:   info.DomainID,
+		Profile:    info.Profile,
+		Provider:   info.Provider,
+		Method:     info.Method,
+		Path:       info.Path,
+		Status:     http.StatusOK,
+		DurationMS: time.Since(start).Milliseconds(),
+		Message:    "models request completed",
+	})
+}
+
+func (g *InferenceGateway) handleUnknown(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	info := gatewayRequestInfo{
+		RequestID: fmt.Sprintf("gw-unknown-%d", time.Now().UnixNano()),
+		AgentID:   strings.TrimSpace(r.Header.Get("X-Aion-Agent-ID")),
+		DomainID:  strings.TrimSpace(r.Header.Get("X-Aion-Domain-ID")),
+		Profile:   strings.TrimSpace(r.Header.Get("X-Aion-Target-Profile")),
+		Provider:  strings.TrimSpace(r.Header.Get("X-Aion-Target-Provider")),
+		Method:    r.Method,
+		Path:      r.URL.Path,
+	}
+	g.totalRequests.Add(1)
+	g.recordFailure(info, http.StatusNotFound, start, "unknown gateway path")
+	writeGatewayJSON(w, http.StatusNotFound, map[string]string{"error": "unknown gateway path"})
 }
 
 func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
-	g.totalRequests.Add(1)
+	start := time.Now()
+	requestID := fmt.Sprintf("gw-%d", g.totalRequests.Add(1))
+	reqInfo := gatewayRequestInfo{
+		RequestID: requestID,
+		AgentID:   strings.TrimSpace(r.Header.Get("X-Aion-Agent-ID")),
+		DomainID:  strings.TrimSpace(r.Header.Get("X-Aion-Domain-ID")),
+		Profile:   strings.TrimSpace(r.Header.Get("X-Aion-Target-Profile")),
+		Provider:  strings.TrimSpace(r.Header.Get("X-Aion-Target-Provider")),
+		Method:    r.Method,
+		Path:      r.URL.Path,
+	}
+	g.recordEvent(GatewayEvent{
+		At:        time.Now().UTC().Format(time.RFC3339Nano),
+		Level:     "debug",
+		RequestID: requestID,
+		AgentID:   reqInfo.AgentID,
+		DomainID:  reqInfo.DomainID,
+		Profile:   reqInfo.Profile,
+		Provider:  reqInfo.Provider,
+		Method:    reqInfo.Method,
+		Path:      reqInfo.Path,
+		Message:   "request received",
+	})
 	if !g.authorized(r) {
 		g.rejected.Add(1)
+		g.recordFailure(reqInfo, http.StatusUnauthorized, start, "gateway unauthorized")
 		writeGatewayJSON(w, http.StatusUnauthorized, map[string]string{"error": "gateway unauthorized"})
 		return
 	}
+	queueStart := time.Now()
 	release, err := g.acquire(r.Context())
+	queueMS := time.Since(queueStart).Milliseconds()
 	if err != nil {
 		g.rejected.Add(1)
 		g.recordError(err)
+		g.recordFailure(reqInfo, http.StatusTooManyRequests, start, err.Error())
 		writeGatewayJSON(w, http.StatusTooManyRequests, map[string]string{"error": err.Error()})
 		return
 	}
 	defer release()
+	reqInfo.QueueMS = queueMS
 
 	profile, err := g.targetProfile(r)
 	if err != nil {
 		g.rejected.Add(1)
 		g.recordError(err)
+		g.recordFailure(reqInfo, http.StatusBadGateway, start, err.Error())
 		writeGatewayJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
+	}
+	reqInfo.Provider = profile.Provider
+	if reqInfo.Profile == "" {
+		reqInfo.Profile = g.config.InferenceGateway.TargetProfile
 	}
 	target, err := targetURLForRequest(profile, r.URL)
 	if err != nil {
 		g.rejected.Add(1)
 		g.recordError(err)
+		g.recordFailure(reqInfo, http.StatusBadGateway, start, err.Error())
 		writeGatewayJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
+	}
+	if targetURL, parseErr := url.Parse(target); parseErr == nil {
+		g.recordEvent(GatewayEvent{
+			At:        time.Now().UTC().Format(time.RFC3339Nano),
+			Level:     "debug",
+			RequestID: requestID,
+			AgentID:   reqInfo.AgentID,
+			DomainID:  reqInfo.DomainID,
+			Profile:   reqInfo.Profile,
+			Provider:  reqInfo.Provider,
+			Method:    reqInfo.Method,
+			Path:      reqInfo.Path,
+			QueueMS:   queueMS,
+			Message:   "forwarding to upstream host " + targetURL.Host,
+		})
 	}
 
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, r.Body)
 	if err != nil {
 		g.recordError(err)
+		g.recordFailure(reqInfo, http.StatusInternalServerError, start, "gateway request creation failed")
 		writeGatewayJSON(w, http.StatusInternalServerError, map[string]string{"error": "gateway request creation failed"})
 		return
 	}
@@ -203,10 +387,12 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	resp, err := g.client.Do(req)
 	if err != nil {
 		g.recordError(err)
+		g.recordFailure(reqInfo, http.StatusBadGateway, start, "upstream inference request failed: "+err.Error())
 		writeGatewayJSON(w, http.StatusBadGateway, map[string]string{"error": "upstream inference request failed"})
 		return
 	}
 	defer resp.Body.Close()
+	g.recordStatus(resp.StatusCode)
 	if resp.StatusCode == http.StatusTooManyRequests {
 		g.upstream429.Add(1)
 	}
@@ -217,12 +403,15 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	buf := make([]byte, 32*1024)
+	var bytesWritten int64
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				g.recordFailure(reqInfo, resp.StatusCode, start, "client write failed: "+writeErr.Error())
 				return
 			}
+			bytesWritten += int64(n)
 			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
 			}
@@ -230,7 +419,10 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if readErr != nil {
 			if readErr != io.EOF {
 				g.recordError(readErr)
+				g.recordFailure(reqInfo, resp.StatusCode, start, "upstream read failed: "+readErr.Error())
+				return
 			}
+			g.recordCompletion(reqInfo, resp.StatusCode, start, bytesWritten)
 			return
 		}
 	}
@@ -301,12 +493,137 @@ func (g *InferenceGateway) recordError(err error) {
 	g.mu.Unlock()
 }
 
+type gatewayRequestInfo struct {
+	RequestID string
+	AgentID   string
+	DomainID  string
+	Profile   string
+	Provider  string
+	Method    string
+	Path      string
+	QueueMS   int64
+}
+
+func (g *InferenceGateway) recordCompletion(info gatewayRequestInfo, status int, start time.Time, bytesWritten int64) {
+	level := "debug"
+	message := "request completed"
+	if status >= 500 {
+		level = "error"
+		message = "upstream server error"
+	} else if status >= 400 {
+		level = "warn"
+		message = "upstream request rejected"
+	}
+	g.recordEvent(GatewayEvent{
+		At:         time.Now().UTC().Format(time.RFC3339Nano),
+		Level:      level,
+		RequestID:  info.RequestID,
+		AgentID:    info.AgentID,
+		DomainID:   info.DomainID,
+		Profile:    info.Profile,
+		Provider:   info.Provider,
+		Method:     info.Method,
+		Path:       info.Path,
+		Status:     status,
+		QueueMS:    info.QueueMS,
+		DurationMS: time.Since(start).Milliseconds(),
+		Bytes:      bytesWritten,
+		Message:    message,
+	})
+}
+
+func (g *InferenceGateway) recordFailure(info gatewayRequestInfo, status int, start time.Time, message string) {
+	g.recordStatus(status)
+	g.recordEvent(GatewayEvent{
+		At:         time.Now().UTC().Format(time.RFC3339Nano),
+		Level:      "error",
+		RequestID:  info.RequestID,
+		AgentID:    info.AgentID,
+		DomainID:   info.DomainID,
+		Profile:    info.Profile,
+		Provider:   info.Provider,
+		Method:     info.Method,
+		Path:       info.Path,
+		Status:     status,
+		QueueMS:    info.QueueMS,
+		DurationMS: time.Since(start).Milliseconds(),
+		Message:    sanitizeGatewayMessage(message),
+	})
+}
+
+func (g *InferenceGateway) recordStatus(status int) {
+	g.mu.Lock()
+	if g.statusCounts == nil {
+		g.statusCounts = make(map[int]int64)
+	}
+	g.statusCounts[status]++
+	g.mu.Unlock()
+}
+
+func (g *InferenceGateway) recordEvent(event GatewayEvent) {
+	if event.At == "" {
+		event.At = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	event.Message = sanitizeGatewayMessage(event.Message)
+	g.mu.Lock()
+	if len(g.recentEvents) >= 50 {
+		g.recentEvents = g.recentEvents[len(g.recentEvents)-49:]
+	}
+	g.recentEvents = append(g.recentEvents, event)
+	logPath := g.logPath
+	logLevel := "info"
+	if g.config != nil {
+		logLevel = strings.ToLower(strings.TrimSpace(g.config.Orchestrator.LogLevel))
+	}
+	g.mu.Unlock()
+
+	if event.Level != "debug" || logLevel == "debug" || logLevel == "trace" {
+		log.Printf("inference-gateway: %s request=%s agent=%s domain=%s profile=%s provider=%s method=%s path=%s status=%d queue_ms=%d duration_ms=%d bytes=%d msg=%s",
+			event.Level,
+			event.RequestID,
+			event.AgentID,
+			event.DomainID,
+			event.Profile,
+			event.Provider,
+			event.Method,
+			event.Path,
+			event.Status,
+			event.QueueMS,
+			event.DurationMS,
+			event.Bytes,
+			event.Message,
+		)
+	}
+	if logPath != "" {
+		_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
+		if data, err := json.Marshal(event); err == nil {
+			_ = appendTextFile(logPath, string(data)+"\n")
+		}
+	}
+}
+
+func sanitizeGatewayMessage(message string) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return ""
+	}
+	replacements := []string{"Authorization", "x-api-key", "api_key", "apikey", "token", "secret", "password"}
+	for _, replacement := range replacements {
+		message = strings.ReplaceAll(message, replacement, "[redacted]")
+		message = strings.ReplaceAll(message, strings.ToUpper(replacement), "[redacted]")
+	}
+	if len(message) > 500 {
+		return message[:500] + "...(truncated)"
+	}
+	return message
+}
+
 func targetURLForRequest(profile ModelProfile, requestURL *url.URL) (string, error) {
 	base := strings.TrimRight(strings.TrimSpace(profile.Endpoint), "/")
 	if base == "" {
 		return "", fmt.Errorf("gateway target endpoint is empty")
 	}
-	path := requestURL.Path
+	path := canonicalGatewayProxyPath(requestURL.Path)
 	if strings.HasSuffix(base, "/v1") && strings.HasPrefix(path, "/v1/") {
 		path = strings.TrimPrefix(path, "/v1")
 	}
@@ -315,6 +632,17 @@ func targetURLForRequest(profile ModelProfile, requestURL *url.URL) (string, err
 		target += "?" + requestURL.RawQuery
 	}
 	return target, nil
+}
+
+func canonicalGatewayProxyPath(path string) string {
+	switch path {
+	case "/chat/completions":
+		return "/v1/chat/completions"
+	case "/messages":
+		return "/v1/messages"
+	default:
+		return path
+	}
 }
 
 func copyGatewayHeaders(dst, src http.Header) {

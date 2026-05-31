@@ -113,7 +113,7 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 
 	var inferenceGateway *InferenceGateway
 	if config.GatewayEnabled() {
-		inferenceGateway = NewInferenceGateway(config)
+		inferenceGateway = NewInferenceGateway(config, runState.LogsDir)
 	}
 
 	// Initialize Server
@@ -644,18 +644,22 @@ func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunSta
 		if profileName == "" {
 			profileName = config.InferenceGateway.TargetProfile
 		}
+		targetProvider := provider
+		targetModel := model
 		gatewayURL := config.InferenceGateway.PublicBaseURL
 		if gatewayURL == "" {
 			gatewayURL = "http://" + config.InferenceGateway.ListenAddr
 		}
 		endpoint = gatewayURL
+		provider = "aion-gateway"
 		envVars = append(envVars,
 			"AION_INFERENCE_GATEWAY_ENABLED=true",
 			fmt.Sprintf("AION_INFERENCE_GATEWAY_URL=%s", gatewayURL),
 			fmt.Sprintf("AION_INFERENCE_GATEWAY_KEY=%s", config.InferenceGateway.GatewayKey),
-			fmt.Sprintf("AION_TARGET_PROVIDER=%s", provider),
+			fmt.Sprintf("AION_TARGET_PROVIDER=%s", targetProvider),
 			fmt.Sprintf("AION_TARGET_PROFILE=%s", profileName),
-			fmt.Sprintf("AION_TARGET_API=%s", gatewayAPIForProvider(provider)),
+			fmt.Sprintf("AION_TARGET_MODEL=%s", targetModel),
+			fmt.Sprintf("AION_TARGET_API=%s", gatewayAPIForProvider(targetProvider)),
 		)
 	}
 

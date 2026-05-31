@@ -264,6 +264,15 @@ func SpawnPiAgent(config PiAgentConfig) (*PiAgentProcess, error) {
 	cmd.Env = append(os.Environ(), config.Env...)
 	if logFile != nil {
 		cmd.Stderr = logFile
+		_, _ = fmt.Fprintf(logFile, "[aion] pi launch gateway_enabled=%t gateway_url=%s target_provider=%s target_profile=%s target_model=%s pi_provider=%s extensions=%s\n",
+			envEnabled(config.Env, "AION_INFERENCE_GATEWAY_ENABLED"),
+			redactedEnvValue(config.Env, "AION_INFERENCE_GATEWAY_URL"),
+			redactedEnvValue(config.Env, "AION_TARGET_PROVIDER"),
+			redactedEnvValue(config.Env, "AION_TARGET_PROFILE"),
+			redactedEnvValue(config.Env, "AION_TARGET_MODEL"),
+			config.Provider,
+			strings.Join(resolvedExtensions(config.WorkingDir, config.ExtensionPaths), ","),
+		)
 	} else {
 		cmd.Stderr = os.Stderr
 	}
@@ -315,6 +324,38 @@ func SpawnPiAgent(config PiAgentConfig) (*PiAgentProcess, error) {
 	go p.waitForExit()
 
 	return p, nil
+}
+
+func envEnabled(env []string, key string) bool {
+	return strings.EqualFold(redactedEnvValue(env, key), "true") || redactedEnvValue(env, key) == "1"
+}
+
+func redactedEnvValue(env []string, key string) string {
+	prefix := key + "="
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			value := strings.TrimSpace(strings.TrimPrefix(entry, prefix))
+			if value == "" {
+				return ""
+			}
+			if strings.Contains(strings.ToLower(key), "key") || strings.Contains(strings.ToLower(key), "token") || strings.Contains(strings.ToLower(key), "secret") {
+				return "[redacted]"
+			}
+			return value
+		}
+	}
+	return ""
+}
+
+func resolvedExtensions(workingDir string, extensions []string) []string {
+	resolved := make([]string, 0, len(extensions))
+	for _, extension := range extensions {
+		if strings.TrimSpace(extension) == "" {
+			continue
+		}
+		resolved = append(resolved, resolvePiPath(workingDir, extension))
+	}
+	return resolved
 }
 
 func resolvePiPath(workingDir, path string) string {

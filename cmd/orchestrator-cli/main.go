@@ -63,6 +63,11 @@ func main() {
 		fmt.Println(string(output))
 		return
 	}
+	debugPretty := command == "debug-status" && (hasFlag(os.Args[2:], "--pretty") || hasFlag(os.Args[2:], "-p"))
+	debugKey := ""
+	if command == "debug-status" {
+		debugKey = parseFlags(os.Args[2:])["key"]
+	}
 
 	paramsJSON, _ := json.Marshal(params)
 
@@ -87,7 +92,14 @@ func main() {
 		exitError(resp.Error)
 	}
 
-	// Output result as JSON
+	if command == "debug-status" && (debugPretty || debugKey != "") {
+		if err := printDebugStatus(resp.Result, debugPretty, debugKey); err != nil {
+			exitError(err.Error())
+		}
+		return
+	}
+
+	// Output result as JSON.
 	output, _ := json.MarshalIndent(json.RawMessage(resp.Result), "", "  ")
 	fmt.Println(string(output))
 }
@@ -326,6 +338,115 @@ func parseCommand(command string, args []string) (map[string]interface{}, error)
 	}
 }
 
+func printDebugStatus(raw json.RawMessage, pretty bool, key string) error {
+	var result map[string]interface{}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return fmt.Errorf("decode debug status: %w", err)
+	}
+	if key != "" {
+		value, ok := result[key]
+		if !ok {
+			return fmt.Errorf("debug-status key %q not found", key)
+		}
+		if pretty {
+			fmt.Printf("%s: %s\n", key, formatDebugValue(value, "  "))
+			return nil
+		}
+		output, _ := json.MarshalIndent(value, "", "  ")
+		fmt.Println(string(output))
+		return nil
+	}
+	if !pretty {
+		output, _ := json.MarshalIndent(result, "", "  ")
+		fmt.Println(string(output))
+		return nil
+	}
+
+	order := []string{
+		"addr",
+		"log_level",
+		"logs_dir",
+		"rpc_debug_log",
+		"build_spec_status",
+		"dag_nodes",
+		"dag_edges",
+		"hub_history_count",
+		"hub_snapshot_count",
+		"hub_subscribers",
+		"heartbeat_count",
+		"last_hub_event_at",
+		"inference_gateway",
+		"agents",
+	}
+	printed := map[string]bool{}
+	for _, name := range order {
+		value, ok := result[name]
+		if !ok {
+			continue
+		}
+		printed[name] = true
+		fmt.Printf("%s: %s\n", name, formatDebugValue(value, "  "))
+	}
+	for name, value := range result {
+		if printed[name] {
+			continue
+		}
+		fmt.Printf("%s: %s\n", name, formatDebugValue(value, "  "))
+	}
+	return nil
+}
+
+func formatDebugValue(value interface{}, indent string) string {
+	switch v := value.(type) {
+	case nil:
+		return "null"
+	case string:
+		if v == "" {
+			return `""`
+		}
+		if formatted, ok := formatJSONString(v, indent); ok {
+			return formatted
+		}
+		return v
+	case bool:
+		if v {
+			return "true"
+		}
+		return "false"
+	case float64:
+		if v == float64(int64(v)) {
+			return fmt.Sprintf("%d", int64(v))
+		}
+		return fmt.Sprintf("%v", v)
+	default:
+		output, err := json.MarshalIndent(value, indent, "  ")
+		if err != nil {
+			return fmt.Sprintf("%v", value)
+		}
+		text := string(output)
+		if strings.Contains(text, "\n") {
+			return "\n" + text
+		}
+		return text
+	}
+}
+
+func formatJSONString(value, indent string) (string, bool) {
+	trimmed := strings.TrimSpace(value)
+	if !strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[") {
+		return "", false
+	}
+	var decoded interface{}
+	if err := json.Unmarshal([]byte(trimmed), &decoded); err != nil {
+		return "", false
+	}
+	output, err := json.MarshalIndent(decoded, indent, "  ")
+	if err != nil {
+		return "", false
+	}
+	return "\n" + string(output), true
+}
+
 func hasFlag(args []string, names ...string) bool {
 	for _, arg := range args {
 		for _, name := range names {
@@ -373,7 +494,7 @@ Commands:
   read-dag        [--node-id <uuid>]
   heartbeat       --agent-id <uuid>
   query-memory    --text <query> [--top-k N]
-  debug-status    Print server/run/hub/DAG/agent diagnostics
+  debug-status    Print server/run/hub/DAG/agent diagnostics [--pretty|-p] [--key <field>]
   build-progress  Print current build-spec progress projection
   dashboard       Launch real-time monitoring TUI [--verbose]
 
