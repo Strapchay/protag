@@ -19,6 +19,7 @@ import (
 
 const gatewayAuthHeader = "X-Aion-Gateway-Key"
 const gatewayExtensionLoadedPath = "/aion/gateway/extension-loaded"
+const defaultGatewayActivityPulseInterval = 10 * time.Second
 
 // InferenceGatewayStatus is exposed through debug-status for operational
 // observability without leaking upstream provider credentials.
@@ -71,6 +72,9 @@ type InferenceGateway struct {
 	logPath      string
 	statusCounts map[int]int64
 	recentEvents []GatewayEvent
+	activityFn   func(agentID, domainID, phase string)
+
+	activityPulseInterval time.Duration
 }
 
 func NewInferenceGateway(config *Config, logsDir ...string) *InferenceGateway {
@@ -83,10 +87,11 @@ func NewInferenceGateway(config *Config, logsDir ...string) *InferenceGateway {
 		logPath = filepath.Join(logsDir[0], "inference_gateway_debug.log")
 	}
 	g := &InferenceGateway{
-		config:       config,
-		limiter:      newGatewayLimiter(capacity),
-		logPath:      logPath,
-		statusCounts: make(map[int]int64),
+		config:                config,
+		limiter:               newGatewayLimiter(capacity),
+		logPath:               logPath,
+		statusCounts:          make(map[int]int64),
+		activityPulseInterval: defaultGatewayActivityPulseInterval,
 		client: &http.Client{
 			Timeout: 0,
 		},
@@ -103,6 +108,15 @@ func NewInferenceGateway(config *Config, logsDir ...string) *InferenceGateway {
 	mux.HandleFunc("/", g.handleUnknown)
 	g.server = &http.Server{Handler: mux}
 	return g
+}
+
+func (g *InferenceGateway) SetActivityFunc(fn func(agentID, domainID, phase string)) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	g.activityFn = fn
+	g.mu.Unlock()
 }
 
 func (g *InferenceGateway) Start() error {
@@ -322,6 +336,8 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		writeGatewayJSON(w, http.StatusUnauthorized, map[string]string{"error": "gateway unauthorized"})
 		return
 	}
+	stopPulse := g.startActivityPulse(r.Context(), reqInfo)
+	defer stopPulse()
 	queueStart := time.Now()
 	release, err := g.acquire(r.Context())
 	queueMS := time.Since(queueStart).Milliseconds()
@@ -334,6 +350,7 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	reqInfo.QueueMS = queueMS
+	g.emitActivity(reqInfo, "admitted")
 
 	profile, err := g.targetProfile(r)
 	if err != nil {
@@ -356,6 +373,7 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if targetURL, parseErr := url.Parse(target); parseErr == nil {
+		g.emitActivity(reqInfo, "forwarding")
 		g.recordEvent(GatewayEvent{
 			At:        time.Now().UTC().Format(time.RFC3339Nano),
 			Level:     "debug",
@@ -422,9 +440,48 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 				g.recordFailure(reqInfo, resp.StatusCode, start, "upstream read failed: "+readErr.Error())
 				return
 			}
+			g.emitActivity(reqInfo, "completed")
 			g.recordCompletion(reqInfo, resp.StatusCode, start, bytesWritten)
 			return
 		}
+	}
+}
+
+func (g *InferenceGateway) startActivityPulse(ctx context.Context, info gatewayRequestInfo) func() {
+	if strings.TrimSpace(info.AgentID) == "" {
+		return func() {}
+	}
+	done := make(chan struct{})
+	interval := g.activityPulseInterval
+	if interval <= 0 {
+		interval = defaultGatewayActivityPulseInterval
+	}
+	g.emitActivity(info, "active")
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-ticker.C:
+				g.emitActivity(info, "active")
+			}
+		}
+	}()
+	return func() {
+		close(done)
+	}
+}
+
+func (g *InferenceGateway) emitActivity(info gatewayRequestInfo, phase string) {
+	g.mu.Lock()
+	fn := g.activityFn
+	g.mu.Unlock()
+	if fn != nil {
+		fn(info.AgentID, info.DomainID, phase)
 	}
 }
 

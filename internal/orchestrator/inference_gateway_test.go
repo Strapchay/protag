@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInferenceGatewayProxiesOpenAICompatibleRequest(t *testing.T) {
@@ -123,6 +124,73 @@ func TestInferenceGatewayProxiesPiOpenAIPathAlias(t *testing.T) {
 	}
 	if status := gateway.Status(); status.StatusCounts[http.StatusOK] != 1 {
 		t.Fatalf("expected 200 status count, got %#v", status.StatusCounts)
+	}
+}
+
+func TestInferenceGatewayEmitsActivityPulseDuringLongRequest(t *testing.T) {
+	gateway := NewInferenceGateway(&Config{
+		Orchestrator: OrchestratorConfig{LogLevel: "debug"},
+		Execution: ExecutionConfig{
+			Mode:                   "gateway",
+			MaxConcurrentRequests:  1,
+			RequestQueueTimeoutSec: 1,
+		},
+		InferenceGateway: InferenceGatewayConfig{
+			Enabled:       true,
+			GatewayKey:    "local-key",
+			TargetProfile: "forge",
+		},
+		Inference: InferenceConfig{
+			Models: map[string]ModelProfile{
+				"forge": {
+					Provider: "redacted-openai-compatible",
+					Model:    "redacted-model",
+					Endpoint: "http://upstream.local",
+					Env:      map[string]string{"API_KEY": "redacted-token"},
+				},
+			},
+		},
+	})
+	gateway.activityPulseInterval = 5 * time.Millisecond
+	activity := make(chan string, 16)
+	gateway.SetActivityFunc(func(agentID, domainID, phase string) {
+		if agentID == "agent-sql" && domainID == "sql" {
+			activity <- phase
+		}
+	})
+	gateway.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		seenInitialActive := false
+		deadline := time.After(200 * time.Millisecond)
+		for {
+			select {
+			case phase := <-activity:
+				if phase == "active" {
+					if seenInitialActive {
+						return &http.Response{
+							StatusCode: http.StatusOK,
+							Header:     http.Header{"Content-Type": []string{"application/json"}},
+							Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"ok"}}]}`)),
+						}, nil
+					}
+					seenInitialActive = true
+				}
+			case <-deadline:
+				t.Fatalf("timed out waiting for gateway activity pulse")
+			}
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/chat/completions", strings.NewReader(`{"stream":true}`))
+	req.Header.Set(gatewayAuthHeader, "local-key")
+	req.Header.Set("X-Aion-Target-Profile", "forge")
+	req.Header.Set("X-Aion-Agent-ID", "agent-sql")
+	req.Header.Set("X-Aion-Domain-ID", "sql")
+	rec := httptest.NewRecorder()
+
+	gateway.handleProxy(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 

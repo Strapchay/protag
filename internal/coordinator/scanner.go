@@ -80,14 +80,6 @@ var extLanguageMap = map[string]string{
 	".fbs":   "FlatBuffers",
 }
 
-// skip directories
-var skipDirs = map[string]bool{
-	".git": true, ".aion": true, ".idea": true, ".vscode": true,
-	"node_modules": true, "vendor": true, "__pycache__": true,
-	".mypy_cache": true, "target": true, "dist": true, "build": true,
-	".next": true, ".nuxt": true, "coverage": true,
-}
-
 // ScanProject scans a project directory and returns a structured analysis.
 func ScanProject(rootPath string) (*ProjectScan, error) {
 	absRoot, err := filepath.Abs(rootPath)
@@ -106,6 +98,7 @@ func ScanProject(rootPath string) (*ProjectScan, error) {
 	scan := &ProjectScan{
 		RootPath: absRoot,
 	}
+	excludePaths := LoadAgentExcludePaths(absRoot)
 
 	languageSet := make(map[string]bool)
 	moduleSet := make(map[string]bool)
@@ -124,8 +117,7 @@ func ScanProject(rootPath string) (*ProjectScan, error) {
 
 		// Skip hidden/build directories
 		if info.IsDir() {
-			base := filepath.Base(path)
-			if skipDirs[base] || strings.HasPrefix(base, ".") {
+			if IsAgentExcludedPath(relPath, excludePaths) {
 				return filepath.SkipDir
 			}
 			moduleSet[relPath] = true

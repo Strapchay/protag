@@ -555,6 +555,7 @@ Build-spec attempt: %s
 
 The server was restarted or the agent set was explicitly continued. Keep your existing context and continue pending DAG work for your assigned domain.
 Do not re-run the original onboarding/system prompt. Use orchestrator-cli to read the DAG, acquire locks, update task status, create stubs, and coordinate through the context hub.
+Do not read, search, or modify excluded runtime/generated paths such as .aion/, .git/, .agents/, .codex/, dependency caches, build outputs, or paths listed in .aionignore.
 If you are unsure what is pending, inspect the DAG first and continue only work assigned to you.`, attemptID))
 }
 

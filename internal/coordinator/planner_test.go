@@ -45,6 +45,27 @@ func TestValidatePlanResponseRejectsInvalid(t *testing.T) {
 	}
 }
 
+func TestValidatePlanResponseRejectsExcludedPaths(t *testing.T) {
+	plan := &PlanResponse{
+		Domains: []Domain{{
+			DomainID:      "runtime",
+			Description:   "runtime internals",
+			AssignedPaths: []string{".aion/runs"},
+			AgentType:     "domain",
+		}},
+		Nodes: []TaskNode{{
+			ID:          "runtime-task",
+			DomainID:    "runtime",
+			TaskSpec:    "inspect runtime state",
+			TargetFiles: []string{".aion/runs/current/dag.bin"},
+			Priority:    1,
+		}},
+	}
+	if err := ValidatePlanResponse(plan); err == nil {
+		t.Fatal("expected excluded path validation error")
+	}
+}
+
 func TestParsePlanResponseText(t *testing.T) {
 	raw := "```json\n{\"type\":\"plan_response\",\"domains\":[{\"domain_id\":\"api\",\"description\":\"API\",\"assigned_paths\":[\"cmd/\"],\"agent_type\":\"domain\"}],\"nodes\":[{\"id\":\"api-task\",\"domain_id\":\"api\",\"task_spec\":\"build api\",\"target_files\":[\"cmd/server/main.go\"],\"priority\":1}],\"edges\":[]}\n```"
 

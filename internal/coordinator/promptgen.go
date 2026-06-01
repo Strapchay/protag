@@ -48,6 +48,13 @@ func buildDomainPrompt(domain Domain, projectContext, buildSpec string) string {
 	}
 	b.WriteString("\n")
 
+	b.WriteString("## Excluded Paths\n")
+	b.WriteString("Do not inspect, read, search, summarize, modify, or reason from these runtime/generated paths unless the orchestrator explicitly instructs you to debug Aion runtime state:\n")
+	for _, p := range DefaultAgentExcludePaths() {
+		b.WriteString(fmt.Sprintf("- `%s`\n", p))
+	}
+	b.WriteString("Project-specific exclusions may also be listed in `.aionignore`; obey them as part of your domain boundary.\n\n")
+
 	b.WriteString("## Protocol\n")
 	b.WriteString("You are participating in a multi-agent orchestrated process.\n")
 	b.WriteString("The orchestrator owns task allocation and coordination. Your job is to execute the domain scope, not to broaden it.\n")
@@ -95,6 +102,7 @@ func GenerateArchitectInstruction(projectContext string) string {
 	b.WriteString("- DO NOT start building or modifying files yourself.\n")
 	b.WriteString("- When the spec is finalized, write it to `docs/build_spec.md` using your file-writing skills.\n")
 	b.WriteString("- If the `docs/` directory does not exist in the working directory, create it before writing `docs/build_spec.md`.\n")
+	b.WriteString("- Do not inspect, summarize, or modify `.aion/`, `.git/`, `.agents/`, `.codex/`, dependency caches, build outputs, or paths listed in `.aionignore`; these are runtime/generated areas, not project source.\n")
 	b.WriteString("- Do not ask the user to create this file manually; creating the directory and file is part of your spec finalization responsibility.\n")
 	b.WriteString("- Once the file is written, tell the user they can initiate the engineering swarm by issuing the command: `/build-spec`.\n\n")
 
@@ -118,6 +126,7 @@ func GenerateCoordinatorInstruction(projectContext string) string {
 	b.WriteString("- Do not assume a fixed number of agents or tasks.\n")
 	b.WriteString("- Prefer explicit dependencies only when the work truly requires ordering.\n")
 	b.WriteString("- Output only JSON content that matches the plan_response schema.\n")
+	b.WriteString("- Do not assign runtime/generated paths such as `.aion/`, `.git/`, `.agents/`, `.codex/`, dependency caches, build outputs, or `.aionignore` entries to any domain or node.\n")
 	b.WriteString("- Keep the response structured and machine-readable.\n\n")
 
 	if projectContext != "" {
@@ -145,6 +154,7 @@ func GenerateCoordinatorPlanningInstruction(specText string, scan *ProjectScan, 
 	b.WriteString("{\"type\":\"plan_response\",\"domains\":[{\"domain_id\":\"short-stable-domain-id\",\"description\":\"owned implementation area\",\"assigned_paths\":[\"relative/path\"],\"agent_type\":\"domain\"}],\"nodes\":[{\"id\":\"short-stable-task-id\",\"domain_id\":\"short-stable-domain-id\",\"task_spec\":\"specific implementation task\",\"target_files\":[\"relative/path/file.ext\"],\"priority\":1}],\"edges\":[]}\n\n")
 	b.WriteString("The artifact must contain real, non-empty `domains` and `nodes` arrays. Do not copy placeholder IDs or empty arrays.\n")
 	b.WriteString("Create as many domains and task nodes as the spec requires; do not assume a fixed node count.\n")
+	b.WriteString("Never assign excluded runtime/generated paths such as `.aion/`, `.git/`, `.agents/`, `.codex/`, dependency caches, build outputs, or paths listed in `.aionignore` as domains or target files.\n")
 	b.WriteString("After writing the file, you may briefly state that the artifact was written.\n\n")
 
 	if scan != nil {

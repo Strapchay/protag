@@ -2,6 +2,8 @@
 
 A 3-Tier Multi-Agent Orchestration OS for concurrent AI agent operations on a shared codebase.
 
+![Aion Kernel dashboard preview](assets/dashboard-preview.svg)
+
 ## Architecture
 
 - **Tier 1 — Orchestrator** (Go Daemon): Central kernel managing state, locking, IPC, and process supervision. Contains zero AI logic.

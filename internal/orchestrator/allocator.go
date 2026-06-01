@@ -82,6 +82,21 @@ func (a *Allocator) emitStatus(text, level string) {
 	}
 }
 
+func (a *Allocator) RecordAgentActivity(agentID string) bool {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return false
+	}
+	a.mu.Lock()
+	agent := a.activeAgents[agentID]
+	a.mu.Unlock()
+	if agent == nil {
+		return false
+	}
+	agent.RecordActivity()
+	return true
+}
+
 // Allocate writes the context files and spins up the agents for the planned domains.
 func (a *Allocator) Allocate(ctx context.Context, domains []coordinator.Domain, prompts map[string]string) error {
 	return a.AllocateWithOptions(ctx, domains, prompts, AllocationOptions{Mode: AllocationModeInitial})
@@ -471,6 +486,7 @@ func (a *Allocator) dispatchReadyTasks() {
 		}
 		b.WriteString("\nExecute this task, then mark it Done using:\n")
 		b.WriteString("the update flow defined in your loaded skills.\n")
+		b.WriteString("\nDo not read, search, or modify excluded runtime/generated paths such as `.aion/`, `.git/`, `.agents/`, `.codex/`, dependency caches, build outputs, or paths listed in `.aionignore`.\n")
 
 		msg := hub.Message{
 			ID:        fmt.Sprintf("dispatch-%s-%d", node.ID, time.Now().Unix()),

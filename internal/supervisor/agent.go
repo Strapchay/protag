@@ -379,6 +379,17 @@ func (s *AgentSupervisor) State() AgentState {
 	return s.state
 }
 
+// RecordActivity marks the supervised agent as live based on external runtime
+// activity such as an in-flight gateway request.
+func (s *AgentSupervisor) RecordActivity() {
+	s.mu.Lock()
+	hm := s.healthMonitor
+	s.mu.Unlock()
+	if hm != nil {
+		hm.RecordHeartbeat()
+	}
+}
+
 // AgentID returns the agent's unique identifier.
 func (s *AgentSupervisor) AgentID() string {
 	return s.config.AgentID

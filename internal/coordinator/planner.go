@@ -169,6 +169,9 @@ func ValidatePlanResponse(plan *PlanResponse) error {
 		}
 		domainIDs[id] = struct{}{}
 		for _, path := range domain.AssignedPaths {
+			if IsAgentExcludedPath(path, DefaultAgentExcludePaths()) {
+				return fmt.Errorf("coordinator: domain %q assigned excluded path %q", id, path)
+			}
 			if strings.TrimSpace(path) == "." {
 				fallbackPathCount++
 			}
@@ -192,6 +195,11 @@ func ValidatePlanResponse(plan *PlanResponse) error {
 		}
 		if _, ok := domainIDs[strings.TrimSpace(node.DomainID)]; !ok {
 			return fmt.Errorf("coordinator: node %q references unknown domain %q", id, node.DomainID)
+		}
+		for _, path := range node.TargetFiles {
+			if IsAgentExcludedPath(path, DefaultAgentExcludePaths()) {
+				return fmt.Errorf("coordinator: node %q targets excluded path %q", id, path)
+			}
 		}
 		nodeIDs[id] = struct{}{}
 	}

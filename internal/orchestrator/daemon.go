@@ -64,6 +64,9 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 		return nil, fmt.Errorf("daemon: load run state: %w", err)
 	}
 	config.Agents.SessionDir = runState.PiSessionsDir
+	if err := coordinator.EnsureAgentIgnoreFile(projectRoot); err != nil {
+		return nil, fmt.Errorf("daemon: ensure agent ignore file: %w", err)
+	}
 
 	// Initialize DAG Manager
 	dagMgr, err := dag.NewManager(dag.ManagerConfig{
@@ -114,6 +117,11 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	var inferenceGateway *InferenceGateway
 	if config.GatewayEnabled() {
 		inferenceGateway = NewInferenceGateway(config, runState.LogsDir)
+		inferenceGateway.SetActivityFunc(func(agentID, domainID, phase string) {
+			if alloc.RecordAgentActivity(agentID) && config.Orchestrator.LogLevel == "debug" {
+				log.Printf("inference-gateway: liveness pulse agent=%s domain=%s phase=%s", agentID, domainID, phase)
+			}
+		})
 	}
 
 	// Initialize Server
