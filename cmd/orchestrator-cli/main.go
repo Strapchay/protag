@@ -14,9 +14,10 @@ import (
 
 // Request matches the server's expected format.
 type Request struct {
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params"`
-	ID     string          `json:"id"`
+	Method     string          `json:"method"`
+	Params     json.RawMessage `json:"params"`
+	ID         string          `json:"id"`
+	Capability string          `json:"capability,omitempty"`
 }
 
 // Response matches the server's response format.
@@ -72,9 +73,10 @@ func main() {
 	paramsJSON, _ := json.Marshal(params)
 
 	req := Request{
-		Method: command,
-		Params: paramsJSON,
-		ID:     "cli-1",
+		Method:     command,
+		Params:     paramsJSON,
+		ID:         "cli-1",
+		Capability: strings.TrimSpace(os.Getenv("AION_AGENT_CAPABILITY")),
 	}
 
 	// Connect to orchestrator
@@ -217,8 +219,15 @@ func parseCommand(command string, args []string) (map[string]interface{}, error)
 		if nodeID == "" || status == "" {
 			return nil, fmt.Errorf("update-node requires --node-id <uuid> --status <status>")
 		}
+		agentID := flags["agent-id"]
+		if agentID == "" {
+			agentID = os.Getenv("AION_AGENT_ID")
+		}
+		if agentID == "" {
+			return nil, fmt.Errorf("update-node requires --agent-id <uuid> or AION_AGENT_ID env")
+		}
 
-		res := map[string]interface{}{"node_id": nodeID, "status": status}
+		res := map[string]interface{}{"node_id": nodeID, "status": status, "agent_id": agentID}
 
 		if val, ok := flags["started-at"]; ok {
 			var m int64
@@ -495,7 +504,7 @@ func printUsage() {
 Commands:
   acquire-lock    --file <path> --agent-id <uuid>
   release-lock    --file <path> --agent-id <uuid>
-  update-node     --node-id <uuid> --status <Pending|InProgress|Done|Failed>
+	  update-node     --node-id <uuid> --status <Pending|InProgress|Done|Failed> [--agent-id <uuid>]
   create-stub     --contract '<json>'
   inject-edge     --from <node> --to <node>
   split-node      --node-id <uuid> --into '<json>'
@@ -509,7 +518,8 @@ Commands:
   dashboard       Launch real-time monitoring TUI [--verbose]
 
 Environment:
-  AION_ORCHESTRATOR_ADDR   Orchestrator address
-  AION_ORCHESTRATOR_CORE_ADDR  Core orchestrator address codename
-  AION_AGENT_ID            Default agent ID for commands requiring --agent-id`)
+	  AION_ORCHESTRATOR_ADDR   Orchestrator address
+	  AION_ORCHESTRATOR_CORE_ADDR  Core orchestrator address codename
+	  AION_AGENT_ID            Default agent ID for commands requiring --agent-id
+	  AION_AGENT_CAPABILITY    Runtime-issued credential used automatically for authorized agent mutations`)
 }

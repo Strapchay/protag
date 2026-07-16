@@ -85,6 +85,43 @@ func TestManagerUpdateNodeNotFound(t *testing.T) {
 	}
 }
 
+func TestManagerUpdateNodeForAgentEnforcesAssignment(t *testing.T) {
+	mgr, err := NewManager(tempManagerConfig(t))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer mgr.Close()
+
+	if err := mgr.AddNode(DagNode{ID: "owned-node", DomainID: "auth", TaskSpec: "Task 1"}); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	if err := mgr.AssignNode("owned-node", "agent-auth"); err != nil {
+		t.Fatalf("AssignNode: %v", err)
+	}
+
+	if err := mgr.UpdateNodeForAgent("owned-node", "agent-data", StatusDone, nil); err == nil {
+		t.Fatal("expected assignment mismatch error")
+	}
+	got, err := mgr.GetNode("owned-node")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if got.Status != StatusPending || got.TaskSpec == "" {
+		t.Fatalf("rejected update mutated node: %#v", got)
+	}
+
+	if err := mgr.UpdateNodeForAgent("owned-node", "agent-auth", StatusDone, nil); err != nil {
+		t.Fatalf("owner update: %v", err)
+	}
+	got, err = mgr.GetNode("owned-node")
+	if err != nil {
+		t.Fatalf("GetNode after update: %v", err)
+	}
+	if got.Status != StatusDone {
+		t.Fatalf("expected StatusDone, got %s", got.Status)
+	}
+}
+
 func TestManagerAddEdge(t *testing.T) {
 	mgr, err := NewManager(tempManagerConfig(t))
 	if err != nil {

@@ -400,6 +400,7 @@ func (d *Daemon) configureAllocatorCallbacks() {
 	d.allocator.SetBroadcastFunc(func(msg hub.Message) {
 		d.server.BroadcastHubEvent(msg)
 	})
+	d.allocator.SetAgentCapabilityFunc(d.server.IssueAgentCapability)
 	if d.auditor != nil {
 		d.auditor.SetSuppressStaleNodeFunc(func(node dag.DagNode) bool {
 			return d.shouldSuppressStaleNodeAudit(node)
@@ -864,7 +865,9 @@ func (d *Daemon) ResetCurrentRun() error {
 	d.auditor.hubRouter = hubRouter
 	d.server.SetRuntimeSubsystems(dagMgr, lockMgr, stubReg, d.memoryStore)
 	d.server.SetLogsDir(newRun.LogsDir)
+	d.server.ClearAgentCapabilities()
 	d.server.ClearHubHistory()
+	d.configureAllocatorCallbacks()
 
 	if oldDAG != nil {
 		if err := oldDAG.Close(); err != nil {

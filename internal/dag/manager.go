@@ -3,6 +3,7 @@ package dag
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -270,6 +271,15 @@ func (m *Manager) UpdateNode(nodeID string, status NodeStatus) error {
 
 // UpdateNodeWithMetrics updates a node's status and records execution metrics.
 func (m *Manager) UpdateNodeWithMetrics(nodeID string, status NodeStatus, metrics *NodeMetrics) error {
+	return m.updateNodeWithMetrics(nodeID, "", status, metrics, false)
+}
+
+// UpdateNodeForAgent updates a node only when it is assigned to agentID.
+func (m *Manager) UpdateNodeForAgent(nodeID, agentID string, status NodeStatus, metrics *NodeMetrics) error {
+	return m.updateNodeWithMetrics(nodeID, agentID, status, metrics, true)
+}
+
+func (m *Manager) updateNodeWithMetrics(nodeID, agentID string, status NodeStatus, metrics *NodeMetrics, enforceOwner bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -283,6 +293,19 @@ func (m *Manager) UpdateNodeWithMetrics(nodeID string, status NodeStatus, metric
 	}
 	if idx == -1 {
 		return fmt.Errorf("manager: node '%s' not found", nodeID)
+	}
+	if enforceOwner {
+		agentID = strings.TrimSpace(agentID)
+		assignedAgent := strings.TrimSpace(m.dag.Nodes[idx].AssignedAgent)
+		if agentID == "" {
+			return fmt.Errorf("manager: update node '%s' requires an agent ID", nodeID)
+		}
+		if assignedAgent == "" {
+			return fmt.Errorf("manager: node '%s' has no assigned agent", nodeID)
+		}
+		if assignedAgent != agentID {
+			return fmt.Errorf("manager: agent '%s' cannot update node '%s'; assigned to '%s'", agentID, nodeID, assignedAgent)
+		}
 	}
 
 	now := time.Now().UnixMilli()

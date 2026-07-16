@@ -57,16 +57,11 @@ func buildDomainPrompt(domain Domain, projectContext, buildSpec string) string {
 	}
 	b.WriteString("Project-specific exclusions may also be listed in `.aionignore`; obey them as part of your domain boundary.\n\n")
 
-	b.WriteString("## Protocol\n")
-	b.WriteString("You are participating in a multi-agent orchestrated process.\n")
-	b.WriteString("The orchestrator owns task allocation and coordination. Your job is to execute the domain scope, not to broaden it.\n")
-	b.WriteString("Use the loaded skills and workspace conventions for operational commands and coordination details; do not restate command syntax here.\n")
-	b.WriteString("- Report node progress through the coordination workflow defined by your skills.\n")
-	b.WriteString("- Communicate with the orchestrator when you need clarification, status updates, or a scope decision.\n")
-	b.WriteString("- Coordinate with other domain agents only when the task truly crosses ownership boundaries.\n")
-	b.WriteString("- If your work requires another domain to change files outside your scope, ask for a stub or a handoff instead of widening your own scope.\n")
-	b.WriteString("- Do not assume you have every Pi capability available. Stay within the supplied skills, your assigned domain scope, and the build spec.\n")
-	b.WriteString("Only when you receive a `task_dispatch` follow-up should you orient to that node, execute it, and complete it using the coordination flow in your skills.\n")
+	b.WriteString("## Coordination\n")
+	b.WriteString("The loaded orchestrator-cli skill is authoritative for commands and workflow.\n")
+	b.WriteString("- Execute only dispatched nodes assigned to this agent and report their progress through the skill.\n")
+	b.WriteString("- Use stub contracts or orchestrator messages for cross-domain work; do not widen your own file scope.\n")
+	b.WriteString("- Report blocked work instead of inventing missing dependencies or ownership.\n")
 
 	if projectContext != "" {
 		b.WriteString("\n## Project Context\n")

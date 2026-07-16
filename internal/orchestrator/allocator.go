@@ -31,6 +31,7 @@ type Allocator struct {
 	agentStateFn  func(agentID, domainID, state, reason string)
 	lifecycleFn   func(agentID, domainID string, event supervisor.AgentLifecycleEvent)
 	broadcastFn   func(hub.Message)
+	capabilityFn  func(agentID string) (string, error)
 }
 
 type AllocationMode string
@@ -75,6 +76,10 @@ func (a *Allocator) SetLifecycleFunc(fn func(agentID, domainID string, event sup
 
 func (a *Allocator) SetBroadcastFunc(fn func(hub.Message)) {
 	a.broadcastFn = fn
+}
+
+func (a *Allocator) SetAgentCapabilityFunc(fn func(agentID string) (string, error)) {
+	a.capabilityFn = fn
 }
 
 func (a *Allocator) emitStatus(text, level string) {
@@ -150,6 +155,13 @@ func (a *Allocator) AllocateWithOptions(ctx context.Context, domains []coordinat
 			fmt.Sprintf("AION_AGENT_ID=%s", agentID),
 			fmt.Sprintf("AION_DOMAIN_ID=%s", domain.DomainID),
 			fmt.Sprintf("AION_AGENT_SESSION_DIR=%s", agentDir),
+		}
+		if a.capabilityFn != nil {
+			capability, err := a.capabilityFn(agentID)
+			if err != nil {
+				return fmt.Errorf("allocator: issue capability for %s: %w", agentID, err)
+			}
+			envVars = append(envVars, fmt.Sprintf("AION_AGENT_CAPABILITY=%s", capability))
 		}
 
 		if infConfig.UseProfile != "" {
@@ -299,10 +311,10 @@ func defaultDomainAgentResumeMessage(agentID, domainID string) string {
 Agent: %s
 Domain: %s
 
-Your current working directory is a filtered source workspace for your domain. Treat it as the project source view; do not cd outside it or inspect parent/runtime directories.
-Continue from your persisted Pi session context. Do not restart from the original system prompt.
-Use orchestrator-cli to inspect the DAG, acquire locks, update node status, create stubs, and coordinate with other agents.
-Continue only the pending work assigned to your domain.`, agentID, domainID)
+	Your current working directory is a filtered source workspace for your domain. Treat it as the project source view; do not cd outside it or inspect parent/runtime directories.
+	Continue from your persisted Pi session context. Do not restart from the original system prompt.
+	Use the loaded orchestrator-cli skill for coordination commands and workflow.
+	Continue only the pending work assigned to your domain.`, agentID, domainID)
 }
 
 func hasReusablePiSession(agentDir string) bool {

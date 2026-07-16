@@ -14,6 +14,7 @@ This skill provides the `orchestrator-cli` tool for coordinating with the Aion-K
 | `AION_ORCHESTRATOR_CORE_ADDR` | Resolved core orchestrator TCP address | `env-resolved` |
 | `AION_ORCHESTRATOR_ADDR` | Explicit override address | Required only when bypassing the core address |
 | `AION_AGENT_ID` | Your agent UUID (set by supervisor) | Required |
+| `AION_AGENT_CAPABILITY` | Opaque authorization credential (set and consumed automatically) | Required for mutations |
 
 ## Commands
 
@@ -29,9 +30,11 @@ Acquire an exclusive write lock on a file. **You MUST acquire a lock before writ
 
 Release a previously acquired lock. **Always release locks after writing.**
 
-### `orchestrator-cli update-node --node-id <uuid> --status <status>`
+### `orchestrator-cli update-node --node-id <uuid> --status <status> [--agent-id <uuid>]`
 
 Update your task node status. Status values: `Pending`, `InProgress`, `Done`, `Failed`.
+
+The CLI uses the supervisor-issued capability automatically. The orchestrator derives your identity from it and rejects updates when the node is not assigned to you. Never print or persist the capability.
 
 - Call with `InProgress` when you begin a task
 - Call with `Done` when the task is complete

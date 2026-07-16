@@ -16,7 +16,7 @@ cd kernel && go build -o skills/orchestrator-cli/bin/orchestrator-cli ./cmd/orch
 |---------|---------------|-------------|
 | `acquire-lock` | `--file`, `--agent-id` | Exclusive file lock |
 | `release-lock` | `--file`, `--agent-id` | Release file lock |
-| `update-node` | `--node-id`, `--status` | Update task status |
+| `update-node` | `--node-id`, `--status`; agent identity via `--agent-id` or env | Update an assigned task status |
 | `create-stub` | `--contract` | Create stub contract |
 | `inject-edge` | `--from`, `--to` | Report dependency |
 | `split-node` | `--node-id`, `--into` | Split task |
@@ -30,7 +30,8 @@ cd kernel && go build -o skills/orchestrator-cli/bin/orchestrator-cli ./cmd/orch
 
 - `AION_ORCHESTRATOR_CORE_ADDR` — Core orchestrator address resolved from the runtime env
 - `AION_ORCHESTRATOR_ADDR` — Explicit override when you want to bypass the resolved core address
-- `AION_AGENT_ID` — Default agent ID for `--agent-id` flags
+- `AION_AGENT_ID` — Default agent ID for `--agent-id` flags; node updates are rejected unless the node is assigned to this agent
+- `AION_AGENT_CAPABILITY` — Opaque runtime credential injected by the supervisor and consumed automatically; do not print, persist, or pass it manually
 
 ## Output Format
 

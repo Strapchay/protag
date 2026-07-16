@@ -124,6 +124,7 @@ mkdir -p "$session"
   echo "target_profile=$AION_TARGET_PROFILE"
   echo "target_api=$AION_TARGET_API"
   echo "gateway_url=$AION_INFERENCE_GATEWAY_URL"
+  echo "capability=${AION_AGENT_CAPABILITY:+set}"
 } > "$session/launch.env"
 while IFS= read -r line; do
   echo "$line" >> "$session/received.jsonl"
@@ -156,6 +157,9 @@ done
 	router := hub.NewRouter(filepath.Join(root, "logs"))
 	defer router.Close()
 	allocator := NewAllocator(config, root, router, nil)
+	allocator.SetAgentCapabilityFunc(func(agentID string) (string, error) {
+		return "test-capability-" + agentID, nil
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	defer allocator.StopAll()
@@ -178,6 +182,7 @@ done
 		"target_profile=forge",
 		"target_api=openai-completions",
 		"gateway_url=http://127.0.0.1:50151",
+		"capability=set",
 	} {
 		if !strings.Contains(launch, want) {
 			t.Fatalf("launch env missing %q:\n%s", want, launch)

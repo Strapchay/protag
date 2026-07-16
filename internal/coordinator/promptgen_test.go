@@ -29,9 +29,10 @@ func TestGenerateSystemInstructionsIncludesBuildSpecAndCoordinationRules(t *test
 		"## Excluded Paths",
 		"`.aion/`",
 		"Project-specific exclusions may also be listed in `.aionignore`",
-		"Use the loaded skills and workspace conventions for operational commands and coordination details; do not restate command syntax here.",
-		"Communicate with the orchestrator when you need clarification, status updates, or a scope decision.",
-		"Coordinate with other domain agents only when the task truly crosses ownership boundaries.",
+		"The loaded orchestrator-cli skill is authoritative for commands and workflow.",
+		"Execute only dispatched nodes assigned to this agent",
+		"Use stub contracts or orchestrator messages for cross-domain work",
+		"Report blocked work instead of inventing missing dependencies or ownership.",
 		"project context",
 	} {
 		if !strings.Contains(prompt, want) {

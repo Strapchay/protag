@@ -536,6 +536,7 @@ func (d *Daemon) resetBuildSpecArtifactsLocked() error {
 	}
 	d.dagManager = dagMgr
 	d.allocator = NewAllocator(d.config, d.projectRoot, d.hubRouter, dagMgr)
+	d.server.ClearAgentCapabilities()
 	d.configureAllocatorCallbacks()
 	d.server.SetRuntimeSubsystems(dagMgr, d.lockManager, d.stubRegistry, d.memoryStore)
 	d.server.ClearHubHistory()

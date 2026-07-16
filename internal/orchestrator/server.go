@@ -25,9 +25,10 @@ import (
 
 // Request represents a JSON-RPC-style request from orchestrator-cli.
 type Request struct {
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params"`
-	ID     string          `json:"id"`
+	Method     string          `json:"method"`
+	Params     json.RawMessage `json:"params"`
+	ID         string          `json:"id"`
+	Capability string          `json:"capability,omitempty"`
 }
 
 // Response is the JSON-RPC-style response sent back to the CLI.
@@ -74,12 +75,13 @@ type Server struct {
 	stopBuildSpecAgentsCb      func() error
 	agentListCb                func() []AgentInfo
 
-	listener    net.Listener
-	heartbeats  map[string]int64 // agentID → last heartbeat unix ms
-	hubSubs     map[chan hub.Message]struct{}
-	hubHistory  []hub.Message
-	hubSnapshot []hub.Message
-	logLevel    string
+	listener     net.Listener
+	heartbeats   map[string]int64 // agentID → last heartbeat unix ms
+	hubSubs      map[chan hub.Message]struct{}
+	hubHistory   []hub.Message
+	hubSnapshot  []hub.Message
+	logLevel     string
+	capabilities *agentCapabilityRegistry
 }
 
 // NewServer creates an Orchestrator server with the given subsystems.
@@ -97,7 +99,19 @@ func NewServer(
 		heartbeats:   make(map[string]int64),
 		hubSubs:      make(map[chan hub.Message]struct{}),
 		logLevel:     "info",
+		capabilities: newAgentCapabilityRegistry(),
 	}
+}
+
+// IssueAgentCapability returns a new opaque credential for agentID. Issuing a
+// replacement invalidates the agent's previous credential.
+func (s *Server) IssueAgentCapability(agentID string) (string, error) {
+	return s.capabilities.issue(agentID)
+}
+
+// ClearAgentCapabilities invalidates every agent credential for this daemon.
+func (s *Server) ClearAgentCapabilities() {
+	s.capabilities.clear()
 }
 
 // SetLogsDir configures the directory used to persist hub history.
@@ -1115,24 +1129,30 @@ func (s *Server) handleUpdateNode(req Request) Response {
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return Response{ID: req.ID, Error: fmt.Sprintf("invalid params: %v", err)}
 	}
+	authenticatedAgentID, ok := s.capabilities.resolve(req.Capability)
+	if !ok {
+		return Response{ID: req.ID, Error: "update-node requires a valid agent capability"}
+	}
+	params.AgentID = authenticatedAgentID
 
-	status := parseNodeStatus(params.Status)
+	status, ok := parseNodeStatus(params.Status)
+	if !ok {
+		return Response{ID: req.ID, Error: fmt.Sprintf("update-node: invalid status %q", params.Status)}
+	}
 
-	var err error
-	if params.StartedAt > 0 || params.PromptTokens > 0 {
-		metrics := &dag.NodeMetrics{
+	var metrics *dag.NodeMetrics
+	if params.StartedAt > 0 || params.CompletedAt > 0 || params.PromptTokens > 0 || params.CompletionTokens > 0 {
+		metrics = &dag.NodeMetrics{
 			StartedAt:        params.StartedAt,
 			CompletedAt:      params.CompletedAt,
 			PromptTokens:     params.PromptTokens,
 			CompletionTokens: params.CompletionTokens,
 		}
-		err = s.dagManager.UpdateNodeWithMetrics(params.NodeID, status, metrics)
-	} else {
-		err = s.dagManager.UpdateNode(params.NodeID, status)
 	}
+	err := s.dagManager.UpdateNodeForAgent(params.NodeID, params.AgentID, status, metrics)
 
 	if err != nil {
-		if s.behaviorCb != nil && strings.TrimSpace(params.AgentID) != "" {
+		if s.behaviorCb != nil {
 			s.behaviorCb(params.AgentID, "", "invalid_node_update", params.NodeID+": "+err.Error())
 		}
 		return Response{ID: req.ID, Error: err.Error()}
@@ -1478,20 +1498,20 @@ func (s *Server) GetLastHeartbeat(agentID string) (int64, bool) {
 	return ts, ok
 }
 
-func parseNodeStatus(s string) dag.NodeStatus {
+func parseNodeStatus(s string) (dag.NodeStatus, bool) {
 	switch s {
 	case "Pending":
-		return dag.StatusPending
+		return dag.StatusPending, true
 	case "InProgress":
-		return dag.StatusInProgress
+		return dag.StatusInProgress, true
 	case "Done":
-		return dag.StatusDone
+		return dag.StatusDone, true
 	case "Failed":
-		return dag.StatusFailed
+		return dag.StatusFailed, true
 	case "Blocked":
-		return dag.StatusBlocked
+		return dag.StatusBlocked, true
 	default:
-		return dag.StatusPending
+		return dag.StatusPending, false
 	}
 }
 

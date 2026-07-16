@@ -57,13 +57,18 @@ func startTestServer(t testing.TB) (*Server, string) {
 }
 
 func sendTestRequest(t testing.TB, addr string, method string, params interface{}) Response {
+	return sendTestRequestWithCapability(t, addr, method, params, "")
+}
+
+func sendTestRequestWithCapability(t testing.TB, addr string, method string, params interface{}, capability string) Response {
 	t.Helper()
 
 	paramsJSON, _ := json.Marshal(params)
 	req := Request{
-		Method: method,
-		Params: paramsJSON,
-		ID:     "test-1",
+		Method:     method,
+		Params:     paramsJSON,
+		ID:         "test-1",
+		Capability: capability,
 	}
 
 	conn, err := net.Dial("tcp", addr)
@@ -155,6 +160,82 @@ func TestServerReadDagEmpty(t *testing.T) {
 	resp := sendTestRequest(t, addr, "read-dag", map[string]string{})
 	if resp.Error != "" {
 		t.Fatalf("read-dag error: %s", resp.Error)
+	}
+}
+
+func TestServerUpdateNodeRequiresAssignedAgent(t *testing.T) {
+	srv, addr := startTestServer(t)
+	if err := srv.dagManager.AddNode(dag.DagNode{
+		ID:       "node-auth",
+		DomainID: "auth",
+		TaskSpec: "Implement authentication",
+	}); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	if err := srv.dagManager.AssignNode("node-auth", "agent-auth"); err != nil {
+		t.Fatalf("AssignNode: %v", err)
+	}
+	authCapability, err := srv.IssueAgentCapability("agent-auth")
+	if err != nil {
+		t.Fatalf("issue auth capability: %v", err)
+	}
+	dataCapability, err := srv.IssueAgentCapability("agent-data")
+	if err != nil {
+		t.Fatalf("issue data capability: %v", err)
+	}
+
+	missing := sendTestRequest(t, addr, "update-node", map[string]string{
+		"node_id": "node-auth",
+		"status":  "Done",
+	})
+	if missing.Error == "" {
+		t.Fatal("expected missing agent identity error")
+	}
+
+	wrongAgent := sendTestRequestWithCapability(t, addr, "update-node", map[string]string{
+		"node_id":  "node-auth",
+		"status":   "Done",
+		"agent_id": "agent-auth",
+	}, dataCapability)
+	if wrongAgent.Error == "" {
+		t.Fatal("expected node ownership error")
+	}
+	node, err := srv.dagManager.GetNode("node-auth")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if node.Status != dag.StatusPending || node.TaskSpec == "" {
+		t.Fatalf("rejected request mutated node: %#v", node)
+	}
+	invalidStatus := sendTestRequestWithCapability(t, addr, "update-node", map[string]string{
+		"node_id": "node-auth",
+		"status":  "Complete",
+	}, authCapability)
+	if invalidStatus.Error == "" {
+		t.Fatal("expected invalid status error")
+	}
+	node, err = srv.dagManager.GetNode("node-auth")
+	if err != nil {
+		t.Fatalf("GetNode after invalid status: %v", err)
+	}
+	if node.Status != dag.StatusPending {
+		t.Fatalf("invalid status mutated node to %s", node.Status)
+	}
+
+	owner := sendTestRequestWithCapability(t, addr, "update-node", map[string]string{
+		"node_id":  "node-auth",
+		"status":   "Done",
+		"agent_id": "agent-data",
+	}, authCapability)
+	if owner.Error != "" {
+		t.Fatalf("owner update error: %s", owner.Error)
+	}
+	node, err = srv.dagManager.GetNode("node-auth")
+	if err != nil {
+		t.Fatalf("GetNode after update: %v", err)
+	}
+	if node.Status != dag.StatusDone {
+		t.Fatalf("expected node Done, got %s", node.Status)
 	}
 }
 

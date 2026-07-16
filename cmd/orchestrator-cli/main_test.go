@@ -81,6 +81,37 @@ func TestParseGatewayCapacityCommand(t *testing.T) {
 	}
 }
 
+func TestParseUpdateNodeUsesAgentIdentity(t *testing.T) {
+	t.Setenv("AION_AGENT_ID", "agent-env")
+	params, err := parseCommand("update-node", []string{"--node-id", "node-1", "--status", "Done"})
+	if err != nil {
+		t.Fatalf("parse update-node: %v", err)
+	}
+	if params["agent_id"] != "agent-env" {
+		t.Fatalf("agent identity = %#v", params["agent_id"])
+	}
+
+	params, err = parseCommand("update-node", []string{
+		"--node-id", "node-1",
+		"--status", "Done",
+		"--agent-id", "agent-flag",
+	})
+	if err != nil {
+		t.Fatalf("parse update-node with flag: %v", err)
+	}
+	if params["agent_id"] != "agent-flag" {
+		t.Fatalf("flag agent identity = %#v", params["agent_id"])
+	}
+}
+
+func TestParseUpdateNodeRequiresAgentIdentity(t *testing.T) {
+	t.Setenv("AION_AGENT_ID", "")
+	_, err := parseCommand("update-node", []string{"--node-id", "node-1", "--status", "Done"})
+	if err == nil || !strings.Contains(err.Error(), "AION_AGENT_ID") {
+		t.Fatalf("missing identity error = %v", err)
+	}
+}
+
 func TestResolveDebugStatusAddrFromProjectServerInfo(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, ".aion"), 0o755); err != nil {
