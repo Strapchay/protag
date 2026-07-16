@@ -394,7 +394,7 @@ func applyDefaults(c *Config) {
 		c.Isolation.RuntimeBase = filepath.Join(os.TempDir(), "aion-isolation")
 	}
 	if strings.TrimSpace(c.Isolation.Network) == "" {
-		c.Isolation.Network = "shared"
+		c.Isolation.Network = "isolated"
 	}
 	if c.Cgroups.MemoryMaxMB == 0 {
 		c.Cgroups.MemoryMaxMB = 2048

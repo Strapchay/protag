@@ -62,7 +62,7 @@ isolation:
   backend: "${AION_ISOLATION_BACKEND}"
   # Host directory for ephemeral per-generation workspace metadata
   runtime_base: "${AION_ISOLATION_RUNTIME_BASE}"
-  # "shared" reaches the local gateway; "isolated" disables networking
+  # "isolated" removes network access; mounted Unix sockets provide kernel IPC
   network: "${AION_ISOLATION_NETWORK}"
 
 cgroups:

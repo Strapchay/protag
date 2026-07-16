@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -206,6 +207,169 @@ func TestInferenceGatewayProxiesOpenAICompatibleRequest(t *testing.T) {
 		t.Fatalf("expected recent gateway events")
 	} else if status.LogPath == "" {
 		t.Fatalf("expected gateway log path")
+	}
+}
+
+func TestInferenceGatewayUnixTransportUsesCapabilityPolicy(t *testing.T) {
+	registry := newAgentCapabilityRegistry()
+	token, err := registry.issuePolicy(AgentCapabilityPolicy{
+		AgentID:    "agent-data",
+		DomainID:   "data",
+		Profile:    "forge",
+		Provider:   "redacted-openai-compatible",
+		Model:      "permitted-model",
+		Generation: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := NewInferenceGateway(&Config{
+		Execution:        ExecutionConfig{Mode: "gateway", MaxConcurrentRequests: 1, RequestQueueTimeoutSec: 1},
+		InferenceGateway: InferenceGatewayConfig{Enabled: true, GatewayKey: "tcp-only-key"},
+		Inference: InferenceConfig{Models: map[string]ModelProfile{
+			"forge": {
+				Provider: "redacted-openai-compatible",
+				Model:    "permitted-model",
+				Endpoint: "http://upstream.local",
+				Env:      map[string]string{"RESOURCE_CREDENTIAL": "test-value"},
+			},
+		}},
+	})
+	gateway.SetCapabilityResolver(registry.resolvePolicy)
+	gateway.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		if payload["model"] != "permitted-model" {
+			t.Fatalf("capability model was not enforced: %#v", payload)
+		}
+		if got := r.Header.Get("X-Aion-Agent-ID"); got != "" {
+			t.Fatalf("agent-controlled header leaked upstream: %q", got)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+		}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"spoofed-model","stream":true}`))
+	req.Header.Set(gatewayAgentCapabilityHeader, token)
+	req.Header.Set("X-Aion-Agent-ID", "agent-spoofed")
+	req.Header.Set("X-Aion-Target-Profile", "other-profile")
+	req = req.WithContext(context.WithValue(req.Context(), gatewayTransportKey{}, gatewayTransportUnix))
+	rec := httptest.NewRecorder()
+	gateway.handleProxy(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	status := gateway.Status()
+	found := false
+	for _, event := range status.RecentEvents {
+		if event.RequestID == "gw-1" && event.AgentID == "agent-data" && event.DomainID == "data" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("gateway events did not use capability identity: %#v", status.RecentEvents)
+	}
+}
+
+func TestInferenceGatewayUnixTransportRejectsRotatedCapability(t *testing.T) {
+	registry := newAgentCapabilityRegistry()
+	stale, err := registry.issuePolicy(AgentCapabilityPolicy{AgentID: "agent-data", Profile: "forge", Model: "model-a", Generation: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.issuePolicy(AgentCapabilityPolicy{AgentID: "agent-data", Profile: "forge", Model: "model-a", Generation: 2}); err != nil {
+		t.Fatal(err)
+	}
+	gateway := NewInferenceGateway(&Config{
+		Execution:        ExecutionConfig{Mode: "gateway", MaxConcurrentRequests: 1},
+		InferenceGateway: InferenceGatewayConfig{Enabled: true},
+	})
+	gateway.SetCapabilityResolver(registry.resolvePolicy)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"stream":true}`))
+	req.Header.Set(gatewayAgentCapabilityHeader, stale)
+	req = req.WithContext(context.WithValue(req.Context(), gatewayTransportKey{}, gatewayTransportUnix))
+	rec := httptest.NewRecorder()
+	gateway.handleProxy(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("rotated capability status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestInferenceGatewayUnixTransportRejectsWrongProtocolPath(t *testing.T) {
+	registry := newAgentCapabilityRegistry()
+	token, err := registry.issuePolicy(AgentCapabilityPolicy{
+		AgentID:  "agent-data",
+		Profile:  "forge",
+		Provider: "openai-compatible",
+		Model:    "model-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := NewInferenceGateway(&Config{
+		Execution:        ExecutionConfig{Mode: "gateway", MaxConcurrentRequests: 1},
+		InferenceGateway: InferenceGatewayConfig{Enabled: true},
+	})
+	gateway.SetCapabilityResolver(registry.resolvePolicy)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"model-a"}`))
+	req.Header.Set(gatewayAgentCapabilityHeader, token)
+	req = req.WithContext(context.WithValue(req.Context(), gatewayTransportKey{}, gatewayTransportUnix))
+	rec := httptest.NewRecorder()
+	gateway.handleProxy(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("wrong protocol status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestInferenceGatewayStartsProtectedUnixListener(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "inference.sock")
+	registry := newAgentCapabilityRegistry()
+	token, err := registry.issuePolicy(AgentCapabilityPolicy{AgentID: "agent-data", DomainID: "data", Profile: "forge", Model: "model-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := NewInferenceGateway(&Config{
+		Execution:        ExecutionConfig{Mode: "gateway", MaxConcurrentRequests: 1},
+		InferenceGateway: InferenceGatewayConfig{Enabled: true, ListenAddr: "127.0.0.1:0"},
+	})
+	gateway.SetUnixSocket(socketPath)
+	gateway.SetCapabilityResolver(registry.resolvePolicy)
+	if err := gateway.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = gateway.Shutdown(ctx)
+	})
+	info, err := os.Stat(socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("socket mode = %o", info.Mode().Perm())
+	}
+	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+	}}}
+	req, err := http.NewRequest(http.MethodPost, "http://unix/aion/gateway/extension-loaded", strings.NewReader(`{"transport":"unix"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(gatewayAgentCapabilityHeader, token)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
 	}
 }
 

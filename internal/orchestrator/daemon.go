@@ -35,6 +35,7 @@ type Daemon struct {
 	coordinator            coordinator.Coordinator
 	memoryStore            memory.Store
 	inferenceGateway       *InferenceGateway
+	ipcPaths               daemonIPCPaths
 	projectRoot            string
 	auditor                *Auditor
 	runState               *RunState
@@ -68,6 +69,10 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 		return nil, fmt.Errorf("daemon: load run state: %w", err)
 	}
 	config.Agents.SessionDir = runState.PiSessionsDir
+	ipcPaths, err := prepareDaemonIPC(projectRoot)
+	if err != nil {
+		return nil, fmt.Errorf("daemon: prepare IPC: %w", err)
+	}
 
 	// Initialize DAG Manager
 	dagMgr, err := dag.NewManager(dag.ManagerConfig{
@@ -91,6 +96,7 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 
 	// Initialize Allocator
 	alloc := NewAllocator(config, projectRoot, hubRouter, dagMgr)
+	alloc.SetIPCDir(ipcPaths.Dir)
 
 	// Initialize Coordinator
 	piCoord := newPiCoordinatorForRun(projectRoot, config, runState)
@@ -134,6 +140,10 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	server := NewServer(dagMgr, lockMgr, stubReg, memStore)
 	server.SetLogsDir(runState.LogsDir)
 	server.SetLogLevel(config.Orchestrator.LogLevel)
+	if inferenceGateway != nil {
+		inferenceGateway.SetUnixSocket(ipcPaths.InferenceSocket)
+		inferenceGateway.SetCapabilityResolver(server.ResolveAgentCapability)
+	}
 	if broadcaster, ok := coord.(interface{ SetBroadcastFunc(func(hub.Message)) }); ok {
 		broadcaster.SetBroadcastFunc(func(msg hub.Message) {
 			server.BroadcastHubEvent(msg)
@@ -166,6 +176,7 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 		coordinator:      coord,
 		memoryStore:      memStore,
 		inferenceGateway: inferenceGateway,
+		ipcPaths:         ipcPaths,
 		auditor:          aud,
 		runState:         runState,
 		projectRoot:      projectRoot,
@@ -397,7 +408,7 @@ func (d *Daemon) configureAllocatorCallbacks() {
 	d.allocator.SetBroadcastFunc(func(msg hub.Message) {
 		d.server.BroadcastHubEvent(msg)
 	})
-	d.allocator.SetAgentCapabilityFunc(d.server.IssueAgentCapability)
+	d.allocator.SetAgentRuntimeCapabilityFunc(d.server.IssueAgentRuntimeCapability)
 	if d.auditor != nil {
 		d.auditor.SetSuppressStaleNodeFunc(func(node dag.DagNode) bool {
 			return d.shouldSuppressStaleNodeAudit(node)
@@ -730,6 +741,14 @@ func (d *Daemon) Start() error {
 			return err
 		}
 	}
+	if err := d.server.StartUnix(d.ipcPaths.ControlSocket); err != nil {
+		if d.inferenceGateway != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = d.inferenceGateway.Shutdown(shutdownCtx)
+			cancel()
+		}
+		return err
+	}
 
 	// Start server in background
 	go func() {
@@ -839,6 +858,7 @@ func (d *Daemon) ResetCurrentRun() error {
 	stubReg := stub.NewRegistry()
 	hubRouter := hub.NewRouter(newRun.LogsDir)
 	alloc := NewAllocator(d.config, d.projectRoot, hubRouter, dagMgr)
+	alloc.SetIPCDir(d.ipcPaths.Dir)
 	alloc.SetStatusFunc(func(text, level string) {
 		d.server.BroadcastStatus(text, level)
 	})

@@ -20,20 +20,22 @@ import (
 
 // Allocator manages the spinning up and termination of domain agents.
 type Allocator struct {
-	config          *Config
-	projectRoot     string
-	hubRouter       *hub.Router
-	dagManager      *dag.Manager
-	activeAgents    map[string]*supervisor.AgentSupervisor
-	mu              sync.Mutex
-	statusFn        func(text, level string) // optional: broadcasts to TUI status bar
-	agentStatusFn   func(agentID, text, level string)
-	agentStateFn    func(agentID, domainID, state, reason string)
-	lifecycleFn     func(agentID, domainID string, event supervisor.AgentLifecycleEvent)
-	broadcastFn     func(hub.Message)
-	capabilityFn    func(agentID string) (string, error)
-	isolationEngine isolation.Engine
-	isolationErr    error
+	config              *Config
+	projectRoot         string
+	hubRouter           *hub.Router
+	dagManager          *dag.Manager
+	activeAgents        map[string]*supervisor.AgentSupervisor
+	mu                  sync.Mutex
+	statusFn            func(text, level string) // optional: broadcasts to TUI status bar
+	agentStatusFn       func(agentID, text, level string)
+	agentStateFn        func(agentID, domainID, state, reason string)
+	lifecycleFn         func(agentID, domainID string, event supervisor.AgentLifecycleEvent)
+	broadcastFn         func(hub.Message)
+	capabilityFn        func(agentID string) (string, error)
+	runtimeCapabilityFn func(AgentCapabilityPolicy) (string, error)
+	ipcDir              string
+	isolationEngine     isolation.Engine
+	isolationErr        error
 }
 
 type AllocationMode string
@@ -51,6 +53,10 @@ type AllocationOptions struct {
 // NewAllocator creates a new allocator.
 func NewAllocator(config *Config, projectRoot string, hubRouter *hub.Router, dagManager *dag.Manager) *Allocator {
 	engine, isolationErr := newDomainIsolationEngine(config)
+	ipcPaths, ipcErr := prepareDaemonIPC(projectRoot)
+	if isolationErr == nil && ipcErr != nil {
+		isolationErr = fmt.Errorf("allocator: prepare IPC: %w", ipcErr)
+	}
 	return &Allocator{
 		config:          config,
 		projectRoot:     projectRoot,
@@ -59,6 +65,7 @@ func NewAllocator(config *Config, projectRoot string, hubRouter *hub.Router, dag
 		activeAgents:    make(map[string]*supervisor.AgentSupervisor),
 		isolationEngine: engine,
 		isolationErr:    isolationErr,
+		ipcDir:          ipcPaths.Dir,
 	}
 }
 
@@ -85,6 +92,14 @@ func (a *Allocator) SetBroadcastFunc(fn func(hub.Message)) {
 
 func (a *Allocator) SetAgentCapabilityFunc(fn func(agentID string) (string, error)) {
 	a.capabilityFn = fn
+}
+
+func (a *Allocator) SetAgentRuntimeCapabilityFunc(fn func(AgentCapabilityPolicy) (string, error)) {
+	a.runtimeCapabilityFn = fn
+}
+
+func (a *Allocator) SetIPCDir(path string) {
+	a.ipcDir = strings.TrimSpace(path)
 }
 
 func (a *Allocator) emitStatus(text, level string) {
@@ -164,17 +179,10 @@ func (a *Allocator) AllocateWithOptions(ctx context.Context, domains []coordinat
 		model := infConfig.Model
 		endpoint := infConfig.Endpoint
 		envVars := []string{
-			fmt.Sprintf("AION_ORCHESTRATOR_ADDR=%s", a.config.Orchestrator.ListenAddr),
 			fmt.Sprintf("AION_AGENT_ID=%s", agentID),
 			fmt.Sprintf("AION_DOMAIN_ID=%s", domain.DomainID),
 			fmt.Sprintf("AION_AGENT_SESSION_DIR=%s", agentSandboxSessionDir),
-		}
-		if a.capabilityFn != nil {
-			capability, err := a.capabilityFn(agentID)
-			if err != nil {
-				return fmt.Errorf("allocator: issue capability for %s: %w", agentID, err)
-			}
-			envVars = append(envVars, fmt.Sprintf("AION_AGENT_CAPABILITY=%s", capability))
+			fmt.Sprintf("AION_ORCHESTRATOR_SOCKET=%s", agentOrchestratorSocket),
 		}
 
 		if infConfig.UseProfile != "" {
@@ -184,8 +192,10 @@ func (a *Allocator) AllocateWithOptions(ctx context.Context, domains []coordinat
 				if profile.Endpoint != "" {
 					endpoint = profile.Endpoint
 				}
-				for k, v := range profile.Env {
-					envVars = append(envVars, fmt.Sprintf("%s=%s", k, v))
+				if !a.config.GatewayEnabled() {
+					for k, v := range profile.Env {
+						envVars = append(envVars, fmt.Sprintf("%s=%s", k, v))
+					}
 				}
 			} else {
 				log.Printf("allocator: warning: model profile %s not found", infConfig.UseProfile)
@@ -202,25 +212,19 @@ func (a *Allocator) AllocateWithOptions(ctx context.Context, domains []coordinat
 				endpoint = a.config.Inference.Fallback.Endpoint
 			}
 		}
+		targetProfile := infConfig.UseProfile
+		if targetProfile == "" {
+			targetProfile = a.config.InferenceGateway.TargetProfile
+		}
+		targetProvider := provider
+		targetModel := model
 		if a.config.GatewayEnabled() {
-			profileName := infConfig.UseProfile
-			if profileName == "" {
-				profileName = a.config.InferenceGateway.TargetProfile
-			}
-			targetProvider := provider
-			targetModel := model
-			gatewayURL := a.config.InferenceGateway.PublicBaseURL
-			if gatewayURL == "" {
-				gatewayURL = "http://" + a.config.InferenceGateway.ListenAddr
-			}
-			endpoint = gatewayURL
+			endpoint = "http://unix"
 			provider = "aion-gateway"
 			envVars = append(envVars,
 				"AION_INFERENCE_GATEWAY_ENABLED=true",
-				fmt.Sprintf("AION_INFERENCE_GATEWAY_URL=%s", gatewayURL),
-				fmt.Sprintf("AION_INFERENCE_GATEWAY_KEY=%s", a.config.InferenceGateway.GatewayKey),
-				fmt.Sprintf("AION_TARGET_PROVIDER=%s", targetProvider),
-				fmt.Sprintf("AION_TARGET_PROFILE=%s", profileName),
+				fmt.Sprintf("AION_INFERENCE_SOCKET=%s", agentInferenceSocket),
+				fmt.Sprintf("AION_TARGET_PROFILE=%s", targetProfile),
 				fmt.Sprintf("AION_TARGET_MODEL=%s", targetModel),
 				fmt.Sprintf("AION_TARGET_API=%s", gatewayAPIForProvider(targetProvider)),
 			)
@@ -242,6 +246,30 @@ func (a *Allocator) AllocateWithOptions(ctx context.Context, domains []coordinat
 			IsolationGeneration: isolationGeneration,
 			PersistIsolationGeneration: func(generation uint64) error {
 				return saveIsolationGeneration(generationPath, generation)
+			},
+			PrepareGenerationEnv: func(generation uint64) ([]string, error) {
+				policy := AgentCapabilityPolicy{
+					AgentID:    agentID,
+					DomainID:   domain.DomainID,
+					Profile:    targetProfile,
+					Provider:   targetProvider,
+					Model:      targetModel,
+					Generation: generation,
+				}
+				var capability string
+				var err error
+				switch {
+				case a.runtimeCapabilityFn != nil:
+					capability, err = a.runtimeCapabilityFn(policy)
+				case a.capabilityFn != nil:
+					capability, err = a.capabilityFn(agentID)
+				default:
+					return nil, nil
+				}
+				if err != nil {
+					return nil, fmt.Errorf("allocator: issue generation %d capability for %s: %w", generation, agentID, err)
+				}
+				return []string{fmt.Sprintf("AION_AGENT_CAPABILITY=%s", capability)}, nil
 			},
 			PiAgent: supervisor.PiAgentConfig{
 				Binary:         isolatedRuntime.binary,

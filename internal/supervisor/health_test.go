@@ -39,6 +39,24 @@ func TestHealthMonitorHeartbeatKeepsAlive(t *testing.T) {
 	}
 }
 
+func TestHealthMonitorPausesDeadlinesBetweenTurns(t *testing.T) {
+	hm := NewHealthMonitor("agent-idle", 50*time.Millisecond, 50*time.Millisecond)
+	hm.SetMonitoring(false)
+	time.Sleep(100 * time.Millisecond)
+	if got := hm.Status(); got != HealthOK {
+		t.Fatalf("paused health status = %d, want HealthOK", got)
+	}
+
+	hm.SetMonitoring(true)
+	if got := hm.Status(); got != HealthOK {
+		t.Fatalf("resumed health status = %d, want HealthOK", got)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := hm.Status(); got != HealthUnresponsive {
+		t.Fatalf("active health status = %d, want HealthUnresponsive", got)
+	}
+}
+
 func TestHealthMonitorStalled(t *testing.T) {
 	hm := NewHealthMonitor("agent-1", 5*time.Second, 50*time.Millisecond)
 

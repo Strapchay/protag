@@ -96,6 +96,7 @@ done
 	config.Orchestrator.FlushDeadlineMs = 10
 	config.Agents.SessionDir = filepath.Join(tempDir, "sessions")
 	config.Agents.CommandPath = dummyAgentScript
+	config.Isolation.Network = "shared"
 	os.MkdirAll(config.Agents.SessionDir, 0755)
 
 	daemon, err := orchestrator.NewDaemon(config, tempDir)

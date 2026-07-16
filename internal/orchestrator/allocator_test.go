@@ -51,6 +51,7 @@ done
 	config.Health.ProgressTimeoutSec = 60
 	config.Cgroups.Mode = "disabled"
 	config.Cgroups.Enabled = false
+	config.Isolation.Network = "shared"
 
 	agentDir := filepath.Join(config.Agents.SessionDir, "agent-api")
 	if err := os.MkdirAll(agentDir, 0o755); err != nil {
@@ -121,11 +122,12 @@ mkdir -p "$session"
 {
   echo "provider=$provider"
   echo "model=$model"
-  echo "target_provider=$AION_TARGET_PROVIDER"
   echo "target_model=$AION_TARGET_MODEL"
   echo "target_profile=$AION_TARGET_PROFILE"
   echo "target_api=$AION_TARGET_API"
-  echo "gateway_url=$AION_INFERENCE_GATEWAY_URL"
+  echo "inference_socket=$AION_INFERENCE_SOCKET"
+  echo "control_socket=$AION_ORCHESTRATOR_SOCKET"
+  echo "upstream_credential=${RESOURCE_CREDENTIAL:+set}"
   echo "capability=${AION_AGENT_CAPABILITY:+set}"
 } > "$session/launch.env"
 while IFS= read -r line; do
@@ -153,6 +155,7 @@ done
 			Provider: "redacted-openai-compatible",
 			Model:    "redacted-model",
 			Endpoint: "https://example.invalid/v1",
+			Env:      map[string]string{"RESOURCE_CREDENTIAL": "test-value"},
 		},
 	}
 
@@ -181,15 +184,18 @@ done
 	for _, want := range []string{
 		"provider=aion-gateway",
 		"model=redacted-model",
-		"target_provider=redacted-openai-compatible",
 		"target_profile=forge",
 		"target_api=openai-completions",
-		"gateway_url=http://127.0.0.1:50151",
+		"upstream_credential=",
 		"capability=set",
 	} {
 		if !strings.Contains(launch, want) {
 			t.Fatalf("launch env missing %q:\n%s", want, launch)
 		}
+	}
+	if !strings.Contains(launch, "inference_socket="+filepath.Join(root, ".aion", "ipc", "inference.sock")) ||
+		!strings.Contains(launch, "control_socket="+filepath.Join(root, ".aion", "ipc", "control.sock")) {
+		t.Fatalf("fake isolation did not map agent sockets to host fixtures:\n%s", launch)
 	}
 }
 
@@ -199,6 +205,8 @@ func TestPrepareIsolatedAgentRuntimeOwnsOnlyAssignedPaths(t *testing.T) {
 	defer router.Close()
 	config := &Config{}
 	config.Agents.CommandPath = filepath.Join(root, "pi")
+	config.Execution.Mode = "gateway"
+	config.InferenceGateway.Enabled = true
 	if err := os.WriteFile(config.Agents.CommandPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -224,11 +232,30 @@ func TestPrepareIsolatedAgentRuntimeOwnsOnlyAssignedPaths(t *testing.T) {
 	}
 }
 
+func TestPrepareIsolatedAgentRuntimeRequiresGateway(t *testing.T) {
+	root := t.TempDir()
+	router := hub.NewRouter(filepath.Join(root, "logs"))
+	defer router.Close()
+	config := &Config{Agents: AgentsConfig{CommandPath: filepath.Join(root, "pi")}}
+	if err := os.WriteFile(config.Agents.CommandPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	allocator := NewAllocator(config, root, router, nil)
+	_, err := allocator.prepareIsolatedAgentRuntime("agent-offline", coordinator.Domain{
+		DomainID:      "offline",
+		AssignedPaths: []string{"offline"},
+	}, filepath.Join(root, ".aion", "sessions", "agent-offline"))
+	if err == nil || !strings.Contains(err.Error(), "requires the inference gateway") {
+		t.Fatalf("prepare isolated runtime error = %v", err)
+	}
+}
+
 func TestPrepareIsolatedAgentRuntimeRejectsBroadOrEscapingOwnership(t *testing.T) {
 	root := t.TempDir()
 	router := hub.NewRouter(filepath.Join(root, "logs"))
 	defer router.Close()
 	config := &Config{Agents: AgentsConfig{CommandPath: filepath.Join(root, "pi")}}
+	config.Isolation.Network = "shared"
 	if err := os.WriteFile(config.Agents.CommandPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}

@@ -29,6 +29,7 @@ type HealthMonitor struct {
 	activityPhase    string
 	activityStarted  time.Time
 	activityLastSeen time.Time
+	monitoring       bool
 	onTimeout        func(agentID string, status HealthStatus)
 	cancel           context.CancelFunc
 }
@@ -43,6 +44,21 @@ func NewHealthMonitor(agentID string, heartbeatTimeout, progressTimeout time.Dur
 		progressTimeout:  progressTimeout,
 		activityStale:    45 * time.Second,
 		activityMax:      15 * time.Minute,
+		monitoring:       true,
+	}
+}
+
+// SetMonitoring enables health deadlines only while an RPC agent is handling
+// a turn. A resident Pi process is expected to be silent between turns; its
+// process lifetime remains covered by the supervisor's crash detector.
+func (h *HealthMonitor) SetMonitoring(active bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.monitoring = active
+	if active {
+		now := time.Now()
+		h.lastHeartbeat = now
+		h.lastProgress = now
 	}
 }
 
@@ -145,10 +161,11 @@ func (h *HealthMonitor) check() {
 	heartbeatAge := now.Sub(h.lastHeartbeat)
 	progressAge := now.Sub(h.lastProgress)
 	externalActive := h.externalActivityActiveLocked(now)
+	monitoring := h.monitoring
 	cb := h.onTimeout
 	h.mu.Unlock()
 
-	if cb == nil {
+	if cb == nil || !monitoring {
 		return
 	}
 
@@ -169,6 +186,9 @@ func (h *HealthMonitor) check() {
 func (h *HealthMonitor) Status() HealthStatus {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if !h.monitoring {
+		return HealthOK
+	}
 
 	now := time.Now()
 	if now.Sub(h.lastHeartbeat) > h.heartbeatTimeout {

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,6 +56,48 @@ func TestResolveDashboardAddrFallsBackToEnv(t *testing.T) {
 
 	if got := resolveDashboardAddr(); got != "127.0.0.1:7001" {
 		t.Fatalf("resolveDashboardAddr = %q", got)
+	}
+}
+
+func TestResolveOrchestratorAddrPrefersAgentUnixSocket(t *testing.T) {
+	t.Setenv("AION_ORCHESTRATOR_SOCKET", "/run/aion/control.sock")
+	t.Setenv("AION_ORCHESTRATOR_ADDR", "127.0.0.1:7001")
+	if got := resolveOrchestratorAddr(); got != "unix:///run/aion/control.sock" {
+		t.Fatalf("resolveOrchestratorAddr = %q", got)
+	}
+}
+
+func TestSendRequestUsesUnixSocket(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "control.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			serverDone <- acceptErr
+			return
+		}
+		defer conn.Close()
+		var request Request
+		if decodeErr := json.NewDecoder(conn).Decode(&request); decodeErr != nil {
+			serverDone <- decodeErr
+			return
+		}
+		serverDone <- json.NewEncoder(conn).Encode(Response{ID: request.ID, Result: json.RawMessage(`{"ok":true}`)})
+	}()
+	response, err := sendRequest("unix://"+socket, Request{ID: "unix-test", Method: "heartbeat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.ID != "unix-test" || !strings.Contains(string(response.Result), `"ok":true`) {
+		t.Fatalf("response = %#v", response)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
 	}
 }
 

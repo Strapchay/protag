@@ -116,7 +116,13 @@ func resolveCommandAddr(command string) string {
 }
 
 func sendRequest(addr string, req Request) (*Response, error) {
-	conn, err := net.Dial("tcp", addr)
+	network := "tcp"
+	dialAddr := addr
+	if strings.HasPrefix(addr, "unix://") {
+		network = "unix"
+		dialAddr = strings.TrimPrefix(addr, "unix://")
+	}
+	conn, err := net.Dial(network, dialAddr)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
@@ -138,6 +144,9 @@ func sendRequest(addr string, req Request) (*Response, error) {
 }
 
 func resolveOrchestratorAddr() string {
+	if socket := strings.TrimSpace(os.Getenv("AION_ORCHESTRATOR_SOCKET")); socket != "" {
+		return "unix://" + socket
+	}
 	if addr := os.Getenv("AION_ORCHESTRATOR_ADDR"); addr != "" {
 		return addr
 	}
@@ -518,6 +527,7 @@ Commands:
   dashboard       Launch real-time monitoring TUI [--verbose]
 
 Environment:
+	  AION_ORCHESTRATOR_SOCKET Agent-only orchestrator Unix socket
 	  AION_ORCHESTRATOR_ADDR   Orchestrator address
 	  AION_ORCHESTRATOR_CORE_ADDR  Core orchestrator address codename
 	  AION_AGENT_ID            Default agent ID for commands requiring --agent-id

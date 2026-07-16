@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -76,6 +77,8 @@ type Server struct {
 	agentListCb                func() []AgentInfo
 
 	listener     net.Listener
+	unixListener net.Listener
+	unixPath     string
 	heartbeats   map[string]int64 // agentID → last heartbeat unix ms
 	hubSubs      map[chan hub.Message]struct{}
 	hubHistory   []hub.Message
@@ -107,6 +110,16 @@ func NewServer(
 // replacement invalidates the agent's previous credential.
 func (s *Server) IssueAgentCapability(agentID string) (string, error) {
 	return s.capabilities.issue(agentID)
+}
+
+// IssueAgentRuntimeCapability rotates the credential for an agent and binds
+// the replacement to its current workspace generation and inference policy.
+func (s *Server) IssueAgentRuntimeCapability(policy AgentCapabilityPolicy) (string, error) {
+	return s.capabilities.issuePolicy(policy)
+}
+
+func (s *Server) ResolveAgentCapability(token string) (AgentCapabilityPolicy, bool) {
+	return s.capabilities.resolvePolicy(token)
 }
 
 // ClearAgentCapabilities invalidates every agent credential for this daemon.
@@ -370,12 +383,49 @@ func (s *Server) ListenAndServe(addr string) error {
 	}
 	s.listener = ln
 	log.Printf("orchestrator: listening on %s", addr)
+	return s.serve(ln)
+}
 
+// StartUnix starts the agent-only control listener without blocking. The
+// external TCP listener remains available for the TUI and host-side CLI.
+func (s *Server) StartUnix(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return fmt.Errorf("server: unix socket path is required")
+	}
+	if err := prepareUnixSocketPath(path); err != nil {
+		return fmt.Errorf("server: prepare unix socket: %w", err)
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return fmt.Errorf("server: listen unix: %w", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = ln.Close()
+		_ = os.Remove(path)
+		return fmt.Errorf("server: protect unix socket: %w", err)
+	}
+	s.mu.Lock()
+	s.unixListener = ln
+	s.unixPath = path
+	s.mu.Unlock()
+	log.Printf("orchestrator: agent control socket listening at %s", path)
+	go func() {
+		if err := s.serve(ln); err != nil {
+			log.Printf("orchestrator: unix server error: %v", err)
+		}
+	}()
+	return nil
+}
+
+func (s *Server) serve(ln net.Listener) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("orchestrator: accept error: %v", err)
-			continue
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return fmt.Errorf("server: accept: %w", err)
 		}
 		go s.handleConnection(conn)
 	}
@@ -383,10 +433,29 @@ func (s *Server) ListenAndServe(addr string) error {
 
 // Stop stops the server.
 func (s *Server) Stop() error {
-	if s.listener != nil {
-		return s.listener.Close()
+	s.mu.Lock()
+	listener := s.listener
+	unixListener := s.unixListener
+	unixPath := s.unixPath
+	s.listener = nil
+	s.unixListener = nil
+	s.unixPath = ""
+	s.mu.Unlock()
+	var stopErr error
+	if listener != nil {
+		stopErr = listener.Close()
 	}
-	return nil
+	if unixListener != nil {
+		if err := unixListener.Close(); err != nil && stopErr == nil {
+			stopErr = err
+		}
+	}
+	if unixPath != "" {
+		if err := os.Remove(unixPath); err != nil && !os.IsNotExist(err) && stopErr == nil {
+			stopErr = err
+		}
+	}
+	return stopErr
 }
 
 // Addr returns the listener address, or empty if not started.

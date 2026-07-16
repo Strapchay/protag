@@ -66,6 +66,9 @@ type AgentConfig struct {
 	IsolationPolicy            isolation.Policy
 	IsolationGeneration        uint64
 	PersistIsolationGeneration func(uint64) error
+	// PrepareGenerationEnv issues credentials tied to the just-prepared
+	// workspace generation. It runs before the child process is spawned.
+	PrepareGenerationEnv func(uint64) ([]string, error)
 	// CgroupConfig configures resource limits.
 	Cgroup CgroupConfig
 	// HealthConfig
@@ -253,6 +256,14 @@ func (s *AgentSupervisor) spawnAgent(ctx context.Context) error {
 		}
 		workspace = prepared
 		piConfig.Workspace = prepared
+		if s.config.PrepareGenerationEnv != nil {
+			generationEnv, err := s.config.PrepareGenerationEnv(generation)
+			if err != nil {
+				_ = prepared.Close()
+				return fmt.Errorf("prepare isolated workspace generation %d environment: %w", generation, err)
+			}
+			piConfig.Env = append(piConfig.Env, generationEnv...)
+		}
 	}
 	cleanupWorkspace := func() {
 		if workspace != nil {
@@ -298,9 +309,22 @@ func (s *AgentSupervisor) spawnAgent(ctx context.Context) error {
 	)
 	hm.SetExternalActivityTimeouts(s.config.ExternalActivityStale, s.config.ExternalActivityMax)
 	hm.OnTimeout(func(agentID string, status HealthStatus) {
+		s.mu.Lock()
+		turnActive := s.isThinking
+		state := s.state
+		s.mu.Unlock()
+		if !turnActive && state == StateRunning {
+			// An RPC-mode Pi process is expected to be silent between turns.
+			// Process exit is covered independently by crashDetector.
+			hm.RecordHeartbeat()
+			return
+		}
 		log.Printf("supervisor: agent %s health timeout: %d", agentID, status)
 		s.handleCrash("health timeout")
 	})
+	if strings.TrimSpace(s.config.InitialPrompt) == "" {
+		hm.SetMonitoring(false)
+	}
 	hm.Start(ctx)
 
 	s.mu.Lock()
@@ -403,7 +427,13 @@ func (s *AgentSupervisor) SendPrompt(message string) error {
 	if pa == nil {
 		return fmt.Errorf("agent not started")
 	}
-	return pa.SendPrompt(message)
+	if err := pa.SendPrompt(message); err != nil {
+		return err
+	}
+	if s.healthMonitor != nil {
+		s.healthMonitor.SetMonitoring(true)
+	}
+	return nil
 }
 
 // SendFollowUp sends a follow-up message to the Pi Agent.
@@ -419,10 +449,19 @@ func (s *AgentSupervisor) SendFollowUp(message string) error {
 	}
 
 	if thinking {
-		return pa.SendFollowUp(message)
+		if err := pa.SendFollowUp(message); err != nil {
+			return err
+		}
+	} else {
+		// If idle, use prompt to trigger a new turn immediately
+		if err := pa.SendPrompt(message); err != nil {
+			return err
+		}
 	}
-	// If idle, use prompt to trigger a new turn immediately
-	return pa.SendPrompt(message)
+	if s.healthMonitor != nil {
+		s.healthMonitor.SetMonitoring(true)
+	}
+	return nil
 }
 
 // SendSteer sends a steer command to the Pi Agent.
@@ -438,10 +477,19 @@ func (s *AgentSupervisor) SendSteer(message string) error {
 	}
 
 	if thinking {
-		return pa.SendSteer(message)
+		if err := pa.SendSteer(message); err != nil {
+			return err
+		}
+	} else {
+		// If idle, use prompt to force processing of the steer
+		if err := pa.SendPrompt("STEER: " + message); err != nil {
+			return err
+		}
 	}
-	// If idle, use prompt to force processing of the steer
-	return pa.SendPrompt("STEER: " + message)
+	if s.healthMonitor != nil {
+		s.healthMonitor.SetMonitoring(true)
+	}
+	return nil
 }
 
 // State returns the current agent state.
@@ -524,13 +572,14 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 	case "turn_start":
 		s.mu.Lock()
 		s.isThinking = true
+		s.lastThinking = ""
+		s.lastText = ""
 		s.mu.Unlock()
 		s.emitStatus(s.displayLabel()+" is thinking...", "info")
 		if s.healthMonitor != nil {
+			s.healthMonitor.SetMonitoring(true)
 			s.healthMonitor.RecordHeartbeat()
 		}
-		s.lastThinking = ""
-		s.lastText = ""
 	case "turn_end":
 		s.mu.Lock()
 		s.isThinking = false
@@ -539,6 +588,7 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 		s.emitStatus(s.displayLabel()+" is idle", "ok")
 		if s.healthMonitor != nil {
 			s.healthMonitor.RecordHeartbeat()
+			s.healthMonitor.SetMonitoring(false)
 		}
 	case "text", "thinking", "message_start", "message_update", "message_end":
 		pMsg, err := event.ParseMessage()
@@ -553,9 +603,20 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 
 		log.Printf("supervisor: agent %s broadcasting: thinkingLen=%d, textLen=%d", s.config.AgentID, len(thinking), len(text))
 
-		// Broadcast thinking if present and relevant to this event type
-		if thinking != "" && thinking != s.lastThinking && (event.Type == "thinking" || event.Type == "message_update" || event.Type == "message_start") {
+		thinkingEvent := event.Type == "thinking" || event.Type == "message_update" || event.Type == "message_start"
+		s.mu.Lock()
+		emitThinking := thinking != "" && thinking != s.lastThinking && thinkingEvent
+		if emitThinking {
 			s.lastThinking = thinking
+		}
+		emitText := text != "" && text != s.lastText
+		if emitText {
+			s.lastText = text
+		}
+		s.mu.Unlock()
+
+		// Broadcast thinking if present and relevant to this event type
+		if emitThinking {
 			s.emitLifecycle(AgentLifecycleEvent{Kind: "thinking", Content: thinking})
 			payload := map[string]string{
 				"type":    "thinking",
@@ -567,8 +628,7 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 		}
 
 		// Broadcast text if present
-		if text != "" && text != s.lastText {
-			s.lastText = text
+		if emitText {
 			s.emitLifecycle(AgentLifecycleEvent{Kind: "text", Content: text})
 			payload := map[string]string{
 				"type":    "text",
@@ -624,6 +684,9 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 		s.mu.Lock()
 		s.isThinking = false
 		s.mu.Unlock()
+		if s.healthMonitor != nil {
+			s.healthMonitor.SetMonitoring(false)
+		}
 		if event.ErrorMessage != "" {
 			s.emitLifecycle(AgentLifecycleEvent{Kind: "agent_error", IsError: true, Error: event.ErrorMessage})
 			s.emitStatus("Fatal Agent Error: "+event.ErrorMessage, "error")

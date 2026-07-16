@@ -2,8 +2,10 @@ package supervisor
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,6 +29,7 @@ if [[ -f "$count_file" ]]; then
 fi
 count=$((count + 1))
 printf '%s' "$count" > "$count_file"
+printf '%s\n' "$AION_AGENT_CAPABILITY" >> "$AION_TEST_SESSION/capabilities"
 while IFS= read -r line; do
   if [[ "$line" == *'"type":"abort"'* ]]; then
     exit 0
@@ -40,6 +43,8 @@ done
 	}
 
 	engine := &isolationtest.FakeEngine{}
+	var generationsMu sync.Mutex
+	var issuedGenerations []uint64
 	supervisor := NewAgentSupervisor(AgentConfig{
 		AgentID:       "agent-domain-a",
 		DomainID:      "domain-a",
@@ -52,6 +57,12 @@ done
 			Env:            []string{"AION_TEST_SESSION=/state/pi"},
 		},
 		IsolationEngine: engine,
+		PrepareGenerationEnv: func(generation uint64) ([]string, error) {
+			generationsMu.Lock()
+			issuedGenerations = append(issuedGenerations, generation)
+			generationsMu.Unlock()
+			return []string{fmt.Sprintf("AION_AGENT_CAPABILITY=generation-%d", generation)}, nil
+		},
 		IsolationPolicy: isolation.Policy{
 			ID:         "agent-domain-a",
 			WorkingDir: "/workspace",
@@ -92,6 +103,16 @@ done
 		t.Fatalf("read persisted launch count: %v", err)
 	} else if string(got) != "2" {
 		t.Fatalf("expected resumed process to share persisted session state, got launch count %q", got)
+	}
+	if got, err := os.ReadFile(filepath.Join(sessionDir, "capabilities")); err != nil {
+		t.Fatalf("read generation capabilities: %v", err)
+	} else if string(got) != "generation-1\ngeneration-2\n" {
+		t.Fatalf("generation capabilities were not rotated: %q", got)
+	}
+	generationsMu.Lock()
+	defer generationsMu.Unlock()
+	if len(issuedGenerations) != 2 || issuedGenerations[0] != 1 || issuedGenerations[1] != 2 {
+		t.Fatalf("issued generations = %#v", issuedGenerations)
 	}
 
 	if err := supervisor.Stop(); err != nil {

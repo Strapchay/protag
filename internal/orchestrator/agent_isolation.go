@@ -63,15 +63,18 @@ func (a *Allocator) prepareIsolatedAgentRuntime(agentID string, domain coordinat
 		ID:         agentID,
 		WorkingDir: agentSandboxRoot,
 		Hostname:   agentID,
-		Network:    isolation.NetworkShared,
+		Network:    isolation.NetworkIsolated,
 		SourceRoot: projectRoot,
 		Environment: map[string]string{
 			"PI_CODING_AGENT_DIR": "/state/pi/config",
 			"PI_TELEMETRY":        "0",
 		},
 	}
-	if strings.EqualFold(strings.TrimSpace(a.config.Isolation.Network), string(isolation.NetworkIsolated)) {
-		policy.Network = isolation.NetworkIsolated
+	if strings.EqualFold(strings.TrimSpace(a.config.Isolation.Network), string(isolation.NetworkShared)) {
+		policy.Network = isolation.NetworkShared
+	}
+	if policy.Network == isolation.NetworkIsolated && !a.config.GatewayEnabled() {
+		return isolatedAgentRuntime{}, fmt.Errorf("allocator: isolated agent networking requires the inference gateway; enable gateway mode or explicitly select shared networking")
 	}
 	for _, name := range []string{".aion", ".git", ".agents", ".codex"} {
 		policy.DeniedSources = append(policy.DeniedSources, filepath.Join(projectRoot, name))
@@ -95,6 +98,14 @@ func (a *Allocator) prepareIsolatedAgentRuntime(agentID string, domain coordinat
 	policy.Writable = append(policy.Writable, isolation.Mount{
 		Source: agentDir,
 		Target: agentSandboxSessionDir,
+		Kind:   isolation.MountDirectory,
+	})
+	if strings.TrimSpace(a.ipcDir) == "" {
+		return isolatedAgentRuntime{}, fmt.Errorf("allocator: agent IPC directory is unavailable")
+	}
+	policy.ReadOnly = append(policy.ReadOnly, isolation.Mount{
+		Source: a.ipcDir,
+		Target: agentIPCMountPath,
 		Kind:   isolation.MountDirectory,
 	})
 

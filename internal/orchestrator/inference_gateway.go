@@ -23,6 +23,7 @@ import (
 )
 
 const gatewayAuthHeader = "X-Aion-Gateway-Key"
+const gatewayAgentCapabilityHeader = "X-Aion-Agent-Capability"
 const gatewayExtensionLoadedPath = "/aion/gateway/extension-loaded"
 const defaultGatewayActivityPulseInterval = 10 * time.Second
 const maxGatewayCapacity = 16
@@ -32,6 +33,7 @@ const maxGatewayCapacity = 16
 type InferenceGatewayStatus struct {
 	Enabled            bool                   `json:"enabled"`
 	ListenAddr         string                 `json:"listen_addr"`
+	UnixSocket         string                 `json:"unix_socket,omitempty"`
 	PublicBaseURL      string                 `json:"public_base_url"`
 	Capacity           int                    `json:"capacity"`
 	InUse              int                    `json:"in_use"`
@@ -84,11 +86,14 @@ type GatewayEvent struct {
 }
 
 type InferenceGateway struct {
-	config   *Config
-	server   *http.Server
-	listener net.Listener
-	limiter  *gatewayLimiter
-	client   *http.Client
+	config       *Config
+	server       *http.Server
+	unixServer   *http.Server
+	listener     net.Listener
+	unixListener net.Listener
+	unixPath     string
+	limiter      *gatewayLimiter
+	client       *http.Client
 
 	totalRequests atomic.Int64
 	rejected      atomic.Int64
@@ -102,11 +107,16 @@ type InferenceGateway struct {
 	statusCounts map[int]int64
 	recentEvents []GatewayEvent
 	activityFn   func(agentID, domainID, phase string)
+	capabilityFn func(token string) (AgentCapabilityPolicy, bool)
 	active       map[string]gatewayActiveRequest
 
 	activityPulseInterval time.Duration
 	sleepFn               func(context.Context, time.Duration) error
 }
+
+type gatewayTransportKey struct{}
+
+const gatewayTransportUnix = "unix"
 
 func NewInferenceGateway(config *Config, logsDir ...string) *InferenceGateway {
 	capacity := 1
@@ -152,6 +162,24 @@ func (g *InferenceGateway) SetActivityFunc(fn func(agentID, domainID, phase stri
 	g.mu.Unlock()
 }
 
+func (g *InferenceGateway) SetUnixSocket(path string) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	g.unixPath = strings.TrimSpace(path)
+	g.mu.Unlock()
+}
+
+func (g *InferenceGateway) SetCapabilityResolver(fn func(token string) (AgentCapabilityPolicy, bool)) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	g.capabilityFn = fn
+	g.mu.Unlock()
+}
+
 func (g *InferenceGateway) Start() error {
 	if g == nil || g.config == nil || !g.config.GatewayEnabled() {
 		return nil
@@ -167,6 +195,38 @@ func (g *InferenceGateway) Start() error {
 	}
 	g.listener = ln
 	log.Printf("inference-gateway: listening on %s", addr)
+	g.mu.Lock()
+	unixPath := g.unixPath
+	g.mu.Unlock()
+	if unixPath != "" {
+		if err := prepareUnixSocketPath(unixPath); err != nil {
+			_ = ln.Close()
+			return fmt.Errorf("inference gateway prepare unix socket: %w", err)
+		}
+		unixListener, err := net.Listen("unix", unixPath)
+		if err != nil {
+			_ = ln.Close()
+			return fmt.Errorf("inference gateway listen unix: %w", err)
+		}
+		if err := os.Chmod(unixPath, 0o600); err != nil {
+			_ = unixListener.Close()
+			_ = ln.Close()
+			_ = os.Remove(unixPath)
+			return fmt.Errorf("inference gateway protect unix socket: %w", err)
+		}
+		g.unixListener = unixListener
+		g.unixServer = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := context.WithValue(r.Context(), gatewayTransportKey{}, gatewayTransportUnix)
+			g.server.Handler.ServeHTTP(w, r.WithContext(ctx))
+		})}
+		log.Printf("inference-gateway: agent socket listening at %s", unixPath)
+		go func() {
+			if err := g.unixServer.Serve(unixListener); err != nil && err != http.ErrServerClosed {
+				g.recordError(err)
+				log.Printf("inference-gateway: unix server error: %v", err)
+			}
+		}()
+	}
 	g.recordStartup(addr)
 	go func() {
 		if err := g.server.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -193,7 +253,22 @@ func (g *InferenceGateway) Shutdown(ctx context.Context) error {
 	if g == nil || g.server == nil {
 		return nil
 	}
-	return g.server.Shutdown(ctx)
+	var shutdownErr error
+	if g.unixServer != nil {
+		shutdownErr = g.unixServer.Shutdown(ctx)
+	}
+	if err := g.server.Shutdown(ctx); err != nil && shutdownErr == nil {
+		shutdownErr = err
+	}
+	g.mu.Lock()
+	unixPath := g.unixPath
+	g.mu.Unlock()
+	if unixPath != "" {
+		if err := os.Remove(unixPath); err != nil && !os.IsNotExist(err) && shutdownErr == nil {
+			shutdownErr = err
+		}
+	}
+	return shutdownErr
 }
 
 func (g *InferenceGateway) Status() InferenceGatewayStatus {
@@ -232,6 +307,7 @@ func (g *InferenceGateway) Status() InferenceGatewayStatus {
 		return active[i].StartedAt < active[j].StartedAt
 	})
 	logPath := g.logPath
+	unixPath := g.unixPath
 	g.mu.Unlock()
 	capacity, inUse, queued := 0, 0, 0
 	if g.limiter != nil {
@@ -240,6 +316,7 @@ func (g *InferenceGateway) Status() InferenceGatewayStatus {
 	return InferenceGatewayStatus{
 		Enabled:            g.config.GatewayEnabled(),
 		ListenAddr:         g.config.InferenceGateway.ListenAddr,
+		UnixSocket:         unixPath,
 		PublicBaseURL:      g.config.InferenceGateway.PublicBaseURL,
 		Capacity:           capacity,
 		InUse:              inUse,
@@ -297,12 +374,14 @@ func (g *InferenceGateway) handleExtensionLoaded(w http.ResponseWriter, r *http.
 		Method:    r.Method,
 		Path:      r.URL.Path,
 	}
-	if !g.authorized(r) {
+	policy, authorized := g.authorizePolicy(r)
+	if !authorized {
 		g.rejected.Add(1)
 		g.recordFailure(info, http.StatusUnauthorized, start, "extension loaded signal unauthorized")
 		writeGatewayJSON(w, http.StatusUnauthorized, map[string]string{"error": "gateway unauthorized"})
 		return
 	}
+	applyGatewayPolicyInfo(&info, policy)
 	g.recordEvent(GatewayEvent{
 		At:         time.Now().UTC().Format(time.RFC3339Nano),
 		Level:      "info",
@@ -331,24 +410,34 @@ func (g *InferenceGateway) handleModels(w http.ResponseWriter, r *http.Request) 
 		Method:    r.Method,
 		Path:      r.URL.Path,
 	}
-	if !g.authorized(r) {
+	policy, authorized := g.authorizePolicy(r)
+	if !authorized {
 		g.rejected.Add(1)
 		g.recordFailure(info, http.StatusUnauthorized, start, "models request unauthorized")
 		writeGatewayJSON(w, http.StatusUnauthorized, map[string]string{"error": "gateway unauthorized"})
 		return
 	}
+	applyGatewayPolicyInfo(&info, policy)
 	g.totalRequests.Add(1)
 	models := make([]map[string]any, 0, len(g.config.Inference.Models))
-	for name, profile := range g.config.Inference.Models {
-		id := strings.TrimSpace(profile.Model)
-		if id == "" {
-			id = name
-		}
+	if policy != nil {
 		models = append(models, map[string]any{
-			"id":       id,
+			"id":       policy.Model,
 			"object":   "model",
 			"owned_by": "aion-gateway",
 		})
+	} else {
+		for name, profile := range g.config.Inference.Models {
+			id := strings.TrimSpace(profile.Model)
+			if id == "" {
+				id = name
+			}
+			models = append(models, map[string]any{
+				"id":       id,
+				"object":   "model",
+				"owned_by": "aion-gateway",
+			})
+		}
 	}
 	writeGatewayJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
@@ -399,6 +488,8 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		Method:    r.Method,
 		Path:      r.URL.Path,
 	}
+	policy, authorized := g.authorizePolicy(r)
+	applyGatewayPolicyInfo(&reqInfo, policy)
 	g.recordEvent(GatewayEvent{
 		At:        time.Now().UTC().Format(time.RFC3339Nano),
 		Level:     "debug",
@@ -411,11 +502,18 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		Path:      reqInfo.Path,
 		Message:   "request received",
 	})
-	if !g.authorized(r) {
+	if !authorized {
 		g.rejected.Add(1)
 		g.emitActivity(reqInfo, "failed")
 		g.recordFailure(reqInfo, http.StatusUnauthorized, start, "gateway unauthorized")
 		writeGatewayJSON(w, http.StatusUnauthorized, map[string]string{"error": "gateway unauthorized"})
+		return
+	}
+	if policy != nil && !gatewayPolicyAllowsPath(*policy, r.URL.Path) {
+		g.rejected.Add(1)
+		g.emitActivity(reqInfo, "failed")
+		g.recordFailure(reqInfo, http.StatusForbidden, start, "gateway capability does not permit this inference protocol")
+		writeGatewayJSON(w, http.StatusForbidden, map[string]string{"error": "gateway capability does not permit this inference protocol"})
 		return
 	}
 	stopPulse := g.startActivityPulse(r.Context(), reqInfo, "queued")
@@ -435,7 +533,7 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	reqInfo.QueueMS = queueMS
 	g.emitActivity(reqInfo, "admitted")
 
-	profile, err := g.targetProfile(r)
+	profile, err := g.targetProfile(r, policy)
 	if err != nil {
 		g.rejected.Add(1)
 		g.recordError(err)
@@ -464,6 +562,17 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		g.recordFailure(reqInfo, http.StatusBadRequest, start, "gateway request body could not be read")
 		writeGatewayJSON(w, http.StatusBadRequest, map[string]string{"error": "gateway request body could not be read"})
 		return
+	}
+	if policy != nil {
+		body, err = enforceGatewayRequestModel(body, policy.Model)
+		if err != nil {
+			g.rejected.Add(1)
+			g.recordError(err)
+			g.emitActivity(reqInfo, "failed")
+			g.recordFailure(reqInfo, http.StatusBadRequest, start, err.Error())
+			writeGatewayJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
 	}
 
 	proxyCtx, cancelProxy := context.WithTimeout(r.Context(), time.Duration(g.upstreamTimeoutSec())*time.Second)
@@ -816,14 +925,45 @@ func sleepWithContext(ctx context.Context, delay time.Duration) error {
 }
 
 func (g *InferenceGateway) authorized(r *http.Request) bool {
-	key := strings.TrimSpace(g.config.InferenceGateway.GatewayKey)
-	if key == "" {
-		return true
-	}
-	return r.Header.Get(gatewayAuthHeader) == key
+	_, ok := g.authorizePolicy(r)
+	return ok
 }
 
-func (g *InferenceGateway) targetProfile(r *http.Request) (ModelProfile, error) {
+func (g *InferenceGateway) authorizePolicy(r *http.Request) (*AgentCapabilityPolicy, bool) {
+	if r.Context().Value(gatewayTransportKey{}) == gatewayTransportUnix {
+		g.mu.Lock()
+		resolve := g.capabilityFn
+		g.mu.Unlock()
+		if resolve == nil {
+			return nil, false
+		}
+		policy, ok := resolve(r.Header.Get(gatewayAgentCapabilityHeader))
+		if !ok || strings.TrimSpace(policy.AgentID) == "" {
+			return nil, false
+		}
+		return &policy, true
+	}
+	key := strings.TrimSpace(g.config.InferenceGateway.GatewayKey)
+	if key == "" {
+		return nil, true
+	}
+	return nil, r.Header.Get(gatewayAuthHeader) == key
+}
+
+func (g *InferenceGateway) targetProfile(r *http.Request, policy *AgentCapabilityPolicy) (ModelProfile, error) {
+	if policy != nil && policy.Profile != "" {
+		profile, ok := g.config.Inference.Models[policy.Profile]
+		if !ok {
+			return ModelProfile{}, fmt.Errorf("gateway target profile %q not found", policy.Profile)
+		}
+		if profile.Endpoint == "" {
+			profile.Endpoint = defaultProviderEndpoint(profile.Provider)
+		}
+		if profile.Endpoint == "" {
+			return ModelProfile{}, fmt.Errorf("gateway target profile %q has no endpoint", policy.Profile)
+		}
+		return profile, nil
+	}
 	profileName := strings.TrimSpace(r.Header.Get("X-Aion-Target-Profile"))
 	if profileName == "" {
 		profileName = strings.TrimSpace(g.config.InferenceGateway.TargetProfile)
@@ -881,6 +1021,47 @@ type gatewayActiveRequest struct {
 	phase     string
 	startedAt time.Time
 	updatedAt time.Time
+}
+
+func applyGatewayPolicyInfo(info *gatewayRequestInfo, policy *AgentCapabilityPolicy) {
+	if info == nil || policy == nil {
+		return
+	}
+	info.AgentID = policy.AgentID
+	info.DomainID = policy.DomainID
+	info.Profile = policy.Profile
+	info.Provider = policy.Provider
+}
+
+func enforceGatewayRequestModel(body []byte, model string) ([]byte, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil, fmt.Errorf("gateway capability has no permitted model")
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("gateway request body is not valid JSON: %w", err)
+	}
+	encodedModel, err := json.Marshal(model)
+	if err != nil {
+		return nil, fmt.Errorf("gateway permitted model could not be encoded: %w", err)
+	}
+	payload["model"] = encodedModel
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("gateway request body could not be encoded: %w", err)
+	}
+	return encoded, nil
+}
+
+func gatewayPolicyAllowsPath(policy AgentCapabilityPolicy, path string) bool {
+	path = canonicalGatewayProxyPath(path)
+	switch gatewayAPIForProvider(policy.Provider) {
+	case "anthropic-messages":
+		return path == "/v1/messages"
+	default:
+		return path == "/v1/chat/completions"
+	}
 }
 
 func (g *InferenceGateway) recordCompletion(info gatewayRequestInfo, status int, start time.Time, bytesWritten int64) {
