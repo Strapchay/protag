@@ -604,7 +604,7 @@ func (c *PiCoordinator) preparePlanningArtifacts(specText string, req PlanReques
 		BuildSpec:     specText,
 		ProjectScan:   req.ProjectScan,
 		OutputPath:    paths.OutputPath,
-		ExcludedPaths: LoadAgentExcludePaths(c.projectRoot),
+		ExcludedPaths: DefaultProjectScanExcludes(),
 		ValidationRules: []string{
 			"domains must be non-empty",
 			"nodes must be non-empty",

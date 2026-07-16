@@ -26,9 +26,7 @@ func TestGenerateSystemInstructionsIncludesBuildSpecAndCoordinationRules(t *test
 		"do not inspect project files, run implementation tools, or modify files until the orchestrator sends a `task_dispatch` message",
 		"## Build Spec",
 		"build spec body",
-		"## Excluded Paths",
-		"`.aion/`",
-		"Project-specific exclusions may also be listed in `.aionignore`",
+		"isolated view containing only your domain's writable ownership mounts",
 		"The loaded orchestrator-cli skill is authoritative for commands and workflow.",
 		"Execute only dispatched nodes assigned to this agent",
 		"Use stub contracts or orchestrator messages for cross-domain work",
@@ -57,7 +55,6 @@ func TestGenerateCoordinatorPlanningInstructionUsesArtifactOnly(t *testing.T) {
 		"complete, parseable JSON",
 		"prefer 3-8 domains and 1-3 nodes per domain",
 		"Use the `excluded_paths` array",
-		"Do not inspect `.aionignore`",
 		"The build spec is inside the planning input artifact",
 	} {
 		if !strings.Contains(prompt, want) {
@@ -67,7 +64,6 @@ func TestGenerateCoordinatorPlanningInstructionUsesArtifactOnly(t *testing.T) {
 	for _, forbidden := range []string{
 		"FULL BUILD SPEC SHOULD NOT BE INLINE",
 		"BUILD SPEC\n",
-		"paths listed in `.aionignore`",
 	} {
 		if strings.Contains(prompt, forbidden) {
 			t.Fatalf("prompt should not contain %q:\n%s", forbidden, prompt)

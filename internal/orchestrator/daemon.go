@@ -68,9 +68,6 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 		return nil, fmt.Errorf("daemon: load run state: %w", err)
 	}
 	config.Agents.SessionDir = runState.PiSessionsDir
-	if err := coordinator.EnsureAgentIgnoreFile(projectRoot); err != nil {
-		return nil, fmt.Errorf("daemon: ensure agent ignore file: %w", err)
-	}
 
 	// Initialize DAG Manager
 	dagMgr, err := dag.NewManager(dag.ManagerConfig{

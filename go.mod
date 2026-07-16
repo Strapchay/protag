@@ -3,6 +3,7 @@ module aion-kernel
 go 1.25.7
 
 require (
+	aion-isolation v0.0.0
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
@@ -10,6 +11,8 @@ require (
 	github.com/philippgille/chromem-go v0.7.0
 	gopkg.in/yaml.v3 v3.0.1
 )
+
+replace aion-isolation => ../isolation
 
 require (
 	github.com/atotto/clipboard v0.1.4 // indirect

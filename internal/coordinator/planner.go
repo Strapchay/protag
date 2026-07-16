@@ -155,7 +155,6 @@ func ValidatePlanResponse(plan *PlanResponse) error {
 	}
 
 	domainIDs := make(map[string]struct{}, len(plan.Domains))
-	fallbackPathCount := 0
 	for _, domain := range plan.Domains {
 		id := strings.TrimSpace(domain.DomainID)
 		if id == "" {
@@ -169,18 +168,14 @@ func ValidatePlanResponse(plan *PlanResponse) error {
 		}
 		domainIDs[id] = struct{}{}
 		for _, path := range domain.AssignedPaths {
-			if IsAgentExcludedPath(path, DefaultAgentExcludePaths()) {
+			if IsProjectScanExcluded(path, DefaultProjectScanExcludes()) {
 				return fmt.Errorf("coordinator: domain %q assigned excluded path %q", id, path)
 			}
 			if strings.TrimSpace(path) == "." {
-				fallbackPathCount++
+				return fmt.Errorf("coordinator: domain %q cannot own the project root", id)
 			}
 		}
 	}
-	if fallbackPathCount > 1 {
-		return fmt.Errorf("coordinator: broad fallback path '.' cannot be assigned to multiple domains")
-	}
-
 	nodeIDs := make(map[string]struct{}, len(plan.Nodes))
 	for _, node := range plan.Nodes {
 		id := strings.TrimSpace(node.ID)
@@ -197,7 +192,7 @@ func ValidatePlanResponse(plan *PlanResponse) error {
 			return fmt.Errorf("coordinator: node %q references unknown domain %q", id, node.DomainID)
 		}
 		for _, path := range node.TargetFiles {
-			if IsAgentExcludedPath(path, DefaultAgentExcludePaths()) {
+			if IsProjectScanExcluded(path, DefaultProjectScanExcludes()) {
 				return fmt.Errorf("coordinator: node %q targets excluded path %q", id, path)
 			}
 		}

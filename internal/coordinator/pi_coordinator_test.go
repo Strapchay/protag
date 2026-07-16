@@ -91,8 +91,8 @@ func TestPiCoordinator_PreparePlanningArtifacts(t *testing.T) {
 	if input.AttemptHint != "buildspec-test-1" || input.BuildSpec != "Build the app" || input.OutputPath != paths.OutputPath {
 		t.Fatalf("unexpected planning input: %#v", input)
 	}
-	if len(input.ExcludedPaths) == 0 || !IsAgentExcludedPath(".aion/runs/current", input.ExcludedPaths) {
-		t.Fatalf("planning input should include resolved excluded paths: %#v", input.ExcludedPaths)
+	if len(input.ExcludedPaths) == 0 || !IsProjectScanExcluded(".aion/runs/current", input.ExcludedPaths) {
+		t.Fatalf("planning input should include generated scan exclusions: %#v", input.ExcludedPaths)
 	}
 }
 

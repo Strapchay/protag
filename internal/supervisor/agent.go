@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	isolation "aion-isolation"
 	"aion-kernel/internal/hub"
 )
 
@@ -59,6 +60,12 @@ type AgentConfig struct {
 	InitialPrompt string
 	// PiAgentConfig configures the Pi Agent subprocess.
 	PiAgent PiAgentConfig
+	// IsolationEngine and IsolationPolicy are set for domain agents. The
+	// supervisor owns the prepared workspace and recreates it on every spawn.
+	IsolationEngine            isolation.Engine
+	IsolationPolicy            isolation.Policy
+	IsolationGeneration        uint64
+	PersistIsolationGeneration func(uint64) error
 	// CgroupConfig configures resource limits.
 	Cgroup CgroupConfig
 	// HealthConfig
@@ -88,6 +95,17 @@ type AgentSupervisor struct {
 	lastThinking     string
 	lastText         string
 	isThinking       bool
+	workspace        isolation.Workspace
+	workspaceGen     uint64
+}
+
+type AgentRuntimeSnapshot struct {
+	AgentID             string              `json:"agent_id"`
+	DomainID            string              `json:"domain_id"`
+	State               string              `json:"state"`
+	PID                 int                 `json:"pid,omitempty"`
+	WorkspaceGeneration uint64              `json:"workspace_generation,omitempty"`
+	Workspace           *isolation.Snapshot `json:"workspace,omitempty"`
 }
 
 // NewAgentSupervisor creates a new agent supervisor.
@@ -108,10 +126,11 @@ func NewAgentSupervisor(config AgentConfig) *AgentSupervisor {
 		config.ExternalActivityMax = 15 * time.Minute
 	}
 	return &AgentSupervisor{
-		config:      config,
-		state:       StateStarting,
-		contextCh:   make(chan hub.Message, 64),
-		recentTools: make([]string, 0, 10),
+		config:       config,
+		state:        StateStarting,
+		contextCh:    make(chan hub.Message, 64),
+		recentTools:  make([]string, 0, 10),
+		workspaceGen: config.IsolationGeneration,
 	}
 }
 
@@ -213,17 +232,47 @@ func (s *AgentSupervisor) spawnAgent(ctx context.Context) error {
 	s.state = StateStarting
 	s.mu.Unlock()
 
+	piConfig := s.config.PiAgent
+	var workspace isolation.Workspace
+	if s.config.IsolationEngine != nil {
+		s.mu.Lock()
+		s.workspaceGen++
+		generation := s.workspaceGen
+		s.mu.Unlock()
+		policy := s.config.IsolationPolicy
+		policy.Generation = generation
+		prepared, err := s.config.IsolationEngine.Prepare(ctx, policy)
+		if err != nil {
+			return fmt.Errorf("prepare isolated workspace generation %d: %w", generation, err)
+		}
+		if s.config.PersistIsolationGeneration != nil {
+			if err := s.config.PersistIsolationGeneration(generation); err != nil {
+				_ = prepared.Close()
+				return fmt.Errorf("persist isolated workspace generation %d: %w", generation, err)
+			}
+		}
+		workspace = prepared
+		piConfig.Workspace = prepared
+	}
+	cleanupWorkspace := func() {
+		if workspace != nil {
+			_ = workspace.Close()
+		}
+	}
+
 	// Create cgroup
 	if err := CreateCgroup(s.config.Cgroup); err != nil {
 		if s.config.Cgroup.Strict() {
+			cleanupWorkspace()
 			return err
 		}
 		log.Printf("supervisor: cgroup creation failed for %s: %v", s.config.AgentID, err)
 	}
 
 	// Spawn Pi Agent
-	piAgent, err := SpawnPiAgent(s.config.PiAgent)
+	piAgent, err := SpawnPiAgent(ctx, piConfig)
 	if err != nil {
+		cleanupWorkspace()
 		return fmt.Errorf("spawn pi agent: %w", err)
 	}
 	// Any later crash respawn should reopen the session created by this process.
@@ -234,6 +283,7 @@ func (s *AgentSupervisor) spawnAgent(ctx context.Context) error {
 		if err := AssignProcessWithConfig(s.config.Cgroup, piAgent.PID()); err != nil {
 			if s.config.Cgroup.Strict() {
 				piAgent.Kill()
+				cleanupWorkspace()
 				return err
 			}
 			log.Printf("supervisor: cgroup assign failed for %s: %v", s.config.AgentID, err)
@@ -256,6 +306,7 @@ func (s *AgentSupervisor) spawnAgent(ctx context.Context) error {
 	s.mu.Lock()
 	s.piAgent = piAgent
 	s.healthMonitor = hm
+	s.workspace = workspace
 	s.state = StateRunning
 	s.mu.Unlock()
 
@@ -271,6 +322,12 @@ func (s *AgentSupervisor) spawnAgent(ctx context.Context) error {
 	// Send initial prompt
 	if s.config.InitialPrompt != "" {
 		if err := s.SendPrompt(s.config.InitialPrompt); err != nil {
+			hm.Stop()
+			_ = piAgent.Kill()
+			cleanupWorkspace()
+			s.mu.Lock()
+			s.workspace = nil
+			s.mu.Unlock()
 			return fmt.Errorf("send initial prompt: %w", err)
 		}
 	}
@@ -299,11 +356,9 @@ func (s *AgentSupervisor) Stop() error {
 	s.state = StateStopped
 	piAgent := s.piAgent
 	hm := s.healthMonitor
+	workspace := s.workspace
+	s.workspace = nil
 	s.mu.Unlock()
-
-	if s.cancel != nil {
-		s.cancel()
-	}
 
 	if hm != nil {
 		hm.Stop()
@@ -322,6 +377,12 @@ func (s *AgentSupervisor) Stop() error {
 			// Force kill
 			piAgent.Kill()
 		}
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if workspace != nil {
+		_ = workspace.Close()
 	}
 
 	// Clean up cgroup
@@ -414,6 +475,25 @@ func (s *AgentSupervisor) AgentID() string {
 // DomainID returns the agent's domain.
 func (s *AgentSupervisor) DomainID() string {
 	return s.config.DomainID
+}
+
+func (s *AgentSupervisor) RuntimeSnapshot() AgentRuntimeSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snapshot := AgentRuntimeSnapshot{
+		AgentID:             s.config.AgentID,
+		DomainID:            s.config.DomainID,
+		State:               s.state.String(),
+		WorkspaceGeneration: s.workspaceGen,
+	}
+	if s.piAgent != nil && s.piAgent.IsAlive() {
+		snapshot.PID = s.piAgent.PID()
+	}
+	if s.workspace != nil {
+		workspace := s.workspace.Snapshot()
+		snapshot.Workspace = &workspace
+	}
+	return snapshot
 }
 
 func (s *AgentSupervisor) eventListener(ctx context.Context) {
@@ -559,13 +639,13 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 
 func (s *AgentSupervisor) detectLooping(event PiAgentEvent) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	var tool struct {
 		Name  string `json:"name"`
 		Input string `json:"input,omitempty"`
 	}
 	if err := json.Unmarshal(event.Data, &tool); err != nil {
+		s.mu.Unlock()
 		return
 	}
 
@@ -585,12 +665,15 @@ func (s *AgentSupervisor) detectLooping(event PiAgentEvent) {
 			}
 		}
 		if allSame {
+			s.recentTools = s.recentTools[:0]
+			s.mu.Unlock()
 			log.Printf("supervisor: LOOP DETECTED for agent %s on tool %s. Injecting steer.", s.config.AgentID, tool.Name)
 			s.emitStatus(fmt.Sprintf("[%s] Loop detected on tool '%s' — injecting steer", s.config.AgentID, tool.Name), "warn")
 			s.SendSteer(fmt.Sprintf("You have failed this action 7 times in a row. Stop looping. Summarize your hypothesis and try a completely different approach. Do not repeat: %s", tool.Name))
-			s.recentTools = s.recentTools[:0] // reset sliding window
+			return
 		}
 	}
+	s.mu.Unlock()
 }
 
 func (s *AgentSupervisor) handleNetworkFault(event PiAgentEvent) {
@@ -769,9 +852,10 @@ func (s *AgentSupervisor) crashDetector(ctx context.Context) {
 	case <-piAgent.Done():
 		s.mu.Lock()
 		state := s.state
+		current := s.piAgent
 		s.mu.Unlock()
 
-		if state == StateStopped {
+		if state == StateStopped || current != piAgent {
 			return // expected shutdown
 		}
 
@@ -781,7 +865,7 @@ func (s *AgentSupervisor) crashDetector(ctx context.Context) {
 
 func (s *AgentSupervisor) handleCrash(reason string) {
 	s.mu.Lock()
-	if s.state == StateStopped {
+	if s.state == StateStopped || s.state == StateCrashed {
 		s.mu.Unlock()
 		return
 	}
@@ -790,6 +874,8 @@ func (s *AgentSupervisor) handleCrash(reason string) {
 	count := s.crashCount
 	maxRestarts := s.config.MaxCrashRestarts
 	piAgent := s.piAgent
+	workspace := s.workspace
+	s.workspace = nil
 	s.mu.Unlock()
 
 	log.Printf("supervisor: agent %s crashed (reason: %s, crashes: %d/%d)", s.config.AgentID, reason, count, maxRestarts)
@@ -799,6 +885,9 @@ func (s *AgentSupervisor) handleCrash(reason string) {
 	// Kill process group if still running
 	if piAgent != nil {
 		piAgent.Kill()
+	}
+	if workspace != nil {
+		_ = workspace.Close()
 	}
 
 	// Cancel old context to stop old goroutines

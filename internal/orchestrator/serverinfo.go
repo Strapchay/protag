@@ -42,4 +42,3 @@ func deleteServerInfo(projectRoot string) error {
 	}
 	return os.Remove(filepath.Join(projectRoot, ".aion", "server.json"))
 }
-

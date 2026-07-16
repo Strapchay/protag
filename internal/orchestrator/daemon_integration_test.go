@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"aion-isolation/isolationtest"
 	"aion-kernel/internal/coordinator"
 	"aion-kernel/internal/dag"
 	"aion-kernel/internal/orchestrator"
@@ -111,38 +112,45 @@ done
 
 	// Mock a multi-node DAG (Node-A -> Node-B)
 	err = daemon.DagManager().AddNode(dag.DagNode{
-		ID:            "Node-A",
-		DomainID:      "test",
-		TaskSpec:      "Do part A",
-		Priority:      1,
-		Status:        dag.StatusPending,
+		ID:       "Node-A",
+		DomainID: "test",
+		TaskSpec: "Do part A",
+		Priority: 1,
+		Status:   dag.StatusPending,
 	})
-	if err != nil { t.Fatalf("AddNode: %v", err) }
+	if err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
 
 	err = daemon.DagManager().AddNode(dag.DagNode{
-		ID:            "Node-B",
-		DomainID:      "test",
-		TaskSpec:      "Do part B",
-		Priority:      2,
-		Status:        dag.StatusPending,
+		ID:       "Node-B",
+		DomainID: "test",
+		TaskSpec: "Do part B",
+		Priority: 2,
+		Status:   dag.StatusPending,
 	})
-	if err != nil { t.Fatalf("AddNode: %v", err) }
+	if err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
 
 	err = daemon.DagManager().AddEdge(dag.DagEdge{
 		FromNode: "Node-A",
 		ToNode:   "Node-B",
 		Type:     dag.EdgeDependency,
 	})
-	if err != nil { t.Fatalf("AddEdge: %v", err) }
+	if err != nil {
+		t.Fatalf("AddEdge: %v", err)
+	}
 
 	// Start Allocator to trigger dispatch loop
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	
+
 	// Create prompt
 	prompts := map[string]string{"test": "System instruction"}
+	daemon.Allocator().SetIsolationEngine(&isolationtest.FakeEngine{})
 	// Allocate will spawn agent-test
-	if err := daemon.Allocator().Allocate(ctx, []coordinator.Domain{{DomainID: "test"}}, prompts); err != nil {
+	if err := daemon.Allocator().Allocate(ctx, []coordinator.Domain{{DomainID: "test", AssignedPaths: []string{"src"}}}, prompts); err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
 
@@ -152,7 +160,9 @@ done
 
 	// Simulate successful StatusDone emission of Node-A
 	err = daemon.DagManager().UpdateNode("Node-A", dag.StatusDone)
-	if err != nil { t.Fatalf("UpdateNode A: %v", err) }
+	if err != nil {
+		t.Fatalf("UpdateNode A: %v", err)
+	}
 
 	// Wait for Dispatcher to assign Node-B to the agent
 	time.Sleep(1 * time.Second)
@@ -169,4 +179,3 @@ done
 		t.Errorf("Agent did not receive task dispatch for Node-B. Got: %s", receivedData)
 	}
 }
-

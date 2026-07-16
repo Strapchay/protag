@@ -2,7 +2,6 @@ package orchestrator
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"log"
 	"os"
@@ -12,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	isolation "aion-isolation"
 	"aion-kernel/internal/coordinator"
 	"aion-kernel/internal/dag"
 	"aion-kernel/internal/hub"
@@ -20,18 +20,20 @@ import (
 
 // Allocator manages the spinning up and termination of domain agents.
 type Allocator struct {
-	config        *Config
-	projectRoot   string
-	hubRouter     *hub.Router
-	dagManager    *dag.Manager
-	activeAgents  map[string]*supervisor.AgentSupervisor
-	mu            sync.Mutex
-	statusFn      func(text, level string) // optional: broadcasts to TUI status bar
-	agentStatusFn func(agentID, text, level string)
-	agentStateFn  func(agentID, domainID, state, reason string)
-	lifecycleFn   func(agentID, domainID string, event supervisor.AgentLifecycleEvent)
-	broadcastFn   func(hub.Message)
-	capabilityFn  func(agentID string) (string, error)
+	config          *Config
+	projectRoot     string
+	hubRouter       *hub.Router
+	dagManager      *dag.Manager
+	activeAgents    map[string]*supervisor.AgentSupervisor
+	mu              sync.Mutex
+	statusFn        func(text, level string) // optional: broadcasts to TUI status bar
+	agentStatusFn   func(agentID, text, level string)
+	agentStateFn    func(agentID, domainID, state, reason string)
+	lifecycleFn     func(agentID, domainID string, event supervisor.AgentLifecycleEvent)
+	broadcastFn     func(hub.Message)
+	capabilityFn    func(agentID string) (string, error)
+	isolationEngine isolation.Engine
+	isolationErr    error
 }
 
 type AllocationMode string
@@ -48,12 +50,15 @@ type AllocationOptions struct {
 
 // NewAllocator creates a new allocator.
 func NewAllocator(config *Config, projectRoot string, hubRouter *hub.Router, dagManager *dag.Manager) *Allocator {
+	engine, isolationErr := newDomainIsolationEngine(config)
 	return &Allocator{
-		config:       config,
-		projectRoot:  projectRoot,
-		hubRouter:    hubRouter,
-		dagManager:   dagManager,
-		activeAgents: make(map[string]*supervisor.AgentSupervisor),
+		config:          config,
+		projectRoot:     projectRoot,
+		hubRouter:       hubRouter,
+		dagManager:      dagManager,
+		activeAgents:    make(map[string]*supervisor.AgentSupervisor),
+		isolationEngine: engine,
+		isolationErr:    isolationErr,
 	}
 }
 
@@ -140,9 +145,17 @@ func (a *Allocator) AllocateWithOptions(ctx context.Context, domains []coordinat
 		if err := os.WriteFile(agentsMDPath, []byte(prompt), 0644); err != nil {
 			return fmt.Errorf("allocator: write AGENTS.md for %s: %w", agentID, err)
 		}
-		agentWorkDir, err := a.prepareAgentWorkDir(agentID, domain, prompt)
+		isolatedRuntime, err := a.prepareIsolatedAgentRuntime(agentID, domain, agentDir)
 		if err != nil {
 			return err
+		}
+		generationPath, err := isolationGenerationStorePath(agentBaseDir, agentID)
+		if err != nil {
+			return err
+		}
+		isolationGeneration, err := loadIsolationGeneration(generationPath)
+		if err != nil {
+			return fmt.Errorf("allocator: load isolation generation for %s: %w", agentID, err)
 		}
 
 		// Resolve model profile
@@ -154,7 +167,7 @@ func (a *Allocator) AllocateWithOptions(ctx context.Context, domains []coordinat
 			fmt.Sprintf("AION_ORCHESTRATOR_ADDR=%s", a.config.Orchestrator.ListenAddr),
 			fmt.Sprintf("AION_AGENT_ID=%s", agentID),
 			fmt.Sprintf("AION_DOMAIN_ID=%s", domain.DomainID),
-			fmt.Sprintf("AION_AGENT_SESSION_DIR=%s", agentDir),
+			fmt.Sprintf("AION_AGENT_SESSION_DIR=%s", agentSandboxSessionDir),
 		}
 		if a.capabilityFn != nil {
 			capability, err := a.capabilityFn(agentID)
@@ -220,20 +233,27 @@ func (a *Allocator) AllocateWithOptions(ctx context.Context, domains []coordinat
 		}
 
 		agentConfig := supervisor.AgentConfig{
-			AgentID:       agentID,
-			DomainID:      domain.DomainID,
-			AssignedPaths: domain.AssignedPaths,
-			InitialPrompt: initialPrompt,
+			AgentID:             agentID,
+			DomainID:            domain.DomainID,
+			AssignedPaths:       domain.AssignedPaths,
+			InitialPrompt:       initialPrompt,
+			IsolationEngine:     a.isolationEngine,
+			IsolationPolicy:     isolatedRuntime.policy,
+			IsolationGeneration: isolationGeneration,
+			PersistIsolationGeneration: func(generation uint64) error {
+				return saveIsolationGeneration(generationPath, generation)
+			},
 			PiAgent: supervisor.PiAgentConfig{
-				Binary:         a.config.Agents.CommandPath,
-				SessionDir:     agentDir,
+				Binary:         isolatedRuntime.binary,
+				SessionDir:     agentSandboxSessionDir,
+				HostSessionDir: agentDir,
 				ResumeSession:  resumeAgent,
-				WorkingDir:     agentWorkDir,
+				WorkingDir:     agentSandboxRoot,
 				Provider:       provider,
 				Model:          model,
 				Endpoint:       endpoint,
-				SkillPaths:     a.config.Agents.SkillPaths,
-				ExtensionPaths: a.config.Agents.ExtensionPaths,
+				SkillPaths:     isolatedRuntime.skillPaths,
+				ExtensionPaths: isolatedRuntime.extensionPaths,
 				Env:            envVars,
 			},
 			Cgroup: supervisor.CgroupConfig{
@@ -311,7 +331,7 @@ func defaultDomainAgentResumeMessage(agentID, domainID string) string {
 Agent: %s
 Domain: %s
 
-	Your current working directory is a filtered source workspace for your domain. Treat it as the project source view; do not cd outside it or inspect parent/runtime directories.
+	Your current working directory is the isolated writable view for your domain. Paths outside your owned mounts are not present.
 	Continue from your persisted Pi session context. Do not restart from the original system prompt.
 	Use the loaded orchestrator-cli skill for coordination commands and workflow.
 	Continue only the pending work assigned to your domain.`, agentID, domainID)
@@ -345,113 +365,13 @@ func mapAgentLifecycleState(event supervisor.AgentLifecycleEvent) (string, strin
 	}
 }
 
-func (a *Allocator) prepareAgentWorkDir(agentID string, domain coordinator.Domain, prompt string) (string, error) {
-	rootHash := fmt.Sprintf("%x", sha256.Sum256([]byte(a.projectRoot)))[:12]
-	workDir := filepath.Join(os.TempDir(), "aion-kernel-agent-workspaces", rootHash, agentID)
-	workDirAbs, err := filepath.Abs(workDir)
-	if err != nil {
-		return "", fmt.Errorf("allocator: resolve filtered workdir for %s: %w", agentID, err)
-	}
-	if err := os.RemoveAll(workDir); err != nil {
-		return "", fmt.Errorf("allocator: reset filtered workdir for %s: %w", agentID, err)
-	}
-	if err := os.MkdirAll(workDir, 0o755); err != nil {
-		return "", fmt.Errorf("allocator: create filtered workdir for %s: %w", agentID, err)
-	}
-	if err := os.WriteFile(filepath.Join(workDir, "AGENTS.md"), []byte(prompt), 0o644); err != nil {
-		return "", fmt.Errorf("allocator: write filtered AGENTS.md for %s: %w", agentID, err)
-	}
-
-	excludes := coordinator.LoadAgentExcludePaths(a.projectRoot)
-	for _, assignedPath := range domain.AssignedPaths {
-		if err := linkAssignedPath(a.projectRoot, workDirAbs, assignedPath, excludes); err != nil {
-			return "", fmt.Errorf("allocator: prepare filtered workdir for %s: %w", agentID, err)
-		}
-	}
-	return workDirAbs, nil
-}
-
-func linkAssignedPath(projectRoot, workDir, assignedPath string, excludes []string) error {
-	rawPath := strings.Trim(strings.TrimSpace(assignedPath), "`\"'")
-	if filepath.IsAbs(rawPath) {
-		return fmt.Errorf("assigned path %q must be relative", assignedPath)
-	}
-	rel := normalizeWorkspaceRelPath(assignedPath)
-	if rel == "" {
-		return nil
-	}
-	if coordinator.IsAgentExcludedPath(rel, excludes) {
-		return fmt.Errorf("assigned path %q is excluded", assignedPath)
-	}
-	projectRootAbs, err := filepath.Abs(projectRoot)
-	if err != nil {
-		return err
-	}
-	target := filepath.Join(projectRootAbs, rel)
-	targetRel, err := filepath.Rel(projectRootAbs, target)
-	if err != nil {
-		return err
-	}
-	if targetRel == ".." || strings.HasPrefix(targetRel, ".."+string(os.PathSeparator)) {
-		return fmt.Errorf("assigned path %q escapes project root", assignedPath)
-	}
-
-	linkPath := filepath.Join(workDir, rel)
-	linkRel, err := filepath.Rel(workDir, linkPath)
-	if err != nil {
-		return err
-	}
-	if linkRel == ".." || strings.HasPrefix(linkRel, ".."+string(os.PathSeparator)) {
-		return fmt.Errorf("assigned path %q escapes filtered workdir", assignedPath)
-	}
-
-	if err := os.MkdirAll(filepath.Dir(linkPath), 0o755); err != nil {
-		return err
-	}
-	if _, err := os.Lstat(linkPath); err == nil {
-		if err := os.Remove(linkPath); err != nil {
-			return err
-		}
-	} else if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-
-	if _, err := os.Stat(target); err == nil {
-		return os.Symlink(target, linkPath)
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-
-	if looksLikeFilePath(rel) {
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return err
-		}
-	} else if err := os.MkdirAll(target, 0o755); err != nil {
-		return err
-	}
-	return os.Symlink(target, linkPath)
-}
-
-func normalizeWorkspaceRelPath(path string) string {
-	path = strings.TrimSpace(path)
-	path = strings.Trim(path, "`\"'")
-	path = filepath.ToSlash(filepath.Clean(path))
-	path = strings.TrimPrefix(path, "./")
-	if path == "." || path == "/" || path == "" {
-		return ""
-	}
-	return strings.TrimPrefix(path, "/")
-}
-
-func looksLikeFilePath(path string) bool {
-	base := filepath.Base(path)
-	return strings.Contains(base, ".")
-}
-
 type AgentInfo struct {
-	AgentID  string `json:"agent_id"`
-	DomainID string `json:"domain_id"`
-	State    string `json:"state"`
+	AgentID             string              `json:"agent_id"`
+	DomainID            string              `json:"domain_id"`
+	State               string              `json:"state"`
+	PID                 int                 `json:"pid,omitempty"`
+	WorkspaceGeneration uint64              `json:"workspace_generation,omitempty"`
+	Workspace           *isolation.Snapshot `json:"workspace,omitempty"`
 }
 
 func (a *Allocator) AgentInfos() []AgentInfo {
@@ -460,10 +380,14 @@ func (a *Allocator) AgentInfos() []AgentInfo {
 
 	infos := make([]AgentInfo, 0, len(a.activeAgents))
 	for agentID, agent := range a.activeAgents {
+		runtime := agent.RuntimeSnapshot()
 		infos = append(infos, AgentInfo{
-			AgentID:  agentID,
-			DomainID: agent.DomainID(),
-			State:    agent.State().String(),
+			AgentID:             agentID,
+			DomainID:            agent.DomainID(),
+			State:               runtime.State,
+			PID:                 runtime.PID,
+			WorkspaceGeneration: runtime.WorkspaceGeneration,
+			Workspace:           runtime.Workspace,
 		})
 	}
 	sort.Slice(infos, func(i, j int) bool {
@@ -616,8 +540,7 @@ func (a *Allocator) dispatchReadyTasks() {
 		}
 		b.WriteString("\nExecute this task, then mark it Done using:\n")
 		b.WriteString("the update flow defined in your loaded skills.\n")
-		b.WriteString("\nYour current working directory is a filtered source workspace for your assigned domain. Treat it as the project source view; do not cd outside it or inspect parent/runtime directories.\n")
-		b.WriteString("Do not read, search, or modify excluded runtime/generated paths such as `.aion/`, `.git/`, `.agents/`, `.codex/`, dependency caches, build outputs, or paths listed in `.aionignore`.\n")
+		b.WriteString("\nYour current working directory contains only your isolated writable domain mounts. Use contracts and orchestrator messages for cross-domain requirements.\n")
 
 		msg, err := hub.NewMessage(hub.MessageType("task_dispatch"), "orchestrator", agentID, b.String())
 		if err != nil {

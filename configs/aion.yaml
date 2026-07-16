@@ -57,6 +57,14 @@ inference_gateway:
   # Total seconds an admitted upstream request may hold gateway capacity
   upstream_timeout_sec: ${AION_INFERENCE_GATEWAY_UPSTREAM_TIMEOUT_SEC}
 
+isolation:
+  # Mandatory domain-agent sandbox backend; no production passthrough exists
+  backend: "${AION_ISOLATION_BACKEND}"
+  # Host directory for ephemeral per-generation workspace metadata
+  runtime_base: "${AION_ISOLATION_RUNTIME_BASE}"
+  # "shared" reaches the local gateway; "isolated" disables networking
+  network: "${AION_ISOLATION_NETWORK}"
+
 cgroups:
   # Enable cgroup resource limits (requires Linux + permissions)
   enabled: ${AION_CGROUPS_ENABLED}

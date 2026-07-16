@@ -17,9 +17,18 @@ type Config struct {
 	Health           HealthConfig           `yaml:"health"`
 	Execution        ExecutionConfig        `yaml:"execution"`
 	InferenceGateway InferenceGatewayConfig `yaml:"inference_gateway"`
+	Isolation        IsolationConfig        `yaml:"isolation"`
 	Cgroups          CgroupsConfig          `yaml:"cgroups"`
 	Inference        InferenceConfig        `yaml:"inference"`
 	Memory           MemoryConfig           `yaml:"memory"`
+}
+
+// IsolationConfig configures the mandatory domain-agent process boundary.
+// There is intentionally no disabled or passthrough production mode.
+type IsolationConfig struct {
+	Backend     string `yaml:"backend"`
+	RuntimeBase string `yaml:"runtime_base"`
+	Network     string `yaml:"network"`
 }
 
 // MemoryConfig configures the semantic memory store.
@@ -218,6 +227,11 @@ inference_gateway:
   retry_max_delay_ms: ${AION_INFERENCE_GATEWAY_RETRY_MAX_DELAY_MS}
   upstream_timeout_sec: ${AION_INFERENCE_GATEWAY_UPSTREAM_TIMEOUT_SEC}
 
+isolation:
+  backend: "${AION_ISOLATION_BACKEND}"
+  runtime_base: "${AION_ISOLATION_RUNTIME_BASE}"
+  network: "${AION_ISOLATION_NETWORK}"
+
 cgroups:
   enabled: true
   mode: "${AION_CGROUPS_MODE}"
@@ -373,6 +387,15 @@ func applyDefaults(c *Config) {
 	if c.InferenceGateway.UpstreamTimeoutSec == 0 {
 		c.InferenceGateway.UpstreamTimeoutSec = 300
 	}
+	if strings.TrimSpace(c.Isolation.Backend) == "" {
+		c.Isolation.Backend = "bubblewrap"
+	}
+	if strings.TrimSpace(c.Isolation.RuntimeBase) == "" {
+		c.Isolation.RuntimeBase = filepath.Join(os.TempDir(), "aion-isolation")
+	}
+	if strings.TrimSpace(c.Isolation.Network) == "" {
+		c.Isolation.Network = "shared"
+	}
 	if c.Cgroups.MemoryMaxMB == 0 {
 		c.Cgroups.MemoryMaxMB = 2048
 	}
@@ -465,6 +488,14 @@ func validateConfig(c *Config) error {
 	}
 	if c.InferenceGateway.UpstreamTimeoutSec < 1 {
 		return fmt.Errorf("inference_gateway.upstream_timeout_sec must be >= 1")
+	}
+	if strings.ToLower(strings.TrimSpace(c.Isolation.Backend)) != "bubblewrap" {
+		return fmt.Errorf("invalid isolation.backend %q; domain isolation requires bubblewrap", c.Isolation.Backend)
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Isolation.Network)) {
+	case "shared", "isolated":
+	default:
+		return fmt.Errorf("invalid isolation.network %q", c.Isolation.Network)
 	}
 	switch strings.ToLower(strings.TrimSpace(c.Cgroups.Mode)) {
 	case "", "direct", "systemd", "disabled":

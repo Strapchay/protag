@@ -670,9 +670,8 @@ func buildSpecDomainAgentResumeMessage(attempt *BuildSpecAttempt) string {
 Build-spec attempt: %s
 
 The server was restarted or the agent set was explicitly continued. Keep your existing context and continue pending DAG work for your assigned domain.
-Your current working directory is a filtered source workspace for your assigned domain. Treat it as the project source view; do not cd outside it or inspect parent/runtime directories.
+Your current working directory is the isolated writable view for your assigned domain. Other domain and kernel runtime paths are not mounted.
 Do not re-run the original onboarding/system prompt. Use orchestrator-cli to read the DAG, acquire locks, update task status, create stubs, and coordinate through the context hub.
-Do not read, search, or modify excluded runtime/generated paths such as .aion/, .git/, .agents/, .codex/, dependency caches, build outputs, or paths listed in .aionignore.
 If you are unsure what is pending, inspect the DAG first and continue only work assigned to you.`, attemptID))
 }
 

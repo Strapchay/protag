@@ -36,7 +36,7 @@ func buildDomainPrompt(domain Domain, projectContext, buildSpec string) string {
 	b.WriteString("## Mission\n")
 	b.WriteString("Prepare to implement only work dispatched to your domain. Keep all later changes inside the assigned paths and the dispatched node/task scope.\n")
 	b.WriteString("This bootstrap turn is orientation-only: do not inspect project files, run implementation tools, or modify files until the orchestrator sends a `task_dispatch` message. Acknowledge readiness briefly, then wait.\n\n")
-	b.WriteString("Your current working directory is a filtered source workspace for your assigned domain. Treat it as the project source view; do not cd outside it or inspect parent/runtime directories.\n\n")
+	b.WriteString("Your current working directory is an isolated view containing only your domain's writable ownership mounts. Other domains and kernel runtime state are absent.\n\n")
 
 	if strings.TrimSpace(buildSpec) != "" {
 		b.WriteString("## Build Spec\n")
@@ -49,13 +49,6 @@ func buildDomainPrompt(domain Domain, projectContext, buildSpec string) string {
 		b.WriteString(fmt.Sprintf("- `%s`\n", p))
 	}
 	b.WriteString("\n")
-
-	b.WriteString("## Excluded Paths\n")
-	b.WriteString("Do not inspect, read, search, summarize, modify, or reason from these runtime/generated paths unless the orchestrator explicitly instructs you to debug Aion runtime state:\n")
-	for _, p := range DefaultAgentExcludePaths() {
-		b.WriteString(fmt.Sprintf("- `%s`\n", p))
-	}
-	b.WriteString("Project-specific exclusions may also be listed in `.aionignore`; obey them as part of your domain boundary.\n\n")
 
 	b.WriteString("## Coordination\n")
 	b.WriteString("The loaded orchestrator-cli skill is authoritative for commands and workflow.\n")
@@ -99,7 +92,7 @@ func GenerateArchitectInstruction(projectContext string) string {
 	b.WriteString("- DO NOT start building or modifying files yourself.\n")
 	b.WriteString("- When the spec is finalized, write it to `docs/build_spec.md` using your file-writing skills.\n")
 	b.WriteString("- If the `docs/` directory does not exist in the working directory, create it before writing `docs/build_spec.md`.\n")
-	b.WriteString("- Do not inspect, summarize, or modify `.aion/`, `.git/`, `.agents/`, `.codex/`, dependency caches, build outputs, or paths listed in `.aionignore`; these are runtime/generated areas, not project source.\n")
+	b.WriteString("- Treat generated/runtime directories as implementation noise unless they are directly relevant to the specification.\n")
 	b.WriteString("- Do not ask the user to create this file manually; creating the directory and file is part of your spec finalization responsibility.\n")
 	b.WriteString("- Once the file is written, tell the user they can initiate the engineering swarm by issuing the command: `/build-spec`.\n\n")
 
@@ -123,7 +116,7 @@ func GenerateCoordinatorInstruction(projectContext string) string {
 	b.WriteString("- Do not assume a fixed number of agents or tasks.\n")
 	b.WriteString("- Prefer explicit dependencies only when the work truly requires ordering.\n")
 	b.WriteString("- Output only JSON content that matches the plan_response schema.\n")
-	b.WriteString("- Do not assign runtime/generated paths such as `.aion/`, `.git/`, `.agents/`, `.codex/`, dependency caches, build outputs, or `.aionignore` entries to any domain or node.\n")
+	b.WriteString("- Do not assign paths listed in the planning artifact's `excluded_paths` to any domain or node.\n")
 	b.WriteString("- Keep the response structured and machine-readable.\n\n")
 
 	if projectContext != "" {
@@ -151,7 +144,7 @@ func GenerateCoordinatorPlanningInstruction(_ string, scan *ProjectScan, inputPa
 	b.WriteString("{\"type\":\"plan_response\",\"domains\":[{\"domain_id\":\"short-stable-domain-id\",\"description\":\"owned implementation area\",\"assigned_paths\":[\"relative/path\"],\"agent_type\":\"domain\"}],\"nodes\":[{\"id\":\"short-stable-task-id\",\"domain_id\":\"short-stable-domain-id\",\"task_spec\":\"specific implementation task\",\"target_files\":[\"relative/path/file.ext\"],\"priority\":1}],\"edges\":[]}\n\n")
 	b.WriteString("The artifact must contain real, non-empty `domains` and `nodes` arrays. Do not copy placeholder IDs or empty arrays.\n")
 	b.WriteString("Keep the initial plan coarse enough for reliable artifact writing: prefer 3-8 domains and 1-3 nodes per domain. Do not exceed 18 nodes unless the spec truly cannot be represented otherwise.\n")
-	b.WriteString("Use the `excluded_paths` array from the planning input artifact. Do not inspect `.aionignore`; the daemon already resolved it for you.\n")
+	b.WriteString("Use the `excluded_paths` array from the planning input artifact.\n")
 	b.WriteString("Do not run exploratory shell commands or inspect runtime/generated folders. Read the input artifact, plan from it, and write the output artifact.\n")
 	b.WriteString("The daemon will wait until the output becomes complete, parseable JSON and then validate its plan contract.\n")
 	b.WriteString("After writing the file, you may briefly state that the artifact was written.\n\n")

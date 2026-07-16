@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+
+	isolation "aion-isolation"
 )
 
 type readCloserWrapper struct {
@@ -27,6 +30,9 @@ type PiAgentConfig struct {
 	Model string
 	// SessionDir is the directory for Pi Agent session files.
 	SessionDir string
+	// HostSessionDir is where the supervisor writes diagnostic logs when the
+	// session is mounted at a different path inside an isolated workspace.
+	HostSessionDir string
 	// ResumeSession tells Pi to reopen the latest session in SessionDir.
 	ResumeSession bool
 	// WorkingDir is the project root directory.
@@ -46,6 +52,10 @@ type PiAgentConfig struct {
 	MockMode bool
 	// MockBinary is the path to the mock Pi Agent binary.
 	MockBinary string
+	// Workspace constructs the process command inside a prepared isolation
+	// generation. Nil is reserved for non-domain processes and unit tests that
+	// exercise Pi RPC directly.
+	Workspace isolation.Workspace
 }
 
 type PiAgentEvent struct {
@@ -221,7 +231,7 @@ type PiAgentProcess struct {
 }
 
 // SpawnPiAgent starts a new Pi Agent subprocess in RPC mode.
-func SpawnPiAgent(config PiAgentConfig) (*PiAgentProcess, error) {
+func SpawnPiAgent(ctx context.Context, config PiAgentConfig) (*PiAgentProcess, error) {
 	binary := config.Binary
 	if binary == "" {
 		binary = "pi"
@@ -258,15 +268,35 @@ func SpawnPiAgent(config PiAgentConfig) (*PiAgentProcess, error) {
 
 	// Setup raw logging for debugging
 	var logFile *os.File
-	if config.SessionDir != "" {
-		_ = os.MkdirAll(config.SessionDir, 0755)
-		logPath := filepath.Join(config.SessionDir, "pi_raw.log")
+	hostSessionDir := config.HostSessionDir
+	if hostSessionDir == "" {
+		hostSessionDir = config.SessionDir
+	}
+	if hostSessionDir != "" {
+		_ = os.MkdirAll(hostSessionDir, 0755)
+		logPath := filepath.Join(hostSessionDir, "pi_raw.log")
 		logFile, _ = os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	}
 
-	cmd := exec.Command(binary, args...)
-	cmd.Dir = config.WorkingDir
-	cmd.Env = append(os.Environ(), config.Env...)
+	var cmd *exec.Cmd
+	var err error
+	if config.Workspace != nil {
+		cmd, err = config.Workspace.Command(ctx, isolation.CommandSpec{
+			Path: binary,
+			Args: args,
+			Env:  environmentMap(config.Env),
+		})
+		if err != nil {
+			if logFile != nil {
+				_ = logFile.Close()
+			}
+			return nil, fmt.Errorf("piagent: construct isolated command: %w", err)
+		}
+	} else {
+		cmd = exec.Command(binary, args...)
+		cmd.Dir = config.WorkingDir
+		cmd.Env = append(os.Environ(), config.Env...)
+	}
 	if logFile != nil {
 		cmd.Stderr = logFile
 		_, _ = fmt.Fprintf(logFile, "[aion] pi launch gateway_enabled=%t gateway_url=%s target_provider=%s target_profile=%s target_model=%s pi_provider=%s extensions=%s\n",
@@ -303,6 +333,9 @@ func SpawnPiAgent(config PiAgentConfig) (*PiAgentProcess, error) {
 	}
 
 	if err := cmd.Start(); err != nil {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
 		return nil, fmt.Errorf("piagent: start: %w", err)
 	}
 
@@ -329,6 +362,18 @@ func SpawnPiAgent(config PiAgentConfig) (*PiAgentProcess, error) {
 	go p.waitForExit()
 
 	return p, nil
+}
+
+func environmentMap(entries []string) map[string]string {
+	environment := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		name, value, ok := strings.Cut(entry, "=")
+		if !ok || strings.TrimSpace(name) == "" {
+			continue
+		}
+		environment[name] = value
+	}
+	return environment
 }
 
 func envEnabled(env []string, key string) bool {

@@ -2,6 +2,7 @@
 
 # Binary output
 BIN_DIR := bin
+AION_KERNEL_BIN := $(BIN_DIR)/aion-kernel
 ORCHESTRATOR_BIN := $(BIN_DIR)/orchestrator
 CLI_BIN := $(BIN_DIR)/orchestrator-cli
 
@@ -17,7 +18,8 @@ build: build-orchestrator build-cli
 
 build-orchestrator:
 	@mkdir -p $(BIN_DIR)
-	go build $(GOFLAGS) -o $(ORCHESTRATOR_BIN) ./cmd/orchestrator/
+	go build $(GOFLAGS) -o $(AION_KERNEL_BIN) ./cmd/orchestrator/
+	cp $(AION_KERNEL_BIN) $(ORCHESTRATOR_BIN)
 
 build-cli:
 	@mkdir -p $(BIN_DIR)

@@ -98,7 +98,7 @@ func ScanProject(rootPath string) (*ProjectScan, error) {
 	scan := &ProjectScan{
 		RootPath: absRoot,
 	}
-	excludePaths := LoadAgentExcludePaths(absRoot)
+	excludePaths := DefaultProjectScanExcludes()
 
 	languageSet := make(map[string]bool)
 	moduleSet := make(map[string]bool)
@@ -117,7 +117,7 @@ func ScanProject(rootPath string) (*ProjectScan, error) {
 
 		// Skip hidden/build directories
 		if info.IsDir() {
-			if IsAgentExcludedPath(relPath, excludePaths) {
+			if IsProjectScanExcluded(relPath, excludePaths) {
 				return filepath.SkipDir
 			}
 			moduleSet[relPath] = true

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"aion-isolation/isolationtest"
 	"aion-kernel/internal/coordinator"
 	"aion-kernel/internal/hub"
 )
@@ -62,12 +63,13 @@ done
 	router := hub.NewRouter(filepath.Join(root, "logs"))
 	defer router.Close()
 	allocator := NewAllocator(config, root, router, nil)
+	allocator.SetIsolationEngine(&isolationtest.FakeEngine{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	defer allocator.StopAll()
 
 	err := allocator.AllocateWithOptions(ctx,
-		[]coordinator.Domain{{DomainID: "api"}},
+		[]coordinator.Domain{{DomainID: "api", AssignedPaths: []string{"api"}}},
 		map[string]string{"api": "FULL INITIAL PROMPT"},
 		AllocationOptions{Mode: AllocationModeResume, ResumeMessage: "resume existing work"},
 	)
@@ -157,6 +159,7 @@ done
 	router := hub.NewRouter(filepath.Join(root, "logs"))
 	defer router.Close()
 	allocator := NewAllocator(config, root, router, nil)
+	allocator.SetIsolationEngine(&isolationtest.FakeEngine{})
 	allocator.SetAgentCapabilityFunc(func(agentID string) (string, error) {
 		return "test-capability-" + agentID, nil
 	})
@@ -165,7 +168,7 @@ done
 	defer allocator.StopAll()
 
 	err := allocator.AllocateWithOptions(ctx,
-		[]coordinator.Domain{{DomainID: "api"}},
+		[]coordinator.Domain{{DomainID: "api", AssignedPaths: []string{"api"}}},
 		map[string]string{"api": "initial prompt"},
 		AllocationOptions{Mode: AllocationModeInitial},
 	)
@@ -190,95 +193,54 @@ done
 	}
 }
 
-func TestPrepareAgentWorkDirHidesRuntimePathsAndLinksAssignedPaths(t *testing.T) {
+func TestPrepareIsolatedAgentRuntimeOwnsOnlyAssignedPaths(t *testing.T) {
 	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, ".aion", "runs"), 0o755); err != nil {
-		t.Fatalf("mkdir runtime dir: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o755); err != nil {
-		t.Fatalf("mkdir git dir: %v", err)
-	}
-	sourceDir := filepath.Join(root, "oltp", "storage")
-	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
-		t.Fatalf("mkdir source dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(sourceDir, "page.py"), []byte("page = 1\n"), 0o644); err != nil {
-		t.Fatalf("write source file: %v", err)
-	}
-
 	router := hub.NewRouter(filepath.Join(root, "logs"))
 	defer router.Close()
-	allocator := NewAllocator(&Config{}, root, router, nil)
-	workDir, err := allocator.prepareAgentWorkDir("agent-storage", coordinator.Domain{
+	config := &Config{}
+	config.Agents.CommandPath = filepath.Join(root, "pi")
+	if err := os.WriteFile(config.Agents.CommandPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	allocator := NewAllocator(config, root, router, nil)
+	runtime, err := allocator.prepareIsolatedAgentRuntime("agent-storage", coordinator.Domain{
 		DomainID:      "storage",
 		AssignedPaths: []string{"oltp/storage"},
-	}, "domain prompt")
+	}, filepath.Join(root, ".aion", "sessions", "agent-storage"))
 	if err != nil {
-		t.Fatalf("prepareAgentWorkDir: %v", err)
+		t.Fatalf("prepareIsolatedAgentRuntime: %v", err)
 	}
-
-	entries, err := os.ReadDir(workDir)
-	if err != nil {
-		t.Fatalf("read filtered workdir: %v", err)
+	if runtime.policy.WorkingDir != agentSandboxRoot || runtime.policy.SourceRoot != root {
+		t.Fatalf("unexpected isolation policy roots: %#v", runtime.policy)
 	}
-	for _, entry := range entries {
-		switch entry.Name() {
-		case ".aion", ".git", ".agents", ".codex":
-			t.Fatalf("filtered workdir leaked runtime path %q", entry.Name())
-		}
+	if len(runtime.policy.Writable) != 2 {
+		t.Fatalf("expected owned path and state mount, got %#v", runtime.policy.Writable)
 	}
-	if _, err := os.Stat(filepath.Join(workDir, "AGENTS.md")); err != nil {
-		t.Fatalf("filtered AGENTS.md missing: %v", err)
+	if runtime.policy.Writable[0].Source != filepath.Join(root, "oltp", "storage") || runtime.policy.Writable[0].Target != "/workspace/oltp/storage" {
+		t.Fatalf("unexpected owned mount: %#v", runtime.policy.Writable[0])
 	}
-
-	linkPath := filepath.Join(workDir, "oltp", "storage")
-	info, err := os.Lstat(linkPath)
-	if err != nil {
-		t.Fatalf("assigned path link missing: %v", err)
-	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("assigned path is not a symlink: %s", linkPath)
-	}
-
-	written := filepath.Join(workDir, "oltp", "storage", "new_page.py")
-	if err := os.WriteFile(written, []byte("new_page = 1\n"), 0o644); err != nil {
-		t.Fatalf("write through filtered workspace: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(root, "oltp", "storage", "new_page.py")); err != nil {
-		t.Fatalf("write did not reach project source path: %v", err)
+	if runtime.policy.Writable[1].Target != agentSandboxSessionDir {
+		t.Fatalf("unexpected session mount: %#v", runtime.policy.Writable[1])
 	}
 }
 
-func TestPrepareAgentWorkDirRejectsExcludedAssignedPath(t *testing.T) {
+func TestPrepareIsolatedAgentRuntimeRejectsBroadOrEscapingOwnership(t *testing.T) {
 	root := t.TempDir()
 	router := hub.NewRouter(filepath.Join(root, "logs"))
 	defer router.Close()
-	allocator := NewAllocator(&Config{}, root, router, nil)
-	_, err := allocator.prepareAgentWorkDir("agent-runtime", coordinator.Domain{
-		DomainID:      "runtime",
-		AssignedPaths: []string{".aion/runs"},
-	}, "domain prompt")
-	if err == nil {
-		t.Fatalf("expected excluded assigned path to fail")
+	config := &Config{Agents: AgentsConfig{CommandPath: filepath.Join(root, "pi")}}
+	if err := os.WriteFile(config.Agents.CommandPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "excluded") {
-		t.Fatalf("expected excluded error, got: %v", err)
-	}
-}
+	allocator := NewAllocator(config, root, router, nil)
 
-func TestPrepareAgentWorkDirRejectsEscapingAssignedPath(t *testing.T) {
-	root := t.TempDir()
-	router := hub.NewRouter(filepath.Join(root, "logs"))
-	defer router.Close()
-	allocator := NewAllocator(&Config{}, root, router, nil)
-
-	for _, assignedPath := range []string{"../outside", filepath.Join(root, "absolute")} {
-		_, err := allocator.prepareAgentWorkDir("agent-escape", coordinator.Domain{
+	for _, assignedPath := range []string{".", "../outside", filepath.Join(root, "absolute")} {
+		_, err := allocator.prepareIsolatedAgentRuntime("agent-escape", coordinator.Domain{
 			DomainID:      "escape",
 			AssignedPaths: []string{assignedPath},
-		}, "domain prompt")
+		}, filepath.Join(root, ".aion", "sessions", "agent-escape"))
 		if err == nil {
-			t.Fatalf("expected escaping assigned path %q to fail", assignedPath)
+			t.Fatalf("expected broad or escaping assigned path %q to fail", assignedPath)
 		}
 	}
 }

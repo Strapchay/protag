@@ -12,6 +12,10 @@ A 3-Tier Multi-Agent Orchestration OS for concurrent AI agent operations on a sh
 
 ## Quick Start
 
+Linux domain-agent execution requires `bubblewrap` (`bwrap`) and enabled
+unprivileged user namespaces. Agent allocation fails closed when either is
+unavailable.
+
 ```bash
 # Install build tools (flatc, protoc plugins)
 make install-tools
@@ -125,12 +129,14 @@ with `orchestrator-cli set-gateway-capacity --capacity <N>` or the dashboard's
 `/gateway-capacity <N>` command. `/stop-agents` pauses active Domain Agents
 without failing their DAG nodes; `/continue-agents` resumes them.
 
-Domain agents run from filtered per-agent source workspaces under the system
-temp directory. Each workspace contains `AGENTS.md` plus symlinks for only the
-domain's assigned paths, so runtime and control directories such as `.aion/`,
-`.git/`, `.agents/`, and `.codex/` are not visible from a normal `ls -la`.
-`.aionignore` still controls scan/planning exclusions, but the filtered
-workspace is the enforcement boundary for domain-agent file discovery.
+Domain agents run inside mandatory rootless Bubblewrap workspaces. Assigned
+project paths are direct writable mounts under `/workspace`; persistent Pi
+session state is mounted under `/state/pi`; approved runtime tools and skills
+are read-only. Other domains, repository metadata, and kernel runtime state are
+not mounted. Every supervisor respawn receives a fresh isolation generation
+while the Pi session remains persistent. The monotonic generation counter is
+stored in run-owned state outside the agent mount namespace, so pause/resume and
+daemon restart cannot reuse a workspace identity.
 
 ## Documentation
 

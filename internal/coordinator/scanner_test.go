@@ -140,7 +140,7 @@ func TestScanDetectsDependencyFiles(t *testing.T) {
 	}
 }
 
-func TestScanProjectHonorsAgentIgnoreFile(t *testing.T) {
+func TestScanProjectExcludesGeneratedRuntimePaths(t *testing.T) {
 	dir := setupMockProject(t)
 	if err := os.MkdirAll(filepath.Join(dir, ".aion", "runs"), 0o755); err != nil {
 		t.Fatalf("mkdir .aion: %v", err)
@@ -148,14 +148,11 @@ func TestScanProjectHonorsAgentIgnoreFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".aion", "runs", "state.json"), []byte("{}"), 0o644); err != nil {
 		t.Fatalf("write .aion file: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Join(dir, "fixtures", "cache"), 0o755); err != nil {
-		t.Fatalf("mkdir fixture cache: %v", err)
+	if err := os.MkdirAll(filepath.Join(dir, "node_modules", "cache"), 0o755); err != nil {
+		t.Fatalf("mkdir dependency cache: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "fixtures", "cache", "generated.go"), []byte("package cache"), 0o644); err != nil {
-		t.Fatalf("write fixture cache: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, AgentIgnoreFileName), []byte("fixtures/cache/\n"), 0o644); err != nil {
-		t.Fatalf("write ignore file: %v", err)
+	if err := os.WriteFile(filepath.Join(dir, "node_modules", "cache", "generated.go"), []byte("package cache"), 0o644); err != nil {
+		t.Fatalf("write dependency cache: %v", err)
 	}
 
 	scan, err := ScanProject(dir)
@@ -166,7 +163,7 @@ func TestScanProjectHonorsAgentIgnoreFile(t *testing.T) {
 		t.Fatalf("scan included .aion runtime state:\n%s", scan.DirectoryTree)
 	}
 	if strings.Contains(scan.DirectoryTree, "generated.go") {
-		t.Fatalf("scan included ignored fixture cache:\n%s", scan.DirectoryTree)
+		t.Fatalf("scan included generated dependency cache:\n%s", scan.DirectoryTree)
 	}
 }
 
