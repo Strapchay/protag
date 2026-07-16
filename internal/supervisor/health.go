@@ -24,6 +24,11 @@ type HealthMonitor struct {
 	lastProgress     time.Time
 	heartbeatTimeout time.Duration
 	progressTimeout  time.Duration
+	activityStale    time.Duration
+	activityMax      time.Duration
+	activityPhase    string
+	activityStarted  time.Time
+	activityLastSeen time.Time
 	onTimeout        func(agentID string, status HealthStatus)
 	cancel           context.CancelFunc
 }
@@ -36,6 +41,21 @@ func NewHealthMonitor(agentID string, heartbeatTimeout, progressTimeout time.Dur
 		lastProgress:     time.Now(),
 		heartbeatTimeout: heartbeatTimeout,
 		progressTimeout:  progressTimeout,
+		activityStale:    45 * time.Second,
+		activityMax:      15 * time.Minute,
+	}
+}
+
+// SetExternalActivityTimeouts configures how external runtime activity, such
+// as a gateway inference request, shields the progress timeout.
+func (h *HealthMonitor) SetExternalActivityTimeouts(stale, max time.Duration) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if stale > 0 {
+		h.activityStale = stale
+	}
+	if max > 0 {
+		h.activityMax = max
 	}
 }
 
@@ -59,6 +79,28 @@ func (h *HealthMonitor) RecordProgress() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.lastProgress = time.Now()
+}
+
+// RecordExternalActivity records externally observable work for the agent.
+// Active phases keep the heartbeat fresh and suppress progress stalls while
+// their pulses remain fresh and below the configured maximum duration.
+func (h *HealthMonitor) RecordExternalActivity(phase string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	now := time.Now()
+	h.lastHeartbeat = now
+	if !isActiveExternalPhase(phase) {
+		h.activityPhase = phase
+		h.activityStarted = time.Time{}
+		h.activityLastSeen = time.Time{}
+		return
+	}
+	if h.activityStarted.IsZero() || !isActiveExternalPhase(h.activityPhase) {
+		h.activityStarted = now
+	}
+	h.activityPhase = phase
+	h.activityLastSeen = now
 }
 
 // Start begins the health monitoring loop.
@@ -102,6 +144,7 @@ func (h *HealthMonitor) check() {
 	now := time.Now()
 	heartbeatAge := now.Sub(h.lastHeartbeat)
 	progressAge := now.Sub(h.lastProgress)
+	externalActive := h.externalActivityActiveLocked(now)
 	cb := h.onTimeout
 	h.mu.Unlock()
 
@@ -115,7 +158,7 @@ func (h *HealthMonitor) check() {
 		return
 	}
 
-	if progressAge > h.progressTimeout {
+	if progressAge > h.progressTimeout && !externalActive {
 		log.Printf("health: agent %s stalled (no progress for %v)", h.agentID, progressAge)
 		cb(h.agentID, HealthStalled)
 		return
@@ -131,10 +174,32 @@ func (h *HealthMonitor) Status() HealthStatus {
 	if now.Sub(h.lastHeartbeat) > h.heartbeatTimeout {
 		return HealthUnresponsive
 	}
-	if now.Sub(h.lastProgress) > h.progressTimeout {
+	if now.Sub(h.lastProgress) > h.progressTimeout && !h.externalActivityActiveLocked(now) {
 		return HealthStalled
 	}
 	return HealthOK
+}
+
+func (h *HealthMonitor) externalActivityActiveLocked(now time.Time) bool {
+	if !isActiveExternalPhase(h.activityPhase) || h.activityLastSeen.IsZero() || h.activityStarted.IsZero() {
+		return false
+	}
+	if h.activityStale > 0 && now.Sub(h.activityLastSeen) > h.activityStale {
+		return false
+	}
+	if h.activityMax > 0 && now.Sub(h.activityStarted) > h.activityMax {
+		return false
+	}
+	return true
+}
+
+func isActiveExternalPhase(phase string) bool {
+	switch phase {
+	case "queued", "admitted", "forwarding", "retry_wait", "active", "waiting_inference", "running_tool", "waiting_orchestrator_rpc":
+		return true
+	default:
+		return false
+	}
 }
 
 func minDuration(a, b time.Duration) time.Duration {

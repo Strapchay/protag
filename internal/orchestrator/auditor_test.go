@@ -59,6 +59,28 @@ func TestAuditorReportsUnsuppressedStaleNode(t *testing.T) {
 	}
 }
 
+func TestAuditorInfersAssignedAgentFromDomain(t *testing.T) {
+	mgr := newTestDagManager(t)
+	if err := mgr.AddNode(dag.DagNode{
+		ID:        "server-main",
+		DomainID:  "server",
+		Status:    dag.StatusInProgress,
+		CreatedAt: time.Now().Add(-10 * time.Minute).UnixMilli(),
+	}); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+
+	var assigned string
+	auditor := NewAuditor(mgr, nil, nil, time.Second, time.Hour)
+	auditor.SetStaleNodeFunc(func(node dag.DagNode, _ time.Duration) {
+		assigned = node.AssignedAgent
+	})
+	auditor.scan()
+	if assigned != "agent-server" {
+		t.Fatalf("assigned agent = %q", assigned)
+	}
+}
+
 func TestDaemonSuppressesStaleBuildSpecNodeBeforeContinueAgents(t *testing.T) {
 	daemon := testBuildSpecDaemon(t)
 	attempt := newBuildSpecAttempt(daemon.runState.RunID, "docs/build_spec.md", []byte("hello"))

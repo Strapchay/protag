@@ -68,6 +68,19 @@ func TestParseDebugStatusCommand(t *testing.T) {
 	}
 }
 
+func TestParseGatewayCapacityCommand(t *testing.T) {
+	params, err := parseCommand("set-gateway-capacity", []string{"--capacity", "3"})
+	if err != nil {
+		t.Fatalf("parse gateway capacity: %v", err)
+	}
+	if params["capacity"] != 3 {
+		t.Fatalf("capacity params = %#v", params)
+	}
+	if _, err := parseCommand("set-gateway-capacity", []string{"--capacity", "0"}); err == nil {
+		t.Fatal("expected invalid capacity error")
+	}
+}
+
 func TestResolveDebugStatusAddrFromProjectServerInfo(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, ".aion"), 0o755); err != nil {

@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -11,6 +12,137 @@ import (
 	"testing"
 	"time"
 )
+
+func TestGatewayLimiterCanGrowWithoutReorderingWaiters(t *testing.T) {
+	limiter := newGatewayLimiter(1)
+	releaseFirst, err := limiter.acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire first: %v", err)
+	}
+	acquired := make(chan func(), 1)
+	go func() {
+		release, acquireErr := limiter.acquire(context.Background())
+		if acquireErr == nil {
+			acquired <- release
+		}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		_, _, queued := limiter.snapshot()
+		if queued == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("second request did not enter queue")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	limiter.setCapacity(2)
+	select {
+	case releaseSecond := <-acquired:
+		releaseSecond()
+	case <-time.After(time.Second):
+		t.Fatal("capacity increase did not admit queued request")
+	}
+	releaseFirst()
+	capacity, inUse, queued := limiter.snapshot()
+	if capacity != 2 || inUse != 0 || queued != 0 {
+		t.Fatalf("unexpected limiter snapshot: capacity=%d in_use=%d queued=%d", capacity, inUse, queued)
+	}
+}
+
+func TestInferenceGatewayRetriesBeforeReturningResponse(t *testing.T) {
+	gateway := NewInferenceGateway(&Config{
+		Execution: ExecutionConfig{Mode: "gateway", MaxConcurrentRequests: 1, RequestQueueTimeoutSec: 1},
+		InferenceGateway: InferenceGatewayConfig{
+			Enabled:          true,
+			TargetProfile:    "forge",
+			MaxRetries:       2,
+			RetryBaseDelayMS: 1,
+			RetryMaxDelayMS:  2,
+		},
+		Inference: InferenceConfig{Models: map[string]ModelProfile{
+			"forge": {Provider: "redacted-provider", Endpoint: "http://upstream.local"},
+		}},
+	})
+	gateway.sleepFn = func(context.Context, time.Duration) error { return nil }
+	attempts := 0
+	gateway.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		attempts++
+		body, err := io.ReadAll(r.Body)
+		if err != nil || string(body) != `{"stream":true}` {
+			t.Fatalf("attempt %d body=%q err=%v", attempts, string(body), err)
+		}
+		status := http.StatusServiceUnavailable
+		payload := `{"error":"busy"}`
+		if attempts == 2 {
+			status = http.StatusOK
+			payload = `{"ok":true}`
+		}
+		return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(payload))}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/chat/completions", strings.NewReader(`{"stream":true}`))
+	req.Header.Set("X-Aion-Target-Profile", "forge")
+	rec := httptest.NewRecorder()
+	gateway.handleProxy(rec, req)
+
+	if rec.Code != http.StatusOK || attempts != 2 {
+		t.Fatalf("status=%d attempts=%d body=%s", rec.Code, attempts, rec.Body.String())
+	}
+	status := gateway.Status()
+	if status.RetryAttempts != 1 || status.Retried != 1 {
+		t.Fatalf("unexpected retry status: %#v", status)
+	}
+}
+
+func TestInferenceGatewayUpstreamTimeoutReleasesCapacity(t *testing.T) {
+	gateway := NewInferenceGateway(&Config{
+		Execution: ExecutionConfig{Mode: "gateway", MaxConcurrentRequests: 1, RequestQueueTimeoutSec: 5},
+		InferenceGateway: InferenceGatewayConfig{
+			Enabled:            true,
+			TargetProfile:      "forge",
+			MaxRetries:         2,
+			RetryBaseDelayMS:   1,
+			RetryMaxDelayMS:    2,
+			UpstreamTimeoutSec: 1,
+		},
+		Inference: InferenceConfig{Models: map[string]ModelProfile{
+			"forge": {Provider: "redacted-provider", Endpoint: "http://upstream.local"},
+		}},
+	})
+	gateway.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		<-r.Context().Done()
+		return nil, r.Context().Err()
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/chat/completions", strings.NewReader(`{"stream":true}`))
+	req.Header.Set("X-Aion-Target-Profile", "forge")
+	rec := httptest.NewRecorder()
+	gateway.handleProxy(rec, req)
+
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	status := gateway.Status()
+	if status.InUse != 0 || status.Queued != 0 {
+		t.Fatalf("timeout did not release gateway capacity: %#v", status)
+	}
+	if status.StatusCounts[http.StatusGatewayTimeout] != 1 {
+		t.Fatalf("expected one recorded 504, got %#v", status.StatusCounts)
+	}
+}
+
+func TestInferenceGatewaySetCapacityValidatesRange(t *testing.T) {
+	gateway := NewInferenceGateway(&Config{Execution: ExecutionConfig{MaxConcurrentRequests: 1}})
+	status, err := gateway.SetCapacity(3)
+	if err != nil || status.Capacity != 3 {
+		t.Fatalf("SetCapacity(3) status=%#v err=%v", status, err)
+	}
+	if _, err := gateway.SetCapacity(0); err == nil {
+		t.Fatal("expected invalid capacity error")
+	}
+}
 
 func TestInferenceGatewayProxiesOpenAICompatibleRequest(t *testing.T) {
 	logDir := t.TempDir()
@@ -191,6 +323,86 @@ func TestInferenceGatewayEmitsActivityPulseDuringLongRequest(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(gateway.Status().Active) != 0 {
+		t.Fatalf("expected active request registry to be empty after completion, got %#v", gateway.Status().Active)
+	}
+}
+
+func TestInferenceGatewayStatusTracksActiveRequest(t *testing.T) {
+	releaseUpstream := make(chan struct{})
+	gateway := NewInferenceGateway(&Config{
+		Execution: ExecutionConfig{
+			Mode:                   "gateway",
+			MaxConcurrentRequests:  1,
+			RequestQueueTimeoutSec: 1,
+		},
+		InferenceGateway: InferenceGatewayConfig{
+			Enabled:       true,
+			GatewayKey:    "local-key",
+			TargetProfile: "forge",
+		},
+		Inference: InferenceConfig{
+			Models: map[string]ModelProfile{
+				"forge": {
+					Provider: "redacted-openai-compatible",
+					Model:    "redacted-model",
+					Endpoint: "http://upstream.local",
+					Env:      map[string]string{"API_KEY": "redacted-token"},
+				},
+			},
+		},
+	})
+	gateway.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		<-releaseUpstream
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"ok"}}]}`)),
+		}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/chat/completions", strings.NewReader(`{"stream":true}`))
+	req.Header.Set(gatewayAuthHeader, "local-key")
+	req.Header.Set("X-Aion-Target-Profile", "forge")
+	req.Header.Set("X-Aion-Agent-ID", "agent-sql")
+	req.Header.Set("X-Aion-Domain-ID", "sql")
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		gateway.handleProxy(rec, req)
+		close(done)
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		status := gateway.Status()
+		if len(status.Active) == 1 && status.Active[0].AgentID == "agent-sql" && status.Active[0].Provider == "redacted-openai-compatible" && status.Active[0].MaxAttempts == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			close(releaseUpstream)
+			t.Fatalf("timed out waiting for active gateway request, status=%#v", status)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	close(releaseUpstream)
+	<-done
+	if len(gateway.Status().Active) != 0 {
+		t.Fatalf("expected active registry to clear after completion, got %#v", gateway.Status().Active)
+	}
+}
+
+func TestInferenceGatewayRetryAfterIsBounded(t *testing.T) {
+	gateway := NewInferenceGateway(&Config{InferenceGateway: InferenceGatewayConfig{
+		RetryBaseDelayMS: 10,
+		RetryMaxDelayMS:  250,
+	}})
+	resp := &http.Response{Header: http.Header{"Retry-After": []string{"30"}}}
+	if got := gateway.retryDelay(resp, 1); got != 250*time.Millisecond {
+		t.Fatalf("retry delay=%s want=250ms", got)
 	}
 }
 

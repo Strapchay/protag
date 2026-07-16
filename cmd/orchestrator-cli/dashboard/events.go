@@ -36,9 +36,7 @@ type tuiEventMsg struct {
 	Raw      string
 }
 
-type tuiEventNormalizer struct {
-	foundNamedAgent bool
-}
+type tuiEventNormalizer struct{}
 
 func (n *tuiEventNormalizer) Normalize(msg hub.Message) []tuiEventMsg {
 	if msg.Type == hub.MsgSystemStatus {
@@ -137,15 +135,9 @@ func parseTUIPayload(raw json.RawMessage) tuiPayload {
 }
 
 func (n *tuiEventNormalizer) normalizeAgentID(msg hub.Message) string {
-	agentID := coalesceAgentID(msg)
-	if agentID == "" && !n.foundNamedAgent {
-		return "context_prompt"
-	}
+	agentID := strings.TrimSpace(msg.FromAgent)
 	if agentID == "" {
 		return "system"
-	}
-	if agentID != "context_prompt" && agentID != "system" {
-		n.foundNamedAgent = true
 	}
 	return agentID
 }

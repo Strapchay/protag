@@ -41,6 +41,8 @@ type ChatModel struct {
 	autoScroll      bool
 	logger          *log.Logger
 	buildSpecActive bool
+	inputBlurred    bool
+	deferRender     bool
 }
 
 type architectCommand struct {
@@ -56,6 +58,8 @@ var architectCommands = []architectCommand{
 	{Name: "/continue", Description: "ask the Architect to continue from current restored context"},
 	{Name: "/continue-agents", Description: "resume persisted domain agents after build-spec allocation"},
 	{Name: "/resume-agents", Description: "alias for /continue-agents"},
+	{Name: "/stop-agents", Description: "pause active domain agents without failing their DAG tasks"},
+	{Name: "/gateway-capacity", Description: "change runtime inference request concurrency"},
 	{Name: "/show-spec", Description: "show docs/build_spec.md"},
 	{Name: "/show-plan", Description: "show the current build-spec plan"},
 	{Name: "/show-build-spec-trace", Description: "show the current build-spec planning trace"},
@@ -127,6 +131,17 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.input.Focus()
 			}
 			return m, nil
+		}
+		if m.inputBlurred {
+			if msg.Type == tea.KeyEsc {
+				go m.executeCommand("/stop-agents")
+				return m, nil
+			}
+			if msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace {
+				m.inputBlurred = false
+				m.FocusHistory = false
+				m.input.Focus()
+			}
 		}
 
 		inputFocused := m.input.Focused()
@@ -215,6 +230,7 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				m.input.Blur()
+				m.inputBlurred = true
 				return m, nil
 			}
 		}
@@ -234,6 +250,7 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		normalizer := &tuiEventNormalizer{}
 		added := 0
+		m.deferRender = true
 		for _, raw := range msg.Messages {
 			for _, event := range normalizer.Normalize(raw) {
 				if event.Audience != tuiAudienceChat {
@@ -242,6 +259,10 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.addTUIEvent(event)
 				added++
 			}
+		}
+		m.deferRender = false
+		if added > 0 {
+			m.renderHistory()
 		}
 		if added == 0 && len(m.history) == 0 {
 			m.viewport.SetContent("Awaiting interaction with Solution Architect...")
@@ -369,7 +390,9 @@ func (m *ChatModel) AddMessage(agentID, author, text string, style lipgloss.Styl
 				last.Text = text
 				last.CachedRender = "" // Invalidate cache
 				m.MeasureLine(last)
-				m.renderHistory()
+				if !m.deferRender {
+					m.renderHistory()
+				}
 				return
 			}
 		}
@@ -407,7 +430,9 @@ func (m *ChatModel) AddMessage(agentID, author, text string, style lipgloss.Styl
 	if len(m.history) > 500 {
 		m.history = m.history[len(m.history)-500:]
 	}
-	m.renderHistory()
+	if !m.deferRender {
+		m.renderHistory()
+	}
 }
 
 func (m *ChatModel) MeasureLine(line *chatLine) {
@@ -610,6 +635,21 @@ func (m *ChatModel) executeCommand(cmdStr string) {
 	case "/continue-agents", "/resume-agents", "/countine-agents":
 		methodName = "build-spec-continue-agents"
 		params = map[string]interface{}{}
+		showResponse = true
+	case "/stop-agents":
+		methodName = "build-spec-stop-agents"
+		params = map[string]interface{}{}
+		showResponse = true
+	case "/gateway-capacity":
+		if len(parts) < 2 {
+			return
+		}
+		capacity := 0
+		if _, err := fmt.Sscanf(parts[1], "%d", &capacity); err != nil || capacity < 1 {
+			return
+		}
+		methodName = "set-gateway-capacity"
+		params = map[string]interface{}{"capacity": capacity}
 		showResponse = true
 	case "/status":
 		methodName = "architect-status"

@@ -1,16 +1,21 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,40 +25,62 @@ import (
 const gatewayAuthHeader = "X-Aion-Gateway-Key"
 const gatewayExtensionLoadedPath = "/aion/gateway/extension-loaded"
 const defaultGatewayActivityPulseInterval = 10 * time.Second
+const maxGatewayCapacity = 16
 
 // InferenceGatewayStatus is exposed through debug-status for operational
 // observability without leaking upstream provider credentials.
 type InferenceGatewayStatus struct {
-	Enabled       bool           `json:"enabled"`
-	ListenAddr    string         `json:"listen_addr"`
-	PublicBaseURL string         `json:"public_base_url"`
-	Capacity      int            `json:"capacity"`
-	InUse         int            `json:"in_use"`
-	Queued        int            `json:"queued"`
-	TotalRequests int64          `json:"total_requests"`
-	Rejected      int64          `json:"rejected"`
-	Upstream429   int64          `json:"upstream_429"`
-	LastError     string         `json:"last_error,omitempty"`
-	LogPath       string         `json:"log_path,omitempty"`
-	StatusCounts  map[int]int64  `json:"status_counts,omitempty"`
-	RecentEvents  []GatewayEvent `json:"recent_events,omitempty"`
+	Enabled            bool                   `json:"enabled"`
+	ListenAddr         string                 `json:"listen_addr"`
+	PublicBaseURL      string                 `json:"public_base_url"`
+	Capacity           int                    `json:"capacity"`
+	InUse              int                    `json:"in_use"`
+	Queued             int                    `json:"queued"`
+	Active             []GatewayActiveRequest `json:"active,omitempty"`
+	TotalRequests      int64                  `json:"total_requests"`
+	Rejected           int64                  `json:"rejected"`
+	Upstream429        int64                  `json:"upstream_429"`
+	RetryAttempts      int64                  `json:"retry_attempts"`
+	Retried            int64                  `json:"retried_requests"`
+	UpstreamTimeoutSec int                    `json:"upstream_timeout_sec"`
+	LastError          string                 `json:"last_error,omitempty"`
+	LogPath            string                 `json:"log_path,omitempty"`
+	StatusCounts       map[int]int64          `json:"status_counts,omitempty"`
+	RecentEvents       []GatewayEvent         `json:"recent_events,omitempty"`
+}
+
+type GatewayActiveRequest struct {
+	RequestID   string `json:"request_id"`
+	AgentID     string `json:"agent_id,omitempty"`
+	DomainID    string `json:"domain_id,omitempty"`
+	Profile     string `json:"profile,omitempty"`
+	Provider    string `json:"provider,omitempty"`
+	Phase       string `json:"phase"`
+	StartedAt   string `json:"started_at"`
+	UpdatedAt   string `json:"updated_at"`
+	AgeMS       int64  `json:"age_ms"`
+	QueueMS     int64  `json:"queue_ms,omitempty"`
+	Attempt     int    `json:"attempt,omitempty"`
+	MaxAttempts int    `json:"max_attempts,omitempty"`
 }
 
 type GatewayEvent struct {
-	At         string `json:"at"`
-	Level      string `json:"level"`
-	RequestID  string `json:"request_id,omitempty"`
-	AgentID    string `json:"agent_id,omitempty"`
-	DomainID   string `json:"domain_id,omitempty"`
-	Profile    string `json:"profile,omitempty"`
-	Provider   string `json:"provider,omitempty"`
-	Method     string `json:"method,omitempty"`
-	Path       string `json:"path,omitempty"`
-	Status     int    `json:"status,omitempty"`
-	QueueMS    int64  `json:"queue_ms,omitempty"`
-	DurationMS int64  `json:"duration_ms,omitempty"`
-	Bytes      int64  `json:"bytes,omitempty"`
-	Message    string `json:"message"`
+	At          string `json:"at"`
+	Level       string `json:"level"`
+	RequestID   string `json:"request_id,omitempty"`
+	AgentID     string `json:"agent_id,omitempty"`
+	DomainID    string `json:"domain_id,omitempty"`
+	Profile     string `json:"profile,omitempty"`
+	Provider    string `json:"provider,omitempty"`
+	Method      string `json:"method,omitempty"`
+	Path        string `json:"path,omitempty"`
+	Status      int    `json:"status,omitempty"`
+	QueueMS     int64  `json:"queue_ms,omitempty"`
+	DurationMS  int64  `json:"duration_ms,omitempty"`
+	Bytes       int64  `json:"bytes,omitempty"`
+	Attempt     int    `json:"attempt,omitempty"`
+	MaxAttempts int    `json:"max_attempts,omitempty"`
+	Message     string `json:"message"`
 }
 
 type InferenceGateway struct {
@@ -66,6 +93,8 @@ type InferenceGateway struct {
 	totalRequests atomic.Int64
 	rejected      atomic.Int64
 	upstream429   atomic.Int64
+	retryAttempts atomic.Int64
+	retried       atomic.Int64
 
 	mu           sync.Mutex
 	lastError    string
@@ -73,8 +102,10 @@ type InferenceGateway struct {
 	statusCounts map[int]int64
 	recentEvents []GatewayEvent
 	activityFn   func(agentID, domainID, phase string)
+	active       map[string]gatewayActiveRequest
 
 	activityPulseInterval time.Duration
+	sleepFn               func(context.Context, time.Duration) error
 }
 
 func NewInferenceGateway(config *Config, logsDir ...string) *InferenceGateway {
@@ -91,7 +122,9 @@ func NewInferenceGateway(config *Config, logsDir ...string) *InferenceGateway {
 		limiter:               newGatewayLimiter(capacity),
 		logPath:               logPath,
 		statusCounts:          make(map[int]int64),
+		active:                make(map[string]gatewayActiveRequest),
 		activityPulseInterval: defaultGatewayActivityPulseInterval,
+		sleepFn:               sleepWithContext,
 		client: &http.Client{
 			Timeout: 0,
 		},
@@ -145,12 +178,13 @@ func (g *InferenceGateway) Start() error {
 }
 
 func (g *InferenceGateway) recordStartup(addr string) {
+	capacity, _, _ := g.limiter.snapshot()
 	g.recordEvent(GatewayEvent{
 		At:      time.Now().UTC().Format(time.RFC3339Nano),
 		Level:   "info",
 		Method:  "START",
 		Path:    addr,
-		Message: fmt.Sprintf("gateway started capacity=%d public_base_url=%s", g.limiter.capacity, g.config.InferenceGateway.PublicBaseURL),
+		Message: fmt.Sprintf("gateway started capacity=%d public_base_url=%s", capacity, g.config.InferenceGateway.PublicBaseURL),
 		Profile: strings.TrimSpace(g.config.InferenceGateway.TargetProfile),
 	})
 }
@@ -173,6 +207,30 @@ func (g *InferenceGateway) Status() InferenceGatewayStatus {
 		statusCounts[status] = count
 	}
 	recentEvents := append([]GatewayEvent(nil), g.recentEvents...)
+	active := make([]GatewayActiveRequest, 0, len(g.active))
+	now := time.Now()
+	for _, item := range g.active {
+		active = append(active, GatewayActiveRequest{
+			RequestID:   item.info.RequestID,
+			AgentID:     item.info.AgentID,
+			DomainID:    item.info.DomainID,
+			Profile:     item.info.Profile,
+			Provider:    item.info.Provider,
+			Phase:       item.phase,
+			StartedAt:   item.startedAt.UTC().Format(time.RFC3339Nano),
+			UpdatedAt:   item.updatedAt.UTC().Format(time.RFC3339Nano),
+			AgeMS:       now.Sub(item.startedAt).Milliseconds(),
+			QueueMS:     item.info.QueueMS,
+			Attempt:     item.info.Attempt,
+			MaxAttempts: item.info.MaxAttempts,
+		})
+	}
+	sort.Slice(active, func(i, j int) bool {
+		if active[i].StartedAt == active[j].StartedAt {
+			return active[i].RequestID < active[j].RequestID
+		}
+		return active[i].StartedAt < active[j].StartedAt
+	})
 	logPath := g.logPath
 	g.mu.Unlock()
 	capacity, inUse, queued := 0, 0, 0
@@ -180,20 +238,43 @@ func (g *InferenceGateway) Status() InferenceGatewayStatus {
 		capacity, inUse, queued = g.limiter.snapshot()
 	}
 	return InferenceGatewayStatus{
-		Enabled:       g.config.GatewayEnabled(),
-		ListenAddr:    g.config.InferenceGateway.ListenAddr,
-		PublicBaseURL: g.config.InferenceGateway.PublicBaseURL,
-		Capacity:      capacity,
-		InUse:         inUse,
-		Queued:        queued,
-		TotalRequests: g.totalRequests.Load(),
-		Rejected:      g.rejected.Load(),
-		Upstream429:   g.upstream429.Load(),
-		LastError:     lastError,
-		LogPath:       logPath,
-		StatusCounts:  statusCounts,
-		RecentEvents:  recentEvents,
+		Enabled:            g.config.GatewayEnabled(),
+		ListenAddr:         g.config.InferenceGateway.ListenAddr,
+		PublicBaseURL:      g.config.InferenceGateway.PublicBaseURL,
+		Capacity:           capacity,
+		InUse:              inUse,
+		Queued:             queued,
+		Active:             active,
+		TotalRequests:      g.totalRequests.Load(),
+		Rejected:           g.rejected.Load(),
+		Upstream429:        g.upstream429.Load(),
+		RetryAttempts:      g.retryAttempts.Load(),
+		Retried:            g.retried.Load(),
+		UpstreamTimeoutSec: g.upstreamTimeoutSec(),
+		LastError:          lastError,
+		LogPath:            logPath,
+		StatusCounts:       statusCounts,
+		RecentEvents:       recentEvents,
 	}
+}
+
+// SetCapacity updates the FIFO admission limit for future requests. Requests
+// already admitted are allowed to finish when the capacity is reduced.
+func (g *InferenceGateway) SetCapacity(capacity int) (InferenceGatewayStatus, error) {
+	if g == nil || g.limiter == nil {
+		return InferenceGatewayStatus{}, fmt.Errorf("inference gateway is not initialized")
+	}
+	if capacity < 1 || capacity > maxGatewayCapacity {
+		return g.Status(), fmt.Errorf("gateway capacity must be between 1 and %d", maxGatewayCapacity)
+	}
+	g.limiter.setCapacity(capacity)
+	g.recordEvent(GatewayEvent{
+		Level:   "info",
+		Method:  "CONTROL",
+		Path:    "/aion/gateway/capacity",
+		Message: fmt.Sprintf("gateway capacity changed to %d", capacity),
+	})
+	return g.Status(), nil
 }
 
 func (g *InferenceGateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -332,11 +413,12 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	})
 	if !g.authorized(r) {
 		g.rejected.Add(1)
+		g.emitActivity(reqInfo, "failed")
 		g.recordFailure(reqInfo, http.StatusUnauthorized, start, "gateway unauthorized")
 		writeGatewayJSON(w, http.StatusUnauthorized, map[string]string{"error": "gateway unauthorized"})
 		return
 	}
-	stopPulse := g.startActivityPulse(r.Context(), reqInfo)
+	stopPulse := g.startActivityPulse(r.Context(), reqInfo, "queued")
 	defer stopPulse()
 	queueStart := time.Now()
 	release, err := g.acquire(r.Context())
@@ -344,6 +426,7 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		g.rejected.Add(1)
 		g.recordError(err)
+		g.emitActivity(reqInfo, "failed")
 		g.recordFailure(reqInfo, http.StatusTooManyRequests, start, err.Error())
 		writeGatewayJSON(w, http.StatusTooManyRequests, map[string]string{"error": err.Error()})
 		return
@@ -356,6 +439,7 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		g.rejected.Add(1)
 		g.recordError(err)
+		g.emitActivity(reqInfo, "failed")
 		g.recordFailure(reqInfo, http.StatusBadGateway, start, err.Error())
 		writeGatewayJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
@@ -368,52 +452,42 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		g.rejected.Add(1)
 		g.recordError(err)
+		g.emitActivity(reqInfo, "failed")
 		g.recordFailure(reqInfo, http.StatusBadGateway, start, err.Error())
 		writeGatewayJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
-	if targetURL, parseErr := url.Parse(target); parseErr == nil {
-		g.emitActivity(reqInfo, "forwarding")
-		g.recordEvent(GatewayEvent{
-			At:        time.Now().UTC().Format(time.RFC3339Nano),
-			Level:     "debug",
-			RequestID: requestID,
-			AgentID:   reqInfo.AgentID,
-			DomainID:  reqInfo.DomainID,
-			Profile:   reqInfo.Profile,
-			Provider:  reqInfo.Provider,
-			Method:    reqInfo.Method,
-			Path:      reqInfo.Path,
-			QueueMS:   queueMS,
-			Message:   "forwarding to upstream host " + targetURL.Host,
-		})
-	}
-
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		g.recordError(err)
-		g.recordFailure(reqInfo, http.StatusInternalServerError, start, "gateway request creation failed")
-		writeGatewayJSON(w, http.StatusInternalServerError, map[string]string{"error": "gateway request creation failed"})
+		g.emitActivity(reqInfo, "failed")
+		g.recordFailure(reqInfo, http.StatusBadRequest, start, "gateway request body could not be read")
+		writeGatewayJSON(w, http.StatusBadRequest, map[string]string{"error": "gateway request body could not be read"})
 		return
 	}
-	copyGatewayHeaders(req.Header, r.Header)
-	applyUpstreamAuth(req.Header, profile)
-	if req.Header.Get("Content-Type") == "" {
-		req.Header.Set("Content-Type", "application/json")
-	}
 
-	resp, err := g.client.Do(req)
+	proxyCtx, cancelProxy := context.WithTimeout(r.Context(), time.Duration(g.upstreamTimeoutSec())*time.Second)
+	defer cancelProxy()
+	resp, err := g.forwardWithRetry(proxyCtx, r, target, body, profile, &reqInfo, start)
 	if err != nil {
 		g.recordError(err)
-		g.recordFailure(reqInfo, http.StatusBadGateway, start, "upstream inference request failed: "+err.Error())
-		writeGatewayJSON(w, http.StatusBadGateway, map[string]string{"error": "upstream inference request failed"})
+		phase := "failed"
+		status := http.StatusBadGateway
+		message := "upstream inference request failed: " + err.Error()
+		if errors.Is(proxyCtx.Err(), context.DeadlineExceeded) {
+			status = http.StatusGatewayTimeout
+			message = "upstream inference request timed out"
+		} else if r.Context().Err() != nil {
+			phase = "canceled"
+		}
+		g.emitActivity(reqInfo, phase)
+		g.recordFailure(reqInfo, status, start, message)
+		if r.Context().Err() == nil {
+			writeGatewayJSON(w, status, map[string]string{"error": message})
+		}
 		return
 	}
 	defer resp.Body.Close()
-	g.recordStatus(resp.StatusCode)
-	if resp.StatusCode == http.StatusTooManyRequests {
-		g.upstream429.Add(1)
-	}
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
@@ -426,6 +500,7 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				g.emitActivity(reqInfo, "failed")
 				g.recordFailure(reqInfo, resp.StatusCode, start, "client write failed: "+writeErr.Error())
 				return
 			}
@@ -437,7 +512,12 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if readErr != nil {
 			if readErr != io.EOF {
 				g.recordError(readErr)
-				g.recordFailure(reqInfo, resp.StatusCode, start, "upstream read failed: "+readErr.Error())
+				g.emitActivity(reqInfo, "failed")
+				if errors.Is(proxyCtx.Err(), context.DeadlineExceeded) {
+					g.recordFailure(reqInfo, http.StatusGatewayTimeout, start, "upstream inference stream timed out")
+				} else {
+					g.recordFailure(reqInfo, resp.StatusCode, start, "upstream read failed: "+readErr.Error())
+				}
 				return
 			}
 			g.emitActivity(reqInfo, "completed")
@@ -447,7 +527,106 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (g *InferenceGateway) startActivityPulse(ctx context.Context, info gatewayRequestInfo) func() {
+func (g *InferenceGateway) upstreamTimeoutSec() int {
+	if g != nil && g.config != nil && g.config.InferenceGateway.UpstreamTimeoutSec > 0 {
+		return g.config.InferenceGateway.UpstreamTimeoutSec
+	}
+	return 300
+}
+
+func (g *InferenceGateway) forwardWithRetry(ctx context.Context, incoming *http.Request, target string, body []byte, profile ModelProfile, info *gatewayRequestInfo, start time.Time) (*http.Response, error) {
+	maxRetries := 0
+	if g.config != nil && g.config.InferenceGateway.MaxRetries > 0 {
+		maxRetries = g.config.InferenceGateway.MaxRetries
+	}
+	maxAttempts := maxRetries + 1
+	info.MaxAttempts = maxAttempts
+	retried := false
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		info.Attempt = attempt
+		g.emitActivity(*info, "forwarding")
+		g.recordForwarding(*info, target, maxAttempts)
+
+		req, err := http.NewRequestWithContext(ctx, incoming.Method, target, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("gateway request creation failed: %w", err)
+		}
+		copyGatewayHeaders(req.Header, incoming.Header)
+		applyUpstreamAuth(req.Header, profile)
+		if req.Header.Get("Content-Type") == "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+
+		resp, requestErr := g.client.Do(req)
+		if requestErr == nil {
+			g.recordStatus(resp.StatusCode)
+			if resp.StatusCode == http.StatusTooManyRequests {
+				g.upstream429.Add(1)
+			}
+			if !retryableGatewayStatus(resp.StatusCode) || attempt == maxAttempts {
+				return resp, nil
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			requestErr = fmt.Errorf("upstream returned HTTP %d", resp.StatusCode)
+		} else if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		if attempt == maxAttempts || !retryableGatewayError(requestErr) {
+			return nil, requestErr
+		}
+		if !retried {
+			g.retried.Add(1)
+			retried = true
+		}
+		g.retryAttempts.Add(1)
+		delay := g.retryDelay(resp, attempt)
+		g.emitActivity(*info, "retry_wait")
+		g.recordEvent(GatewayEvent{
+			Level:       "warn",
+			RequestID:   info.RequestID,
+			AgentID:     info.AgentID,
+			DomainID:    info.DomainID,
+			Profile:     info.Profile,
+			Provider:    info.Provider,
+			Method:      info.Method,
+			Path:        info.Path,
+			QueueMS:     info.QueueMS,
+			Attempt:     attempt,
+			MaxAttempts: maxAttempts,
+			Message:     fmt.Sprintf("retrying upstream request after %s: %v", delay, requestErr),
+		})
+		if err := g.sleepFn(ctx, delay); err != nil {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("upstream inference request exhausted retries")
+}
+
+func (g *InferenceGateway) recordForwarding(info gatewayRequestInfo, target string, maxAttempts int) {
+	host := "configured upstream"
+	if targetURL, err := url.Parse(target); err == nil && targetURL.Host != "" {
+		host = targetURL.Host
+	}
+	g.recordEvent(GatewayEvent{
+		Level:       "debug",
+		RequestID:   info.RequestID,
+		AgentID:     info.AgentID,
+		DomainID:    info.DomainID,
+		Profile:     info.Profile,
+		Provider:    info.Provider,
+		Method:      info.Method,
+		Path:        info.Path,
+		QueueMS:     info.QueueMS,
+		Attempt:     info.Attempt,
+		MaxAttempts: maxAttempts,
+		Message:     "forwarding to upstream host " + host,
+	})
+}
+
+func (g *InferenceGateway) startActivityPulse(ctx context.Context, info gatewayRequestInfo, phase string) func() {
 	if strings.TrimSpace(info.AgentID) == "" {
 		return func() {}
 	}
@@ -456,7 +635,7 @@ func (g *InferenceGateway) startActivityPulse(ctx context.Context, info gatewayR
 	if interval <= 0 {
 		interval = defaultGatewayActivityPulseInterval
 	}
-	g.emitActivity(info, "active")
+	g.emitActivity(info, phase)
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -467,7 +646,7 @@ func (g *InferenceGateway) startActivityPulse(ctx context.Context, info gatewayR
 			case <-done:
 				return
 			case <-ticker.C:
-				g.emitActivity(info, "active")
+				g.emitActivityPulse(info)
 			}
 		}
 	}()
@@ -476,13 +655,64 @@ func (g *InferenceGateway) startActivityPulse(ctx context.Context, info gatewayR
 	}
 }
 
+func (g *InferenceGateway) emitActivityPulse(info gatewayRequestInfo) {
+	g.mu.Lock()
+	fn := g.activityFn
+	if item, ok := g.active[info.RequestID]; ok {
+		item.updatedAt = time.Now()
+		g.active[info.RequestID] = item
+	}
+	g.mu.Unlock()
+	if fn != nil {
+		fn(info.AgentID, info.DomainID, "active")
+	}
+}
+
 func (g *InferenceGateway) emitActivity(info gatewayRequestInfo, phase string) {
 	g.mu.Lock()
 	fn := g.activityFn
+	g.recordActiveLocked(info, phase)
 	g.mu.Unlock()
 	if fn != nil {
 		fn(info.AgentID, info.DomainID, phase)
 	}
+}
+
+func (g *InferenceGateway) recordActiveLocked(info gatewayRequestInfo, phase string) {
+	if strings.TrimSpace(info.RequestID) == "" {
+		return
+	}
+	if g.active == nil {
+		g.active = make(map[string]gatewayActiveRequest)
+	}
+	if phase == "completed" || phase == "failed" || phase == "canceled" {
+		delete(g.active, info.RequestID)
+		return
+	}
+	now := time.Now()
+	item := g.active[info.RequestID]
+	if item.startedAt.IsZero() {
+		item.startedAt = now
+		item.info = info
+	}
+	if info.Provider != "" {
+		item.info.Provider = info.Provider
+	}
+	if info.Profile != "" {
+		item.info.Profile = info.Profile
+	}
+	if info.Attempt > 0 {
+		item.info.Attempt = info.Attempt
+	}
+	if info.MaxAttempts > 0 {
+		item.info.MaxAttempts = info.MaxAttempts
+	}
+	if info.QueueMS > 0 {
+		item.info.QueueMS = info.QueueMS
+	}
+	item.phase = phase
+	item.updatedAt = now
+	g.active[info.RequestID] = item
 }
 
 func (g *InferenceGateway) acquire(ctx context.Context) (func(), error) {
@@ -500,6 +730,89 @@ func (g *InferenceGateway) acquire(ctx context.Context) (func(), error) {
 		release()
 		cancel()
 	}, nil
+}
+
+func retryableGatewayStatus(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func retryableGatewayError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if strings.HasPrefix(err.Error(), "upstream returned HTTP ") {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout() || netErr.Temporary()
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "connection reset") || strings.Contains(text, "unexpected eof") || strings.Contains(text, "server closed idle connection")
+}
+
+func (g *InferenceGateway) retryDelay(resp *http.Response, attempt int) time.Duration {
+	base := time.Second
+	maxDelay := 30 * time.Second
+	if g.config != nil {
+		if g.config.InferenceGateway.RetryBaseDelayMS > 0 {
+			base = time.Duration(g.config.InferenceGateway.RetryBaseDelayMS) * time.Millisecond
+		}
+		if g.config.InferenceGateway.RetryMaxDelayMS > 0 {
+			maxDelay = time.Duration(g.config.InferenceGateway.RetryMaxDelayMS) * time.Millisecond
+		}
+	}
+	if resp != nil {
+		if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()); retryAfter > 0 {
+			if retryAfter > maxDelay {
+				return maxDelay
+			}
+			return retryAfter
+		}
+	}
+	delay := base
+	for i := 1; i < attempt && delay < maxDelay; i++ {
+		delay *= 2
+	}
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	half := delay / 2
+	if half <= 0 {
+		return delay
+	}
+	return half + time.Duration(rand.Int63n(int64(half)+1))
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	when, err := http.ParseTime(value)
+	if err != nil || !when.After(now) {
+		return 0
+	}
+	return when.Sub(now)
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (g *InferenceGateway) authorized(r *http.Request) bool {
@@ -551,14 +864,23 @@ func (g *InferenceGateway) recordError(err error) {
 }
 
 type gatewayRequestInfo struct {
-	RequestID string
-	AgentID   string
-	DomainID  string
-	Profile   string
-	Provider  string
-	Method    string
-	Path      string
-	QueueMS   int64
+	RequestID   string
+	AgentID     string
+	DomainID    string
+	Profile     string
+	Provider    string
+	Method      string
+	Path        string
+	QueueMS     int64
+	Attempt     int
+	MaxAttempts int
+}
+
+type gatewayActiveRequest struct {
+	info      gatewayRequestInfo
+	phase     string
+	startedAt time.Time
+	updatedAt time.Time
 }
 
 func (g *InferenceGateway) recordCompletion(info gatewayRequestInfo, status int, start time.Time, bytesWritten int64) {
@@ -572,39 +894,43 @@ func (g *InferenceGateway) recordCompletion(info gatewayRequestInfo, status int,
 		message = "upstream request rejected"
 	}
 	g.recordEvent(GatewayEvent{
-		At:         time.Now().UTC().Format(time.RFC3339Nano),
-		Level:      level,
-		RequestID:  info.RequestID,
-		AgentID:    info.AgentID,
-		DomainID:   info.DomainID,
-		Profile:    info.Profile,
-		Provider:   info.Provider,
-		Method:     info.Method,
-		Path:       info.Path,
-		Status:     status,
-		QueueMS:    info.QueueMS,
-		DurationMS: time.Since(start).Milliseconds(),
-		Bytes:      bytesWritten,
-		Message:    message,
+		At:          time.Now().UTC().Format(time.RFC3339Nano),
+		Level:       level,
+		RequestID:   info.RequestID,
+		AgentID:     info.AgentID,
+		DomainID:    info.DomainID,
+		Profile:     info.Profile,
+		Provider:    info.Provider,
+		Method:      info.Method,
+		Path:        info.Path,
+		Status:      status,
+		QueueMS:     info.QueueMS,
+		DurationMS:  time.Since(start).Milliseconds(),
+		Bytes:       bytesWritten,
+		Attempt:     info.Attempt,
+		MaxAttempts: info.MaxAttempts,
+		Message:     message,
 	})
 }
 
 func (g *InferenceGateway) recordFailure(info gatewayRequestInfo, status int, start time.Time, message string) {
 	g.recordStatus(status)
 	g.recordEvent(GatewayEvent{
-		At:         time.Now().UTC().Format(time.RFC3339Nano),
-		Level:      "error",
-		RequestID:  info.RequestID,
-		AgentID:    info.AgentID,
-		DomainID:   info.DomainID,
-		Profile:    info.Profile,
-		Provider:   info.Provider,
-		Method:     info.Method,
-		Path:       info.Path,
-		Status:     status,
-		QueueMS:    info.QueueMS,
-		DurationMS: time.Since(start).Milliseconds(),
-		Message:    sanitizeGatewayMessage(message),
+		At:          time.Now().UTC().Format(time.RFC3339Nano),
+		Level:       "error",
+		RequestID:   info.RequestID,
+		AgentID:     info.AgentID,
+		DomainID:    info.DomainID,
+		Profile:     info.Profile,
+		Provider:    info.Provider,
+		Method:      info.Method,
+		Path:        info.Path,
+		Status:      status,
+		QueueMS:     info.QueueMS,
+		DurationMS:  time.Since(start).Milliseconds(),
+		Attempt:     info.Attempt,
+		MaxAttempts: info.MaxAttempts,
+		Message:     sanitizeGatewayMessage(message),
 	})
 }
 
@@ -635,7 +961,7 @@ func (g *InferenceGateway) recordEvent(event GatewayEvent) {
 	g.mu.Unlock()
 
 	if event.Level != "debug" || logLevel == "debug" || logLevel == "trace" {
-		log.Printf("inference-gateway: %s request=%s agent=%s domain=%s profile=%s provider=%s method=%s path=%s status=%d queue_ms=%d duration_ms=%d bytes=%d msg=%s",
+		log.Printf("inference-gateway: %s request=%s agent=%s domain=%s profile=%s provider=%s method=%s path=%s status=%d queue_ms=%d duration_ms=%d bytes=%d attempt=%d/%d msg=%s",
 			event.Level,
 			event.RequestID,
 			event.AgentID,
@@ -648,6 +974,8 @@ func (g *InferenceGateway) recordEvent(event GatewayEvent) {
 			event.QueueMS,
 			event.DurationMS,
 			event.Bytes,
+			event.Attempt,
+			event.MaxAttempts,
 			event.Message,
 		)
 	}
@@ -777,40 +1105,92 @@ func writeGatewayJSON(w http.ResponseWriter, status int, payload any) {
 
 type gatewayLimiter struct {
 	capacity int
-	ch       chan struct{}
 	mu       sync.Mutex
-	queued   int
+	inUse    int
+	waiters  []*gatewayWaiter
+}
+
+type gatewayWaiter struct {
+	ready   chan struct{}
+	granted bool
 }
 
 func newGatewayLimiter(capacity int) *gatewayLimiter {
 	if capacity <= 0 {
 		capacity = 1
 	}
-	return &gatewayLimiter{
-		capacity: capacity,
-		ch:       make(chan struct{}, capacity),
-	}
+	return &gatewayLimiter{capacity: capacity}
 }
 
 func (l *gatewayLimiter) acquire(ctx context.Context) (func(), error) {
 	l.mu.Lock()
-	l.queued++
-	l.mu.Unlock()
-	defer func() {
-		l.mu.Lock()
-		l.queued--
+	if len(l.waiters) == 0 && l.inUse < l.capacity {
+		l.inUse++
 		l.mu.Unlock()
-	}()
+		return l.releaseFunc(), nil
+	}
+	waiter := &gatewayWaiter{ready: make(chan struct{})}
+	l.waiters = append(l.waiters, waiter)
+	l.grantLocked()
+	l.mu.Unlock()
+
 	select {
-	case l.ch <- struct{}{}:
-		return func() { <-l.ch }, nil
+	case <-waiter.ready:
+		return l.releaseFunc(), nil
 	case <-ctx.Done():
+		l.mu.Lock()
+		if waiter.granted {
+			l.mu.Unlock()
+			return l.releaseFunc(), nil
+		}
+		for i, queued := range l.waiters {
+			if queued == waiter {
+				l.waiters = append(l.waiters[:i], l.waiters[i+1:]...)
+				break
+			}
+		}
+		l.grantLocked()
+		l.mu.Unlock()
 		return nil, ctx.Err()
+	}
+}
+
+func (l *gatewayLimiter) releaseFunc() func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			l.mu.Lock()
+			if l.inUse > 0 {
+				l.inUse--
+			}
+			l.grantLocked()
+			l.mu.Unlock()
+		})
+	}
+}
+
+func (l *gatewayLimiter) setCapacity(capacity int) {
+	if capacity <= 0 {
+		capacity = 1
+	}
+	l.mu.Lock()
+	l.capacity = capacity
+	l.grantLocked()
+	l.mu.Unlock()
+}
+
+func (l *gatewayLimiter) grantLocked() {
+	for l.inUse < l.capacity && len(l.waiters) > 0 {
+		waiter := l.waiters[0]
+		l.waiters = l.waiters[1:]
+		waiter.granted = true
+		l.inUse++
+		close(waiter.ready)
 	}
 }
 
 func (l *gatewayLimiter) snapshot() (capacity, inUse, queued int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.capacity, len(l.ch), l.queued
+	return l.capacity, l.inUse, len(l.waiters)
 }

@@ -40,7 +40,7 @@ func (d *Daemon) seedBuildSpecAttemptContext(attempt *BuildSpecAttempt) {
 		return
 	}
 	switch attempt.Status {
-	case BuildSpecAttemptActive, BuildSpecAttemptAllocating, BuildSpecAttemptPlanning, BuildSpecAttemptCommitting:
+	case BuildSpecAttemptActive, BuildSpecAttemptPaused, BuildSpecAttemptAllocating, BuildSpecAttemptPlanning, BuildSpecAttemptCommitting:
 	default:
 		return
 	}
@@ -192,7 +192,7 @@ func (d *Daemon) prepareBuildSpecAttempt(specPath string, specData []byte) (*Bui
 
 	snapshot := d.dagManager.Snapshot()
 	if loaded != nil {
-		if loaded.Status == BuildSpecAttemptActive {
+		if loaded.Status == BuildSpecAttemptActive || loaded.Status == BuildSpecAttemptPaused {
 			return nil, fmt.Errorf("build-spec already active for this run")
 		}
 		if loaded.Status == BuildSpecAttemptPlanning || loaded.Status == BuildSpecAttemptCommitting || loaded.Status == BuildSpecAttemptAllocating {
@@ -245,10 +245,18 @@ func (d *Daemon) executeBuildSpecAttempt(ctx context.Context, attempt *BuildSpec
 	_ = appendBuildSpecTrace(d.runState.Root, fmt.Sprintf("coordinator prompt dispatched; spec_bytes=%d files=%d modules=%d", len(specData), scan.FileCount, scan.ModuleCount))
 	d.server.BroadcastAgentStatus("coordinator", "Coordinator is planning a DAG from the spec...", "info")
 	req := coordinator.PlanRequest{
+		AttemptID:   attempt.AttemptID,
 		UserPrompt:  string(specData),
 		ProjectRoot: d.projectRoot,
 		ProjectScan: scan,
 	}
+	attempt.PlannerSessionDir = filepath.Join(d.runState.PiSessionsDir, "coordinator", attempt.AttemptID)
+	attempt.PlanningArtifactDir = filepath.Join(d.projectRoot, "docs", "aion", "planning", attempt.AttemptID)
+	attempt.UpdatedAt = time.Now().UTC()
+	if err := saveBuildSpecAttempt(d.runState.Root, attempt); err != nil {
+		return fmt.Errorf("save coordinator attempt metadata: %w", err)
+	}
+	_ = appendBuildSpecTrace(d.runState.Root, fmt.Sprintf("coordinator attempt scoped: session=%s artifacts=%s", attempt.PlannerSessionDir, attempt.PlanningArtifactDir))
 
 	plan, err := d.coordinator.Plan(ctx, req)
 	if err != nil {
@@ -328,7 +336,71 @@ func (d *Daemon) executeBuildSpecAttempt(ctx context.Context, attempt *BuildSpec
 		handoff.MarkBuildSpecHandoff()
 	}
 	d.server.BroadcastAgentStatus("coordinator", "Coordinator build-spec planning and allocation complete.", "ok")
+	d.startBuildSpecExecutionMonitor()
 	return nil
+}
+
+func (d *Daemon) startBuildSpecExecutionMonitor() {
+	d.startBuildSpecExecutionMonitorWithInterval(2 * time.Second)
+}
+
+func (d *Daemon) startBuildSpecExecutionMonitorWithInterval(checkInterval time.Duration) {
+	if d == nil || d.allocator == nil {
+		return
+	}
+	if checkInterval <= 0 {
+		checkInterval = 2 * time.Second
+	}
+
+	d.executionMonitorMu.Lock()
+	if d.executionMonitorActive {
+		d.executionMonitorMu.Unlock()
+		return
+	}
+	monitorCtx := d.ctx
+	if monitorCtx == nil {
+		monitorCtx = context.Background()
+	}
+	monitorCtx, cancel := context.WithCancel(monitorCtx)
+	d.executionMonitorRun++
+	run := d.executionMonitorRun
+	allocator := d.allocator
+	d.executionMonitorCancel = cancel
+	d.executionMonitorActive = true
+	d.executionMonitorMu.Unlock()
+
+	go func() {
+		err := allocator.MonitorExecution(monitorCtx, checkInterval)
+
+		d.executionMonitorMu.Lock()
+		if d.executionMonitorRun == run {
+			d.executionMonitorCancel = nil
+			d.executionMonitorActive = false
+		}
+		d.executionMonitorMu.Unlock()
+
+		if err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("daemon: build-spec execution monitor failed: %v", err)
+			if d.server != nil {
+				d.server.BroadcastStatus(fmt.Sprintf("Execution monitor failed: %v", err), "error")
+			}
+		}
+	}()
+}
+
+func (d *Daemon) stopBuildSpecExecutionMonitor() {
+	if d == nil {
+		return
+	}
+	d.executionMonitorMu.Lock()
+	cancel := d.executionMonitorCancel
+	d.executionMonitorRun++
+	d.executionMonitorCancel = nil
+	d.executionMonitorActive = false
+	d.executionMonitorMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func (d *Daemon) commitPlan(plan *coordinator.PlanResponse, attempt *BuildSpecAttempt) error {
@@ -488,7 +560,7 @@ func (d *Daemon) continueBuildSpecAgents() error {
 	if attempt.Plan == nil {
 		return fmt.Errorf("no saved build-spec plan for the current attempt")
 	}
-	if attempt.Status != BuildSpecAttemptActive && attempt.Status != BuildSpecAttemptAllocating {
+	if attempt.Status != BuildSpecAttemptActive && attempt.Status != BuildSpecAttemptPaused && attempt.Status != BuildSpecAttemptAllocating {
 		return fmt.Errorf("build-spec agents are only resumable after allocation has started")
 	}
 	live := d.allocator.AgentInfos()
@@ -505,7 +577,7 @@ func (d *Daemon) resumeActiveBuildSpecAgents(attempt *BuildSpecAttempt) error {
 	if attempt == nil || attempt.Plan == nil {
 		return nil
 	}
-	if attempt.Status != BuildSpecAttemptActive && attempt.Status != BuildSpecAttemptAllocating {
+	if attempt.Status != BuildSpecAttemptActive && attempt.Status != BuildSpecAttemptPaused && attempt.Status != BuildSpecAttemptAllocating {
 		return nil
 	}
 	if len(attempt.Plan.Domains) == 0 {
@@ -532,7 +604,7 @@ func (d *Daemon) resumeActiveBuildSpecAgents(attempt *BuildSpecAttempt) error {
 	}); err != nil {
 		return fmt.Errorf("allocate resumed agents: %w", err)
 	}
-	if attempt.Status == BuildSpecAttemptAllocating {
+	if attempt.Status == BuildSpecAttemptAllocating || attempt.Status == BuildSpecAttemptPaused {
 		attempt.Status = BuildSpecAttemptActive
 		attempt.FailureReason = ""
 		now := time.Now().UTC()
@@ -541,6 +613,49 @@ func (d *Daemon) resumeActiveBuildSpecAgents(attempt *BuildSpecAttempt) error {
 	}
 	d.server.BroadcastAgentStatus("coordinator", "Persisted build-spec agents resumed.", "ok")
 	d.refreshBuildProgress("agents_resumed")
+	return nil
+}
+
+func (d *Daemon) stopBuildSpecAgents() error {
+	if d == nil || d.allocator == nil || d.runState == nil {
+		return fmt.Errorf("domain-agent runtime is not initialized")
+	}
+	attempt, err := loadBuildSpecAttempt(d.runState.Root)
+	if err != nil {
+		return fmt.Errorf("load build-spec attempt: %w", err)
+	}
+	if attempt == nil || attempt.Plan == nil {
+		return fmt.Errorf("no allocated build-spec agents to stop")
+	}
+	switch attempt.Status {
+	case BuildSpecAttemptActive, BuildSpecAttemptAllocating, BuildSpecAttemptPaused:
+	default:
+		return fmt.Errorf("build-spec agents cannot be stopped while attempt is %s", attempt.Status)
+	}
+	if attempt.Status == BuildSpecAttemptPaused && len(d.allocator.AgentInfos()) == 0 {
+		return nil
+	}
+
+	_ = appendBuildSpecTrace(d.runState.Root, "user requested domain-agent pause")
+	d.server.BroadcastTransientStatus("Stopping active domain agents...", "info")
+	d.stopBuildSpecExecutionMonitor()
+	d.allocator.StopAll()
+	if latest, loadErr := loadBuildSpecAttempt(d.runState.Root); loadErr == nil && latest != nil {
+		attempt = latest
+	}
+
+	d.buildSpecMu.Lock()
+	attempt.Status = BuildSpecAttemptPaused
+	attempt.FailureReason = ""
+	attempt.UpdatedAt = time.Now().UTC()
+	d.buildSpecAttempt = attempt
+	err = saveBuildSpecAttempt(d.runState.Root, attempt)
+	d.buildSpecMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("persist paused build-spec attempt: %w", err)
+	}
+	d.server.BroadcastAgentStatus("coordinator", "Domain-agent execution paused. Use /continue-agents to resume.", "warn")
+	d.refreshBuildProgress("agents_paused")
 	return nil
 }
 
@@ -554,6 +669,7 @@ func buildSpecDomainAgentResumeMessage(attempt *BuildSpecAttempt) string {
 Build-spec attempt: %s
 
 The server was restarted or the agent set was explicitly continued. Keep your existing context and continue pending DAG work for your assigned domain.
+Your current working directory is a filtered source workspace for your assigned domain. Treat it as the project source view; do not cd outside it or inspect parent/runtime directories.
 Do not re-run the original onboarding/system prompt. Use orchestrator-cli to read the DAG, acquire locks, update task status, create stubs, and coordinate through the context hub.
 Do not read, search, or modify excluded runtime/generated paths such as .aion/, .git/, .agents/, .codex/, dependency caches, build outputs, or paths listed in .aionignore.
 If you are unsure what is pending, inspect the DAG first and continue only work assigned to you.`, attemptID))

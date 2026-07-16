@@ -22,6 +22,9 @@ cd kernel && go build -o skills/orchestrator-cli/bin/orchestrator-cli ./cmd/orch
 | `split-node` | `--node-id`, `--into` | Split task |
 | `read-dag` | (optional: `--node-id`) | Read DAG state |
 | `heartbeat` | `--agent-id` | Health heartbeat |
+| `debug-status` | optional `--pretty`, `--key` | Runtime diagnostics |
+| `set-gateway-capacity` | `--capacity` | Change runtime inference concurrency |
+| `stop-agents` | none | Pause active Domain Agents |
 
 ## Environment Variables
 

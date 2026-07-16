@@ -27,6 +27,8 @@ type PiAgentConfig struct {
 	Model string
 	// SessionDir is the directory for Pi Agent session files.
 	SessionDir string
+	// ResumeSession tells Pi to reopen the latest session in SessionDir.
+	ResumeSession bool
 	// WorkingDir is the project root directory.
 	WorkingDir string
 	// Env specifies additional environment variables (e.g., AION_ORCHESTRATOR_ADDR)
@@ -237,6 +239,9 @@ func SpawnPiAgent(config PiAgentConfig) (*PiAgentProcess, error) {
 	}
 	if config.SessionDir != "" {
 		args = append(args, "--session-dir", config.SessionDir)
+	}
+	if config.ResumeSession {
+		args = append(args, "--continue")
 	}
 	for _, skill := range config.SkillPaths {
 		if strings.TrimSpace(skill) == "" {

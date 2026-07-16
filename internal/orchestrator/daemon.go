@@ -45,6 +45,10 @@ type Daemon struct {
 	buildSpecContinueArmed bool
 	buildSpecCancel        context.CancelFunc
 	buildSpecAttempt       *BuildSpecAttempt
+	executionMonitorMu     sync.Mutex
+	executionMonitorCancel context.CancelFunc
+	executionMonitorRun    uint64
+	executionMonitorActive bool
 	progressMu             sync.Mutex
 	lastProgressSignature  string
 	staleMu                sync.Mutex
@@ -118,8 +122,13 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	if config.GatewayEnabled() {
 		inferenceGateway = NewInferenceGateway(config, runState.LogsDir)
 		inferenceGateway.SetActivityFunc(func(agentID, domainID, phase string) {
-			if alloc.RecordAgentActivity(agentID) && config.Orchestrator.LogLevel == "debug" {
+			if alloc.RecordAgentActivity(agentID, phase) && config.Orchestrator.LogLevel == "debug" {
 				log.Printf("inference-gateway: liveness pulse agent=%s domain=%s phase=%s", agentID, domainID, phase)
+			}
+			if recorder, ok := coord.(interface {
+				RecordPlannerGatewayActivity(agentID, domainID, phase string)
+			}); ok {
+				recorder.RecordPlannerGatewayActivity(agentID, domainID, phase)
 			}
 		})
 	}
@@ -239,8 +248,13 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 			daemon.buildSpecContinueArmed = false
 			daemon.buildSpecMu.Unlock()
 		}()
-		return daemon.continueBuildSpecAgents()
+		if err := daemon.continueBuildSpecAgents(); err != nil {
+			return err
+		}
+		daemon.startBuildSpecExecutionMonitor()
+		return nil
 	})
+	server.SetBuildSpecStopAgentsCallback(daemon.stopBuildSpecAgents)
 
 	server.SetArchitectStatusCallback(func() string {
 		statusable, ok := daemon.coordinator.(interface{ SessionStatus() string })
@@ -335,6 +349,12 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 		}
 		return daemon.inferenceGateway.Status()
 	})
+	server.SetInferenceGatewayCapacityCallback(func(capacity int) (InferenceGatewayStatus, error) {
+		if daemon.inferenceGateway == nil || !daemon.config.GatewayEnabled() {
+			return InferenceGatewayStatus{Enabled: false}, fmt.Errorf("inference gateway is disabled")
+		}
+		return daemon.inferenceGateway.SetCapacity(capacity)
+	})
 	server.SetAgentListCallback(func() []AgentInfo {
 		infos := []AgentInfo{{
 			AgentID:  "coordinator",
@@ -363,6 +383,15 @@ func (d *Daemon) configureAllocatorCallbacks() {
 	d.allocator.SetAgentStateFunc(func(agentID, domainID, state, reason string) {
 		d.recordBuildSpecAgentState(agentID, domainID, state, reason)
 		d.recordAgentLifecycleProgress(agentID, domainID, state, reason)
+		level := "info"
+		if state == "Crashed" {
+			level = "error"
+		}
+		text := fmt.Sprintf("%s is %s", agentID, state)
+		if strings.TrimSpace(reason) != "" {
+			text += ": " + strings.TrimSpace(reason)
+		}
+		d.server.BroadcastAgentStatus(agentID, text, level)
 	})
 	d.allocator.SetLifecycleFunc(func(agentID, domainID string, event supervisor.AgentLifecycleEvent) {
 		d.observeAgentLifecycleBehavior(agentID, domainID, event)
@@ -385,7 +414,13 @@ func (d *Daemon) shouldSuppressStaleNodeAudit(node dag.DagNode) bool {
 	if d == nil || d.runState == nil || strings.TrimSpace(node.ID) == "" {
 		return false
 	}
-	attempt := d.buildSpecAttempt
+	d.buildSpecMu.Lock()
+	var attempt *BuildSpecAttempt
+	if d.buildSpecAttempt != nil {
+		copyAttempt := *d.buildSpecAttempt
+		attempt = &copyAttempt
+	}
+	d.buildSpecMu.Unlock()
 	if attempt == nil {
 		loaded, err := loadBuildSpecAttempt(d.runState.Root)
 		if err != nil {
@@ -397,7 +432,7 @@ func (d *Daemon) shouldSuppressStaleNodeAudit(node dag.DagNode) bool {
 		return false
 	}
 	switch attempt.Status {
-	case BuildSpecAttemptActive, BuildSpecAttemptAllocating:
+	case BuildSpecAttemptActive, BuildSpecAttemptPaused, BuildSpecAttemptAllocating:
 	default:
 		return false
 	}
@@ -450,7 +485,7 @@ func (d *Daemon) recordBuildSpecAgentState(agentID, domainID, state, reason stri
 			return
 		}
 		switch loaded.Status {
-		case BuildSpecAttemptPlanning, BuildSpecAttemptCommitting, BuildSpecAttemptAllocating, BuildSpecAttemptActive:
+		case BuildSpecAttemptPlanning, BuildSpecAttemptCommitting, BuildSpecAttemptAllocating, BuildSpecAttemptActive, BuildSpecAttemptPaused:
 			attempt = loaded
 			d.buildSpecAttempt = attempt
 		default:
@@ -672,15 +707,18 @@ func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunSta
 	}
 
 	return coordinator.NewPiCoordinator(projectRoot, coordinator.PiCoordinatorConfig{
-		Binary:          config.Agents.CommandPath,
-		SessionDir:      runState.PiSessionsDir,
-		SessionStoreDir: runState.AgentSessionsDir,
-		Provider:        provider,
-		Model:           model,
-		Endpoint:        endpoint,
-		SkillPaths:      config.Agents.SkillPaths,
-		ExtensionPaths:  config.Agents.ExtensionPaths,
-		Env:             envVars,
+		Binary:                     config.Agents.CommandPath,
+		SessionDir:                 runState.PiSessionsDir,
+		SessionStoreDir:            runState.AgentSessionsDir,
+		Provider:                   provider,
+		Model:                      model,
+		Endpoint:                   endpoint,
+		SkillPaths:                 config.Agents.SkillPaths,
+		ExtensionPaths:             config.Agents.ExtensionPaths,
+		Env:                        envVars,
+		PlannerStartTimeout:        time.Duration(config.Health.CoordinatorPlannerStartTimeoutSec) * time.Second,
+		PlannerFirstRequestTimeout: time.Duration(config.Health.CoordinatorPlannerFirstRequestTimeoutSec) * time.Second,
+		PlannerArtifactTimeout:     time.Duration(config.Health.CoordinatorPlannerArtifactTimeoutSec) * time.Second,
 	})
 }
 
@@ -719,7 +757,7 @@ func (d *Daemon) Start() error {
 
 	if attempt, err := loadBuildSpecAttempt(d.runState.Root); err == nil && attempt != nil {
 		switch attempt.Status {
-		case BuildSpecAttemptActive, BuildSpecAttemptAllocating, BuildSpecAttemptPlanning, BuildSpecAttemptCommitting:
+		case BuildSpecAttemptActive, BuildSpecAttemptPaused, BuildSpecAttemptAllocating, BuildSpecAttemptPlanning, BuildSpecAttemptCommitting:
 			d.seedBuildSpecAttemptContext(attempt)
 			d.refreshBuildProgress("startup")
 			d.server.BroadcastTransientStatus("Persisted build-spec attempt loaded. Issue /continue-agents to resume domain work.", "info")
@@ -777,6 +815,7 @@ func (d *Daemon) ResetCurrentRun() error {
 			return fmt.Errorf("stop architect: %w", err)
 		}
 	}
+	d.stopBuildSpecExecutionMonitor()
 	d.allocator.StopAll()
 
 	oldDAG := d.dagManager
@@ -866,6 +905,7 @@ func (d *Daemon) Shutdown() {
 	}
 
 	log.Println("daemon: stopping background tasks (auditor)...")
+	d.stopBuildSpecExecutionMonitor()
 	if d.cancel != nil {
 		d.cancel()
 	}

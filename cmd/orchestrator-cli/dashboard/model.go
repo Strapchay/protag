@@ -22,7 +22,8 @@ type Model struct {
 	ChatInput *ChatModel
 	StatusBar *StatusModel
 
-	options Options
+	options      Options
+	stopAgentsFn func()
 }
 
 // Options configures dashboard diagnostics and display behavior.
@@ -83,6 +84,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
+		if msg.String() == "esc" && m.SelectedPane == "chat" && m.ChatInput != nil && m.ChatInput.inputBlurred && !m.ChatInput.buildSpecActive {
+			m.stopAgents()
+			return m, nil
+		}
+		if msg.String() == "esc" && m.SelectedPane == "agents" && m.LogView != nil && !m.LogView.input.Focused() {
+			m.stopAgents()
+			return m, nil
+		}
 
 		switch msg.String() {
 		case "shift+tab", "backtab":
@@ -119,7 +128,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	if m.ChatInput != nil {
 		if m.SelectedPane == "chat" {
-			if !m.ChatInput.input.Focused() {
+			if !m.ChatInput.input.Focused() && !m.ChatInput.inputBlurred {
 				m.ChatInput.input.Focus()
 			}
 		} else {
@@ -244,6 +253,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+func (m *Model) stopAgents() {
+	if m.stopAgentsFn != nil {
+		m.stopAgentsFn()
+		return
+	}
+	if m.ChatInput != nil {
+		go m.ChatInput.executeCommand("/stop-agents")
+	}
 }
 
 func (m *Model) updateActivePane(msg tea.Msg) tea.Cmd {

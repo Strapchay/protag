@@ -18,6 +18,8 @@ func TestArchitectCommandHandlers(t *testing.T) {
 	continueCalled := false
 	resumeCalled := false
 	continueAgentsCalled := false
+	stopAgentsCalled := false
+	capacityCalled := false
 	resetCalled := false
 	s.SetArchitectStatusCallback(func() string { return "status=awaiting_user" })
 	s.SetArchitectRetryCallback(func() error {
@@ -35,6 +37,14 @@ func TestArchitectCommandHandlers(t *testing.T) {
 	s.SetBuildSpecContinueCallback(func() error {
 		continueAgentsCalled = true
 		return nil
+	})
+	s.SetBuildSpecStopAgentsCallback(func() error {
+		stopAgentsCalled = true
+		return nil
+	})
+	s.SetInferenceGatewayCapacityCallback(func(capacity int) (InferenceGatewayStatus, error) {
+		capacityCalled = capacity == 3
+		return InferenceGatewayStatus{Enabled: true, Capacity: capacity}, nil
 	})
 	s.SetArchitectShowSpecCallback(func() (string, error) { return "# Spec", nil })
 	s.SetArchitectResetCallback(func() error {
@@ -62,6 +72,13 @@ func TestArchitectCommandHandlers(t *testing.T) {
 	}
 	if resp := s.handleRequest(Request{ID: "7", Method: "architect-reset"}); resp.Error != "" || !resetCalled {
 		t.Fatalf("architect-reset resp=%#v called=%v", resp, resetCalled)
+	}
+	if resp := s.handleRequest(Request{ID: "8", Method: "stop-agents"}); resp.Error != "" || !stopAgentsCalled {
+		t.Fatalf("stop-agents resp=%#v called=%v", resp, stopAgentsCalled)
+	}
+	params, _ := json.Marshal(map[string]int{"capacity": 3})
+	if resp := s.handleRequest(Request{ID: "9", Method: "set-gateway-capacity", Params: params}); resp.Error != "" || !capacityCalled {
+		t.Fatalf("set-gateway-capacity resp=%#v called=%v", resp, capacityCalled)
 	}
 }
 

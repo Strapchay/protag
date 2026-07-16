@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPiCoordinator_PlanRequiresPlannerBinary(t *testing.T) {
@@ -65,16 +66,17 @@ func TestPiCoordinator_PreparePlanningArtifacts(t *testing.T) {
 	tmpDir := t.TempDir()
 	coord := NewPiCoordinator(tmpDir, PiCoordinatorConfig{Binary: "pi"})
 	paths, err := coord.preparePlanningArtifacts("Build the app", PlanRequest{
+		AttemptID:   "buildspec-test-1",
 		ProjectRoot: tmpDir,
 		ProjectScan: &ProjectScan{EntryPoints: []string{"cmd/main.go"}},
 	})
 	if err != nil {
 		t.Fatalf("preparePlanningArtifacts: %v", err)
 	}
-	if paths.InputPath != filepath.Join(tmpDir, "docs", "aion", "planning_input.json") {
+	if paths.InputPath != filepath.Join(tmpDir, "docs", "aion", "planning", "buildspec-test-1", "planning_input.json") {
 		t.Fatalf("unexpected input path: %s", paths.InputPath)
 	}
-	if paths.OutputPath != filepath.Join(tmpDir, "docs", "aion", "plan_response.json") {
+	if paths.OutputPath != filepath.Join(tmpDir, "docs", "aion", "planning", "buildspec-test-1", "plan_response.json") {
 		t.Fatalf("unexpected output path: %s", paths.OutputPath)
 	}
 
@@ -86,8 +88,56 @@ func TestPiCoordinator_PreparePlanningArtifacts(t *testing.T) {
 	if err := json.Unmarshal(data, &input); err != nil {
 		t.Fatalf("unmarshal planning input: %v", err)
 	}
-	if input.BuildSpec != "Build the app" || input.OutputPath != paths.OutputPath {
+	if input.AttemptHint != "buildspec-test-1" || input.BuildSpec != "Build the app" || input.OutputPath != paths.OutputPath {
 		t.Fatalf("unexpected planning input: %#v", input)
+	}
+	if len(input.ExcludedPaths) == 0 || !IsAgentExcludedPath(".aion/runs/current", input.ExcludedPaths) {
+		t.Fatalf("planning input should include resolved excluded paths: %#v", input.ExcludedPaths)
+	}
+}
+
+func TestPlannerAttemptIDIsPathSafe(t *testing.T) {
+	got := plannerAttemptID("../../build spec:one")
+	if got != "build-spec-one" {
+		t.Fatalf("plannerAttemptID() = %q", got)
+	}
+}
+
+func TestPiCoordinator_PlannerGatewayActivityHandshake(t *testing.T) {
+	coord := NewPiCoordinator(t.TempDir(), PiCoordinatorConfig{
+		PlannerFirstRequestTimeout: time.Second,
+	})
+	ch := coord.beginPlannerGatewayWatch()
+	go coord.RecordPlannerGatewayActivity("coordinator", "coordinator", "forwarding")
+
+	if err := coord.waitForPlannerGatewayActivity(context.Background(), ch, filepath.Join(t.TempDir(), "plan_response.json")); err != nil {
+		t.Fatalf("waitForPlannerGatewayActivity: %v", err)
+	}
+}
+
+func TestPiCoordinator_PlannerGatewayActivityTimeoutIncludesRawTail(t *testing.T) {
+	tmpDir := t.TempDir()
+	sessionDir := filepath.Join(".aion", "runs", "run-test", "pi_sessions")
+	rawDir := filepath.Join(tmpDir, sessionDir, "coordinator")
+	if err := os.MkdirAll(rawDir, 0755); err != nil {
+		t.Fatalf("mkdir raw dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rawDir, "pi_raw.log"), []byte("line one\nline two\n"), 0644); err != nil {
+		t.Fatalf("write raw log: %v", err)
+	}
+
+	coord := NewPiCoordinator(tmpDir, PiCoordinatorConfig{
+		SessionDir:                 sessionDir,
+		PlannerFirstRequestTimeout: 10 * time.Millisecond,
+	})
+	ch := coord.beginPlannerGatewayWatch()
+
+	err := coord.waitForPlannerGatewayActivity(context.Background(), ch, filepath.Join(tmpDir, "missing.json"))
+	if err == nil {
+		t.Fatal("expected timeout")
+	}
+	if got := err.Error(); !strings.Contains(got, "no coordinator inference request observed") || !strings.Contains(got, "line two") {
+		t.Fatalf("unexpected timeout error: %s", got)
 	}
 }
 

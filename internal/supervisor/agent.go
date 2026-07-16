@@ -62,8 +62,10 @@ type AgentConfig struct {
 	// CgroupConfig configures resource limits.
 	Cgroup CgroupConfig
 	// HealthConfig
-	HeartbeatTimeout time.Duration
-	ProgressTimeout  time.Duration
+	HeartbeatTimeout      time.Duration
+	ProgressTimeout       time.Duration
+	ExternalActivityStale time.Duration
+	ExternalActivityMax   time.Duration
 	// MaxCrashRestarts is the maximum number of crash recoveries before giving up.
 	MaxCrashRestarts int
 }
@@ -98,6 +100,12 @@ func NewAgentSupervisor(config AgentConfig) *AgentSupervisor {
 	}
 	if config.ProgressTimeout <= 0 {
 		config.ProgressTimeout = 15 * time.Minute
+	}
+	if config.ExternalActivityStale <= 0 {
+		config.ExternalActivityStale = 45 * time.Second
+	}
+	if config.ExternalActivityMax <= 0 {
+		config.ExternalActivityMax = 15 * time.Minute
 	}
 	return &AgentSupervisor{
 		config:      config,
@@ -218,6 +226,8 @@ func (s *AgentSupervisor) spawnAgent(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("spawn pi agent: %w", err)
 	}
+	// Any later crash respawn should reopen the session created by this process.
+	s.config.PiAgent.ResumeSession = true
 
 	// Assign to cgroup
 	if s.config.Cgroup.Enabled {
@@ -236,6 +246,7 @@ func (s *AgentSupervisor) spawnAgent(ctx context.Context) error {
 		s.config.HeartbeatTimeout,
 		s.config.ProgressTimeout,
 	)
+	hm.SetExternalActivityTimeouts(s.config.ExternalActivityStale, s.config.ExternalActivityMax)
 	hm.OnTimeout(func(agentID string, status HealthStatus) {
 		log.Printf("supervisor: agent %s health timeout: %d", agentID, status)
 		s.handleCrash("health timeout")
@@ -381,13 +392,18 @@ func (s *AgentSupervisor) State() AgentState {
 
 // RecordActivity marks the supervised agent as live based on external runtime
 // activity such as an in-flight gateway request.
-func (s *AgentSupervisor) RecordActivity() {
+func (s *AgentSupervisor) RecordActivity(phase ...string) {
 	s.mu.Lock()
 	hm := s.healthMonitor
 	s.mu.Unlock()
-	if hm != nil {
-		hm.RecordHeartbeat()
+	if hm == nil {
+		return
 	}
+	if len(phase) > 0 && strings.TrimSpace(phase[0]) != "" {
+		hm.RecordExternalActivity(strings.TrimSpace(phase[0]))
+		return
+	}
+	hm.RecordHeartbeat()
 }
 
 // AgentID returns the agent's unique identifier.

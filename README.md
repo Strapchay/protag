@@ -104,7 +104,33 @@ kernel/
 
 ## Configuration
 
-See `configs/aion.yaml` for the default configuration.
+See `configs/aion.yaml` and `.env.example` for the default configuration.
+For long-running agent turns, tune `AION_PROGRESS_TIMEOUT_SEC`,
+`AION_EXTERNAL_ACTIVITY_STALE_TIMEOUT_SEC`, and
+`AION_EXTERNAL_ACTIVITY_MAX_DURATION_SEC` so queued or in-flight gateway
+requests are not mistaken for stalled agents.
+For `/build-spec` planner handoff diagnosis, tune
+`AION_COORDINATOR_PLANNER_START_TIMEOUT_SEC` and
+`AION_COORDINATOR_PLANNER_FIRST_REQUEST_TIMEOUT_SEC`. To bound the full
+Coordinator plan artifact wait, tune
+`AION_COORDINATOR_PLANNER_ARTIFACT_TIMEOUT_SEC`.
+The Coordinator writes attempt-scoped planning files under
+`docs/aion/planning/<attempt_id>/`. It writes `plan_response.json` directly;
+the daemon waits for complete JSON and a valid plan before mutating the DAG.
+
+Gateway retries are controlled by `AION_INFERENCE_GATEWAY_MAX_RETRIES`,
+`AION_INFERENCE_GATEWAY_RETRY_BASE_DELAY_MS`, and
+`AION_INFERENCE_GATEWAY_RETRY_MAX_DELAY_MS`. Runtime concurrency can be changed
+with `orchestrator-cli set-gateway-capacity --capacity <N>` or the dashboard's
+`/gateway-capacity <N>` command. `/stop-agents` pauses active Domain Agents
+without failing their DAG nodes; `/continue-agents` resumes them.
+
+Domain agents run from filtered per-agent source workspaces under the system
+temp directory. Each workspace contains `AGENTS.md` plus symlinks for only the
+domain's assigned paths, so runtime and control directories such as `.aion/`,
+`.git/`, `.agents/`, and `.codex/` are not visible from a normal `ls -la`.
+`.aionignore` still controls scan/planning exclusions, but the filtered
+workspace is the enforcement boundary for domain-agent file discovery.
 
 ## Documentation
 

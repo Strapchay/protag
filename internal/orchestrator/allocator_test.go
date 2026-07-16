@@ -17,11 +17,16 @@ func TestAllocateResumeUsesConcisePromptForExistingPiSession(t *testing.T) {
 	script := filepath.Join(root, "dummy-pi.sh")
 	if err := os.WriteFile(script, []byte(`#!/usr/bin/env bash
 session=""
+resume="false"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --session-dir)
       session="$2"
       shift 2
+      ;;
+    --continue)
+      resume="true"
+      shift
       ;;
     *)
       shift
@@ -29,6 +34,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 mkdir -p "$session"
+echo "resume=$resume" > "$session/launch.env"
 while IFS= read -r line; do
   echo "$line" >> "$session/received.jsonl"
   echo '{"type":"turn_start","message":"ready"}'
@@ -49,7 +55,7 @@ done
 	if err := os.MkdirAll(agentDir, 0o755); err != nil {
 		t.Fatalf("mkdir agent dir: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(agentDir, "session_state.json"), []byte("{}"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(agentDir, "prior-session.jsonl"), []byte("{}\n"), 0o644); err != nil {
 		t.Fatalf("seed session state: %v", err)
 	}
 
@@ -76,6 +82,10 @@ done
 	}
 	if strings.Contains(received, `"type":"prompt","message":"FULL INITIAL PROMPT"`) {
 		t.Fatalf("resume path sent fresh initial prompt:\n%s", received)
+	}
+	launch := waitForFileContains(t, filepath.Join(agentDir, "launch.env"), "resume=true")
+	if !strings.Contains(launch, "resume=true") {
+		t.Fatalf("resume path did not pass Pi --continue:\n%s", launch)
 	}
 }
 
@@ -171,6 +181,99 @@ done
 	} {
 		if !strings.Contains(launch, want) {
 			t.Fatalf("launch env missing %q:\n%s", want, launch)
+		}
+	}
+}
+
+func TestPrepareAgentWorkDirHidesRuntimePathsAndLinksAssignedPaths(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".aion", "runs"), 0o755); err != nil {
+		t.Fatalf("mkdir runtime dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir git dir: %v", err)
+	}
+	sourceDir := filepath.Join(root, "oltp", "storage")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatalf("mkdir source dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "page.py"), []byte("page = 1\n"), 0o644); err != nil {
+		t.Fatalf("write source file: %v", err)
+	}
+
+	router := hub.NewRouter(filepath.Join(root, "logs"))
+	defer router.Close()
+	allocator := NewAllocator(&Config{}, root, router, nil)
+	workDir, err := allocator.prepareAgentWorkDir("agent-storage", coordinator.Domain{
+		DomainID:      "storage",
+		AssignedPaths: []string{"oltp/storage"},
+	}, "domain prompt")
+	if err != nil {
+		t.Fatalf("prepareAgentWorkDir: %v", err)
+	}
+
+	entries, err := os.ReadDir(workDir)
+	if err != nil {
+		t.Fatalf("read filtered workdir: %v", err)
+	}
+	for _, entry := range entries {
+		switch entry.Name() {
+		case ".aion", ".git", ".agents", ".codex":
+			t.Fatalf("filtered workdir leaked runtime path %q", entry.Name())
+		}
+	}
+	if _, err := os.Stat(filepath.Join(workDir, "AGENTS.md")); err != nil {
+		t.Fatalf("filtered AGENTS.md missing: %v", err)
+	}
+
+	linkPath := filepath.Join(workDir, "oltp", "storage")
+	info, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatalf("assigned path link missing: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("assigned path is not a symlink: %s", linkPath)
+	}
+
+	written := filepath.Join(workDir, "oltp", "storage", "new_page.py")
+	if err := os.WriteFile(written, []byte("new_page = 1\n"), 0o644); err != nil {
+		t.Fatalf("write through filtered workspace: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "oltp", "storage", "new_page.py")); err != nil {
+		t.Fatalf("write did not reach project source path: %v", err)
+	}
+}
+
+func TestPrepareAgentWorkDirRejectsExcludedAssignedPath(t *testing.T) {
+	root := t.TempDir()
+	router := hub.NewRouter(filepath.Join(root, "logs"))
+	defer router.Close()
+	allocator := NewAllocator(&Config{}, root, router, nil)
+	_, err := allocator.prepareAgentWorkDir("agent-runtime", coordinator.Domain{
+		DomainID:      "runtime",
+		AssignedPaths: []string{".aion/runs"},
+	}, "domain prompt")
+	if err == nil {
+		t.Fatalf("expected excluded assigned path to fail")
+	}
+	if !strings.Contains(err.Error(), "excluded") {
+		t.Fatalf("expected excluded error, got: %v", err)
+	}
+}
+
+func TestPrepareAgentWorkDirRejectsEscapingAssignedPath(t *testing.T) {
+	root := t.TempDir()
+	router := hub.NewRouter(filepath.Join(root, "logs"))
+	defer router.Close()
+	allocator := NewAllocator(&Config{}, root, router, nil)
+
+	for _, assignedPath := range []string{"../outside", filepath.Join(root, "absolute")} {
+		_, err := allocator.prepareAgentWorkDir("agent-escape", coordinator.Domain{
+			DomainID:      "escape",
+			AssignedPaths: []string{assignedPath},
+		}, "domain prompt")
+		if err == nil {
+			t.Fatalf("expected escaping assigned path %q to fail", assignedPath)
 		}
 	}
 }

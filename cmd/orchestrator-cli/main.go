@@ -106,7 +106,7 @@ func main() {
 
 func resolveCommandAddr(command string) string {
 	switch command {
-	case "debug-status":
+	case "debug-status", "set-gateway-capacity", "stop-agents":
 		return resolveDashboardAddr()
 	default:
 		return resolveOrchestratorAddr()
@@ -332,6 +332,14 @@ func parseCommand(command string, args []string) (map[string]interface{}, error)
 		return map[string]interface{}{}, nil
 	case "build-progress":
 		return map[string]interface{}{}, nil
+	case "stop-agents":
+		return map[string]interface{}{}, nil
+	case "set-gateway-capacity":
+		capacity := 0
+		if _, err := fmt.Sscanf(flags["capacity"], "%d", &capacity); err != nil || capacity < 1 {
+			return nil, fmt.Errorf("set-gateway-capacity requires --capacity <positive integer>")
+		}
+		return map[string]interface{}{"capacity": capacity}, nil
 
 	default:
 		return nil, fmt.Errorf("unknown command: %s", command)
@@ -496,6 +504,8 @@ Commands:
   query-memory    --text <query> [--top-k N]
   debug-status    Print server/run/hub/DAG/agent diagnostics [--pretty|-p] [--key <field>]
   build-progress  Print current build-spec progress projection
+  set-gateway-capacity --capacity <N>  Change runtime inference concurrency
+  stop-agents     Pause active domain agents; resume with /continue-agents
   dashboard       Launch real-time monitoring TUI [--verbose]
 
 Environment:

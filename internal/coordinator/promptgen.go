@@ -34,7 +34,9 @@ func buildDomainPrompt(domain Domain, projectContext, buildSpec string) string {
 	b.WriteString(fmt.Sprintf("# Domain Agent: %s\n\n", domain.DomainID))
 	b.WriteString(fmt.Sprintf("## Description\n%s\n\n", domain.Description))
 	b.WriteString("## Mission\n")
-	b.WriteString("Implement only the work assigned to your domain. Keep your changes inside the assigned paths and the node/task scope in the build spec.\n\n")
+	b.WriteString("Prepare to implement only work dispatched to your domain. Keep all later changes inside the assigned paths and the dispatched node/task scope.\n")
+	b.WriteString("This bootstrap turn is orientation-only: do not inspect project files, run implementation tools, or modify files until the orchestrator sends a `task_dispatch` message. Acknowledge readiness briefly, then wait.\n\n")
+	b.WriteString("Your current working directory is a filtered source workspace for your assigned domain. Treat it as the project source view; do not cd outside it or inspect parent/runtime directories.\n\n")
 
 	if strings.TrimSpace(buildSpec) != "" {
 		b.WriteString("## Build Spec\n")
@@ -64,7 +66,7 @@ func buildDomainPrompt(domain Domain, projectContext, buildSpec string) string {
 	b.WriteString("- Coordinate with other domain agents only when the task truly crosses ownership boundaries.\n")
 	b.WriteString("- If your work requires another domain to change files outside your scope, ask for a stub or a handoff instead of widening your own scope.\n")
 	b.WriteString("- Do not assume you have every Pi capability available. Stay within the supplied skills, your assigned domain scope, and the build spec.\n")
-	b.WriteString("When you receive a `task_dispatch` follow-up, orient yourself, execute it, and then complete the node using the coordination flow in your skills.\n")
+	b.WriteString("Only when you receive a `task_dispatch` follow-up should you orient to that node, execute it, and complete it using the coordination flow in your skills.\n")
 
 	if projectContext != "" {
 		b.WriteString("\n## Project Context\n")
@@ -140,21 +142,23 @@ func GenerateCoordinatorInstruction(projectContext string) string {
 
 // GenerateCoordinatorPlanningInstruction builds the prompt for the Coordinator
 // Pi agent to transform a build spec into a structured plan.
-func GenerateCoordinatorPlanningInstruction(specText string, scan *ProjectScan, inputPath, outputPath string) string {
+func GenerateCoordinatorPlanningInstruction(_ string, scan *ProjectScan, inputPath, outputPath string) string {
 	var b strings.Builder
 	b.WriteString("Read the Coordinator planning input artifact and write the plan artifact.\n")
-	b.WriteString("Do not return the final plan in chat. The chat stream is only for status and observability.\n")
+	b.WriteString("Do not return the final plan in chat. The chat stream is only for short status updates and observability.\n")
 	b.WriteString("Planning input artifact: ")
 	b.WriteString(inputPath)
 	b.WriteString("\n")
-	b.WriteString("Required output artifact: ")
+	b.WriteString("Output artifact: ")
 	b.WriteString(outputPath)
 	b.WriteString("\n\n")
-	b.WriteString("Write a JSON object to the output artifact with this shape:\n")
+	b.WriteString("Write a JSON object directly to the output artifact with this shape:\n")
 	b.WriteString("{\"type\":\"plan_response\",\"domains\":[{\"domain_id\":\"short-stable-domain-id\",\"description\":\"owned implementation area\",\"assigned_paths\":[\"relative/path\"],\"agent_type\":\"domain\"}],\"nodes\":[{\"id\":\"short-stable-task-id\",\"domain_id\":\"short-stable-domain-id\",\"task_spec\":\"specific implementation task\",\"target_files\":[\"relative/path/file.ext\"],\"priority\":1}],\"edges\":[]}\n\n")
 	b.WriteString("The artifact must contain real, non-empty `domains` and `nodes` arrays. Do not copy placeholder IDs or empty arrays.\n")
-	b.WriteString("Create as many domains and task nodes as the spec requires; do not assume a fixed node count.\n")
-	b.WriteString("Never assign excluded runtime/generated paths such as `.aion/`, `.git/`, `.agents/`, `.codex/`, dependency caches, build outputs, or paths listed in `.aionignore` as domains or target files.\n")
+	b.WriteString("Keep the initial plan coarse enough for reliable artifact writing: prefer 3-8 domains and 1-3 nodes per domain. Do not exceed 18 nodes unless the spec truly cannot be represented otherwise.\n")
+	b.WriteString("Use the `excluded_paths` array from the planning input artifact. Do not inspect `.aionignore`; the daemon already resolved it for you.\n")
+	b.WriteString("Do not run exploratory shell commands or inspect runtime/generated folders. Read the input artifact, plan from it, and write the output artifact.\n")
+	b.WriteString("The daemon will wait until the output becomes complete, parseable JSON and then validate its plan contract.\n")
 	b.WriteString("After writing the file, you may briefly state that the artifact was written.\n\n")
 
 	if scan != nil {
@@ -196,10 +200,7 @@ func GenerateCoordinatorPlanningInstruction(specText string, scan *ProjectScan, 
 		b.WriteString("\n\n")
 	}
 
-	b.WriteString("BUILD SPEC\n")
-	b.WriteString(specText)
-	b.WriteString("\n\n")
-	b.WriteString("Write the output artifact now.\n")
+	b.WriteString("The build spec is inside the planning input artifact. Write the output artifact now.\n")
 
 	return b.String()
 }

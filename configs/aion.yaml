@@ -18,6 +18,16 @@ health:
   heartbeat_timeout_sec: ${AION_HEARTBEAT_TIMEOUT_SEC}
   # Seconds without progress (lock/write/update) before agent is killed
   progress_timeout_sec: ${AION_PROGRESS_TIMEOUT_SEC}
+  # Seconds an external runtime pulse may go stale before progress timeout applies
+  external_activity_stale_timeout_sec: ${AION_EXTERNAL_ACTIVITY_STALE_TIMEOUT_SEC}
+  # Maximum seconds an agent can be shielded by one continuous external wait
+  external_activity_max_duration_sec: ${AION_EXTERNAL_ACTIVITY_MAX_DURATION_SEC}
+  # Seconds allowed for Coordinator planner process startup during /build-spec
+  coordinator_planner_start_timeout_sec: ${AION_COORDINATOR_PLANNER_START_TIMEOUT_SEC}
+  # Seconds allowed after prompt dispatch before Coordinator must hit gateway
+  coordinator_planner_first_request_timeout_sec: ${AION_COORDINATOR_PLANNER_FIRST_REQUEST_TIMEOUT_SEC}
+  # Seconds allowed after prompt dispatch for Coordinator to write the plan artifact
+  coordinator_planner_artifact_timeout_sec: ${AION_COORDINATOR_PLANNER_ARTIFACT_TIMEOUT_SEC}
 
 execution:
   # Request-control mode. "gateway" routes Pi provider traffic through Aion.
@@ -38,6 +48,14 @@ inference_gateway:
   gateway_key: ${AION_INFERENCE_GATEWAY_KEY}
   # Optional fallback profile when an agent does not pass a target profile
   target_profile: ${AION_INFERENCE_GATEWAY_TARGET_PROFILE}
+  # Retry only failures observed before response bytes are returned to Pi
+  max_retries: ${AION_INFERENCE_GATEWAY_MAX_RETRIES}
+  # Initial exponential retry delay in milliseconds
+  retry_base_delay_ms: ${AION_INFERENCE_GATEWAY_RETRY_BASE_DELAY_MS}
+  # Maximum retry and Retry-After delay in milliseconds
+  retry_max_delay_ms: ${AION_INFERENCE_GATEWAY_RETRY_MAX_DELAY_MS}
+  # Total seconds an admitted upstream request may hold gateway capacity
+  upstream_timeout_sec: ${AION_INFERENCE_GATEWAY_UPSTREAM_TIMEOUT_SEC}
 
 cgroups:
   # Enable cgroup resource limits (requires Linux + permissions)

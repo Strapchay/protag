@@ -39,6 +39,12 @@ func TestLoadConfig(t *testing.T) {
 	if config.InferenceGateway.PublicBaseURL == "" {
 		t.Fatal("expected inference gateway public base URL")
 	}
+	if config.InferenceGateway.MaxRetries != 2 {
+		t.Fatalf("expected two gateway retries, got %d", config.InferenceGateway.MaxRetries)
+	}
+	if config.InferenceGateway.UpstreamTimeoutSec != 300 {
+		t.Fatalf("expected 300s gateway upstream timeout, got %d", config.InferenceGateway.UpstreamTimeoutSec)
+	}
 }
 
 func TestEnvExampleLoadsConfig(t *testing.T) {
@@ -84,6 +90,21 @@ func TestConfigDefaults(t *testing.T) {
 	if config.Health.HeartbeatTimeoutSec != 30 {
 		t.Fatalf("expected default 30s, got %d", config.Health.HeartbeatTimeoutSec)
 	}
+	if config.Health.ExternalActivityStaleTimeoutSec != 45 {
+		t.Fatalf("expected default external activity stale timeout 45s, got %d", config.Health.ExternalActivityStaleTimeoutSec)
+	}
+	if config.Health.ExternalActivityMaxDurationSec != 900 {
+		t.Fatalf("expected default external activity max duration 900s, got %d", config.Health.ExternalActivityMaxDurationSec)
+	}
+	if config.Health.CoordinatorPlannerStartTimeoutSec != 30 {
+		t.Fatalf("expected default coordinator planner start timeout 30s, got %d", config.Health.CoordinatorPlannerStartTimeoutSec)
+	}
+	if config.Health.CoordinatorPlannerFirstRequestTimeoutSec != 60 {
+		t.Fatalf("expected default coordinator first request timeout 60s, got %d", config.Health.CoordinatorPlannerFirstRequestTimeoutSec)
+	}
+	if config.Health.CoordinatorPlannerArtifactTimeoutSec != 300 {
+		t.Fatalf("expected default coordinator artifact timeout 300s, got %d", config.Health.CoordinatorPlannerArtifactTimeoutSec)
+	}
 	if config.Cgroups.Mode != "direct" {
 		t.Fatalf("expected default cgroup mode direct, got %q", config.Cgroups.Mode)
 	}
@@ -92,6 +113,23 @@ func TestConfigDefaults(t *testing.T) {
 	}
 	if config.Execution.Mode != "gateway" {
 		t.Fatalf("expected default execution mode gateway, got %q", config.Execution.Mode)
+	}
+	if config.InferenceGateway.MaxRetries != 2 || config.InferenceGateway.RetryBaseDelayMS != 1000 || config.InferenceGateway.RetryMaxDelayMS != 30000 {
+		t.Fatalf("unexpected gateway retry defaults: %#v", config.InferenceGateway)
+	}
+	if config.InferenceGateway.UpstreamTimeoutSec != 300 {
+		t.Fatalf("unexpected gateway upstream timeout default: %d", config.InferenceGateway.UpstreamTimeoutSec)
+	}
+}
+
+func TestConfigRejectsExcessiveGatewayRetries(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "invalid-retries.yaml")
+	if err := os.WriteFile(path, []byte("inference_gateway:\n  max_retries: 6\n"), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("expected max_retries validation error")
 	}
 }
 

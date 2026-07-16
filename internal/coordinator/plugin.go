@@ -23,6 +23,8 @@ type Coordinator interface {
 
 // PlanRequest contains everything the Coordinator needs to produce a plan.
 type PlanRequest struct {
+	// AttemptID scopes planner session and artifacts to one build-spec attempt.
+	AttemptID string `json:"attempt_id,omitempty"`
 	// UserPrompt is the high-level user goal.
 	UserPrompt string `json:"user_prompt"`
 	// ProjectRoot is the absolute path to the project.

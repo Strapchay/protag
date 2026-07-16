@@ -62,6 +62,67 @@ func TestHealthMonitorProgressResetsStall(t *testing.T) {
 	}
 }
 
+func TestHealthMonitorExternalActivitySuppressesProgressStall(t *testing.T) {
+	hm := NewHealthMonitor("agent-1", 5*time.Second, 50*time.Millisecond)
+	hm.SetExternalActivityTimeouts(200*time.Millisecond, time.Second)
+
+	time.Sleep(80 * time.Millisecond)
+	hm.RecordExternalActivity("forwarding")
+
+	if hm.Status() != HealthOK {
+		t.Fatalf("expected active external request to suppress progress stall, got %d", hm.Status())
+	}
+}
+
+func TestHealthMonitorExternalActivityCanGoStale(t *testing.T) {
+	hm := NewHealthMonitor("agent-1", 5*time.Second, 50*time.Millisecond)
+	hm.SetExternalActivityTimeouts(40*time.Millisecond, time.Second)
+
+	hm.RecordExternalActivity("active")
+	time.Sleep(80 * time.Millisecond)
+
+	if hm.Status() != HealthStalled {
+		t.Fatalf("expected stale external request to allow progress stall, got %d", hm.Status())
+	}
+}
+
+func TestHealthMonitorExternalActivityMaxDuration(t *testing.T) {
+	hm := NewHealthMonitor("agent-1", 5*time.Second, 50*time.Millisecond)
+	hm.SetExternalActivityTimeouts(time.Second, 70*time.Millisecond)
+
+	hm.RecordExternalActivity("active")
+	time.Sleep(40 * time.Millisecond)
+	hm.RecordExternalActivity("active")
+	time.Sleep(40 * time.Millisecond)
+
+	if hm.Status() != HealthStalled {
+		t.Fatalf("expected overlong external request to allow progress stall, got %d", hm.Status())
+	}
+}
+
+func TestHealthMonitorExternalActivityCompletedClearsShield(t *testing.T) {
+	hm := NewHealthMonitor("agent-1", 5*time.Second, 50*time.Millisecond)
+	hm.SetExternalActivityTimeouts(time.Second, time.Second)
+
+	hm.RecordExternalActivity("active")
+	hm.RecordExternalActivity("completed")
+	time.Sleep(80 * time.Millisecond)
+
+	if hm.Status() != HealthStalled {
+		t.Fatalf("expected completed external request to clear progress shield, got %d", hm.Status())
+	}
+}
+
+func TestHealthMonitorRetryWaitCountsAsExternalActivity(t *testing.T) {
+	hm := NewHealthMonitor("agent-retry", time.Second, time.Millisecond)
+	hm.SetExternalActivityTimeouts(time.Second, time.Second)
+	time.Sleep(2 * time.Millisecond)
+	hm.RecordExternalActivity("retry_wait")
+	if got := hm.Status(); got != HealthOK {
+		t.Fatalf("retry_wait status = %d, want HealthOK", got)
+	}
+}
+
 func TestHealthMonitorCallback(t *testing.T) {
 	hm := NewHealthMonitor("agent-1", 50*time.Millisecond, 5*time.Second)
 

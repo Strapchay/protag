@@ -56,8 +56,13 @@ type AgentsConfig struct {
 
 // HealthConfig configures agent health monitoring.
 type HealthConfig struct {
-	HeartbeatTimeoutSec int `yaml:"heartbeat_timeout_sec"`
-	ProgressTimeoutSec  int `yaml:"progress_timeout_sec"`
+	HeartbeatTimeoutSec                      int `yaml:"heartbeat_timeout_sec"`
+	ProgressTimeoutSec                       int `yaml:"progress_timeout_sec"`
+	ExternalActivityStaleTimeoutSec          int `yaml:"external_activity_stale_timeout_sec"`
+	ExternalActivityMaxDurationSec           int `yaml:"external_activity_max_duration_sec"`
+	CoordinatorPlannerStartTimeoutSec        int `yaml:"coordinator_planner_start_timeout_sec"`
+	CoordinatorPlannerFirstRequestTimeoutSec int `yaml:"coordinator_planner_first_request_timeout_sec"`
+	CoordinatorPlannerArtifactTimeoutSec     int `yaml:"coordinator_planner_artifact_timeout_sec"`
 }
 
 type ExecutionConfig struct {
@@ -69,11 +74,15 @@ type ExecutionConfig struct {
 // InferenceGatewayConfig configures the local provider-compatible proxy used
 // to serialize Pi inference requests before they reach upstream providers.
 type InferenceGatewayConfig struct {
-	Enabled       bool   `yaml:"enabled"`
-	ListenAddr    string `yaml:"listen_addr"`
-	PublicBaseURL string `yaml:"public_base_url"`
-	GatewayKey    string `yaml:"gateway_key,omitempty"`
-	TargetProfile string `yaml:"target_profile,omitempty"`
+	Enabled            bool   `yaml:"enabled"`
+	ListenAddr         string `yaml:"listen_addr"`
+	PublicBaseURL      string `yaml:"public_base_url"`
+	GatewayKey         string `yaml:"gateway_key,omitempty"`
+	TargetProfile      string `yaml:"target_profile,omitempty"`
+	MaxRetries         int    `yaml:"max_retries"`
+	RetryBaseDelayMS   int    `yaml:"retry_base_delay_ms"`
+	RetryMaxDelayMS    int    `yaml:"retry_max_delay_ms"`
+	UpstreamTimeoutSec int    `yaml:"upstream_timeout_sec"`
 }
 
 // CgroupsConfig configures cgroup resource limits.
@@ -187,6 +196,11 @@ orchestrator:
 health:
   heartbeat_timeout_sec: 30
   progress_timeout_sec: 120
+  external_activity_stale_timeout_sec: 45
+  external_activity_max_duration_sec: 900
+  coordinator_planner_start_timeout_sec: 30
+  coordinator_planner_first_request_timeout_sec: 60
+  coordinator_planner_artifact_timeout_sec: 300
 
 execution:
   mode: "${AION_EXECUTION_MODE}"
@@ -199,6 +213,10 @@ inference_gateway:
   public_base_url: "${AION_INFERENCE_GATEWAY_URL}"
   gateway_key: "${AION_INFERENCE_GATEWAY_KEY}"
   target_profile: "${AION_INFERENCE_GATEWAY_TARGET_PROFILE}"
+  max_retries: ${AION_INFERENCE_GATEWAY_MAX_RETRIES}
+  retry_base_delay_ms: ${AION_INFERENCE_GATEWAY_RETRY_BASE_DELAY_MS}
+  retry_max_delay_ms: ${AION_INFERENCE_GATEWAY_RETRY_MAX_DELAY_MS}
+  upstream_timeout_sec: ${AION_INFERENCE_GATEWAY_UPSTREAM_TIMEOUT_SEC}
 
 cgroups:
   enabled: true
@@ -310,6 +328,21 @@ func applyDefaults(c *Config) {
 	if c.Health.ProgressTimeoutSec == 0 {
 		c.Health.ProgressTimeoutSec = 120
 	}
+	if c.Health.ExternalActivityStaleTimeoutSec == 0 {
+		c.Health.ExternalActivityStaleTimeoutSec = 45
+	}
+	if c.Health.ExternalActivityMaxDurationSec == 0 {
+		c.Health.ExternalActivityMaxDurationSec = 900
+	}
+	if c.Health.CoordinatorPlannerStartTimeoutSec == 0 {
+		c.Health.CoordinatorPlannerStartTimeoutSec = 30
+	}
+	if c.Health.CoordinatorPlannerFirstRequestTimeoutSec == 0 {
+		c.Health.CoordinatorPlannerFirstRequestTimeoutSec = 60
+	}
+	if c.Health.CoordinatorPlannerArtifactTimeoutSec == 0 {
+		c.Health.CoordinatorPlannerArtifactTimeoutSec = 300
+	}
 	if c.Execution.MaxConcurrentRequests == 0 {
 		c.Execution.MaxConcurrentRequests = 1
 	}
@@ -327,6 +360,18 @@ func applyDefaults(c *Config) {
 	}
 	if c.InferenceGateway.TargetProfile == "" {
 		c.InferenceGateway.TargetProfile = c.Inference.DomainAgents.UseProfile
+	}
+	if c.InferenceGateway.MaxRetries == 0 {
+		c.InferenceGateway.MaxRetries = 2
+	}
+	if c.InferenceGateway.RetryBaseDelayMS == 0 {
+		c.InferenceGateway.RetryBaseDelayMS = 1000
+	}
+	if c.InferenceGateway.RetryMaxDelayMS == 0 {
+		c.InferenceGateway.RetryMaxDelayMS = 30000
+	}
+	if c.InferenceGateway.UpstreamTimeoutSec == 0 {
+		c.InferenceGateway.UpstreamTimeoutSec = 300
 	}
 	if c.Cgroups.MemoryMaxMB == 0 {
 		c.Cgroups.MemoryMaxMB = 2048
@@ -369,6 +414,27 @@ func validateConfig(c *Config) error {
 	if c.Execution.MaxConcurrentRequests < 1 {
 		return fmt.Errorf("execution.max_concurrent_requests must be >= 1")
 	}
+	if c.Health.HeartbeatTimeoutSec < 1 {
+		return fmt.Errorf("health.heartbeat_timeout_sec must be >= 1")
+	}
+	if c.Health.ProgressTimeoutSec < 1 {
+		return fmt.Errorf("health.progress_timeout_sec must be >= 1")
+	}
+	if c.Health.ExternalActivityStaleTimeoutSec < 1 {
+		return fmt.Errorf("health.external_activity_stale_timeout_sec must be >= 1")
+	}
+	if c.Health.ExternalActivityMaxDurationSec < 1 {
+		return fmt.Errorf("health.external_activity_max_duration_sec must be >= 1")
+	}
+	if c.Health.CoordinatorPlannerStartTimeoutSec < 1 {
+		return fmt.Errorf("health.coordinator_planner_start_timeout_sec must be >= 1")
+	}
+	if c.Health.CoordinatorPlannerFirstRequestTimeoutSec < 1 {
+		return fmt.Errorf("health.coordinator_planner_first_request_timeout_sec must be >= 1")
+	}
+	if c.Health.CoordinatorPlannerArtifactTimeoutSec < 1 {
+		return fmt.Errorf("health.coordinator_planner_artifact_timeout_sec must be >= 1")
+	}
 	if c.Execution.MaxConcurrentRequests > 16 {
 		return fmt.Errorf("execution.max_concurrent_requests %d exceeds reasonable limit", c.Execution.MaxConcurrentRequests)
 	}
@@ -387,6 +453,18 @@ func validateConfig(c *Config) error {
 		if strings.TrimSpace(c.InferenceGateway.PublicBaseURL) == "" {
 			return fmt.Errorf("inference_gateway.public_base_url is required when gateway is enabled")
 		}
+	}
+	if c.InferenceGateway.MaxRetries < 1 || c.InferenceGateway.MaxRetries > 5 {
+		return fmt.Errorf("inference_gateway.max_retries must be between 1 and 5")
+	}
+	if c.InferenceGateway.RetryBaseDelayMS < 1 {
+		return fmt.Errorf("inference_gateway.retry_base_delay_ms must be >= 1")
+	}
+	if c.InferenceGateway.RetryMaxDelayMS < c.InferenceGateway.RetryBaseDelayMS {
+		return fmt.Errorf("inference_gateway.retry_max_delay_ms must be >= retry_base_delay_ms")
+	}
+	if c.InferenceGateway.UpstreamTimeoutSec < 1 {
+		return fmt.Errorf("inference_gateway.upstream_timeout_sec must be >= 1")
 	}
 	switch strings.ToLower(strings.TrimSpace(c.Cgroups.Mode)) {
 	case "", "direct", "systemd", "disabled":

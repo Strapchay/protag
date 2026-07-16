@@ -210,3 +210,35 @@ func TestContinueBuildSpecAgentsRequiresExplicitArm(t *testing.T) {
 		t.Fatal("expected explicit arm requirement")
 	}
 }
+
+func TestBuildSpecExecutionMonitorStartsOnceAndStops(t *testing.T) {
+	daemon := testBuildSpecDaemon(t)
+	t.Cleanup(daemon.stopBuildSpecExecutionMonitor)
+
+	daemon.startBuildSpecExecutionMonitorWithInterval(time.Hour)
+	daemon.executionMonitorMu.Lock()
+	firstRun := daemon.executionMonitorRun
+	active := daemon.executionMonitorActive
+	hasCancel := daemon.executionMonitorCancel != nil
+	daemon.executionMonitorMu.Unlock()
+	if !active || !hasCancel {
+		t.Fatal("expected execution monitor to be active")
+	}
+
+	daemon.startBuildSpecExecutionMonitorWithInterval(time.Hour)
+	daemon.executionMonitorMu.Lock()
+	secondRun := daemon.executionMonitorRun
+	daemon.executionMonitorMu.Unlock()
+	if secondRun != firstRun {
+		t.Fatalf("duplicate monitor start changed generation: first=%d second=%d", firstRun, secondRun)
+	}
+
+	daemon.stopBuildSpecExecutionMonitor()
+	daemon.executionMonitorMu.Lock()
+	active = daemon.executionMonitorActive
+	hasCancel = daemon.executionMonitorCancel != nil
+	daemon.executionMonitorMu.Unlock()
+	if active || hasCancel {
+		t.Fatal("expected execution monitor to be stopped")
+	}
+}

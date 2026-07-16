@@ -47,30 +47,32 @@ type Server struct {
 	memoryStore  memory.Store
 	logsDir      string
 
-	hubCallback              func(hub.Message) // called when hub messages need routing
-	replanCb                 func()
-	reviveCb                 func(string) error
-	buildSpecCb              func(string) // called when user issues /build-spec
-	refineCb                 func(string) // called when user sends message to orchestrator
-	retryCb                  func() error
-	continueCb               func() error
-	resumeCb                 func() error
-	buildSpecContinueCb      func() error
-	statusCb                 func() string
-	showSpecCb               func() (string, error)
-	resetCb                  func() error
-	buildSpecStatusCb        func() string
-	buildSpecPlanCb          func() (string, error)
-	buildSpecTraceCb         func() (string, error)
-	buildSpecCancelCb        func() error
-	buildProgressCb          func() (*BuildProgressSnapshot, error)
-	progressChangedCb        func(string)
-	executionEventCb         func(ExecutionJournalEvent)
-	recoveryCb               func(RecoveryRecord)
-	recoveryResolvedCb       func(string, string, string)
-	behaviorCb               func(agentID, domainID, kind, evidence string)
-	inferenceGatewayStatusCb func() InferenceGatewayStatus
-	agentListCb              func() []AgentInfo
+	hubCallback                func(hub.Message) // called when hub messages need routing
+	replanCb                   func()
+	reviveCb                   func(string) error
+	buildSpecCb                func(string) // called when user issues /build-spec
+	refineCb                   func(string) // called when user sends message to orchestrator
+	retryCb                    func() error
+	continueCb                 func() error
+	resumeCb                   func() error
+	buildSpecContinueCb        func() error
+	statusCb                   func() string
+	showSpecCb                 func() (string, error)
+	resetCb                    func() error
+	buildSpecStatusCb          func() string
+	buildSpecPlanCb            func() (string, error)
+	buildSpecTraceCb           func() (string, error)
+	buildSpecCancelCb          func() error
+	buildProgressCb            func() (*BuildProgressSnapshot, error)
+	progressChangedCb          func(string)
+	executionEventCb           func(ExecutionJournalEvent)
+	recoveryCb                 func(RecoveryRecord)
+	recoveryResolvedCb         func(string, string, string)
+	behaviorCb                 func(agentID, domainID, kind, evidence string)
+	inferenceGatewayStatusCb   func() InferenceGatewayStatus
+	inferenceGatewayCapacityCb func(int) (InferenceGatewayStatus, error)
+	stopBuildSpecAgentsCb      func() error
+	agentListCb                func() []AgentInfo
 
 	listener    net.Listener
 	heartbeats  map[string]int64 // agentID → last heartbeat unix ms
@@ -615,6 +617,10 @@ func (s *Server) handleRequest(req Request) Response {
 		return s.handleBuildSpecCancel(req)
 	case "build-spec-continue-agents":
 		return s.handleBuildSpecContinueAgents(req)
+	case "build-spec-stop-agents", "stop-agents":
+		return s.handleBuildSpecStopAgents(req)
+	case "set-gateway-capacity":
+		return s.handleSetGatewayCapacity(req)
 	case "build-progress":
 		return s.handleBuildProgress(req)
 	case "list-agents":
@@ -704,6 +710,14 @@ func (s *Server) SetBehaviorCallback(cb func(agentID, domainID, kind, evidence s
 
 func (s *Server) SetInferenceGatewayStatusCallback(cb func() InferenceGatewayStatus) {
 	s.inferenceGatewayStatusCb = cb
+}
+
+func (s *Server) SetInferenceGatewayCapacityCallback(cb func(int) (InferenceGatewayStatus, error)) {
+	s.inferenceGatewayCapacityCb = cb
+}
+
+func (s *Server) SetBuildSpecStopAgentsCallback(cb func() error) {
+	s.stopBuildSpecAgentsCb = cb
 }
 
 func (s *Server) SetAgentListCallback(cb func() []AgentInfo) {
@@ -876,6 +890,35 @@ func (s *Server) handleBuildSpecContinueAgents(req Request) Response {
 		return Response{ID: req.ID, Error: err.Error()}
 	}
 	return Response{ID: req.ID, Result: map[string]string{"status": "continue_started"}}
+}
+
+func (s *Server) handleBuildSpecStopAgents(req Request) Response {
+	if s.stopBuildSpecAgentsCb == nil {
+		return Response{ID: req.ID, Error: "build-spec stop-agents callback not configured"}
+	}
+	if err := s.stopBuildSpecAgentsCb(); err != nil {
+		s.BroadcastStatus("Stopping domain agents failed: "+err.Error(), "error")
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	return Response{ID: req.ID, Result: map[string]string{"status": "agents_paused"}}
+}
+
+func (s *Server) handleSetGatewayCapacity(req Request) Response {
+	if s.inferenceGatewayCapacityCb == nil {
+		return Response{ID: req.ID, Error: "gateway capacity callback not configured"}
+	}
+	var params struct {
+		Capacity int `json:"capacity"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	status, err := s.inferenceGatewayCapacityCb(params.Capacity)
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	s.BroadcastTransientStatus(fmt.Sprintf("Inference gateway capacity set to %d.", status.Capacity), "ok")
+	return Response{ID: req.ID, Result: status}
 }
 
 func (s *Server) handleBuildProgress(req Request) Response {

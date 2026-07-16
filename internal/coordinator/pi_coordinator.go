@@ -20,30 +20,38 @@ import (
 // PiCoordinator is an implementation of Coordinator that uses a persistent
 // Pi Agent to engage in refinement chat and produce a plan.
 type PiCoordinator struct {
-	agent          *supervisor.AgentSupervisor
-	plannerAgent   *supervisor.AgentSupervisor
-	config         PiCoordinatorConfig
-	projectRoot    string
-	sessionRT      *session.Runtime
-	statusFn       func(text, level string)
-	broadcastFn    func(msg hub.Message)
-	traceFn        func(text string)
-	plannerMu      sync.Mutex
-	plannerCapture *planCapture
-	lastUserText   string
+	agent             *supervisor.AgentSupervisor
+	plannerAgent      *supervisor.AgentSupervisor
+	config            PiCoordinatorConfig
+	projectRoot       string
+	sessionRT         *session.Runtime
+	statusFn          func(text, level string)
+	broadcastFn       func(msg hub.Message)
+	traceFn           func(text string)
+	plannerMu         sync.Mutex
+	plannerCapture    *planCapture
+	plannerAttemptID  string
+	plannerSessionDir string
+	plannerGatewayMu  sync.Mutex
+	plannerGatewayCh  chan struct{}
+	plannerGatewayOn  bool
+	lastUserText      string
 }
 
 // PiCoordinatorConfig configures the Pi-backed coordinator.
 type PiCoordinatorConfig struct {
-	Binary          string
-	SessionDir      string
-	SessionStoreDir string
-	Provider        string
-	Model           string
-	Endpoint        string
-	SkillPaths      []string
-	ExtensionPaths  []string
-	Env             []string
+	Binary                     string
+	SessionDir                 string
+	SessionStoreDir            string
+	Provider                   string
+	Model                      string
+	Endpoint                   string
+	SkillPaths                 []string
+	ExtensionPaths             []string
+	Env                        []string
+	PlannerStartTimeout        time.Duration
+	PlannerFirstRequestTimeout time.Duration
+	PlannerArtifactTimeout     time.Duration
 }
 
 type SolutionArchitectMetadata struct {
@@ -74,6 +82,7 @@ type planningInputArtifact struct {
 	BuildSpec       string       `json:"build_spec"`
 	ProjectScan     *ProjectScan `json:"project_scan"`
 	OutputPath      string       `json:"output_path"`
+	ExcludedPaths   []string     `json:"excluded_paths"`
 	ValidationRules []string     `json:"validation_rules"`
 }
 
@@ -176,6 +185,7 @@ func (c *PiCoordinator) StartArchitect(ctx context.Context) error {
 		PiAgent: supervisor.PiAgentConfig{
 			Binary:         c.config.Binary,
 			SessionDir:     agentDir,
+			ResumeSession:  start.Resumed,
 			WorkingDir:     c.projectRoot,
 			Provider:       c.config.Provider,
 			Model:          c.config.Model,
@@ -190,15 +200,21 @@ func (c *PiCoordinator) StartArchitect(ctx context.Context) error {
 	return c.agent.Start(ctx)
 }
 
-func (c *PiCoordinator) ensurePlannerAgent(ctx context.Context) error {
+func (c *PiCoordinator) ensurePlannerAgent(ctx context.Context, attemptID string) error {
+	attemptID = plannerAttemptID(attemptID)
 	c.plannerMu.Lock()
-	defer c.plannerMu.Unlock()
-
-	if c.plannerAgent != nil && c.plannerAgent.State() != supervisor.StateStopped {
+	if c.plannerAgent != nil && c.plannerAgent.State() != supervisor.StateStopped && c.plannerAttemptID == attemptID {
+		c.plannerMu.Unlock()
 		return nil
 	}
+	previous := c.plannerAgent
+	c.plannerAgent = nil
+	c.plannerMu.Unlock()
+	if previous != nil {
+		_ = previous.Stop()
+	}
 
-	agentDir := projectPath(c.projectRoot, c.config.SessionDir, "coordinator")
+	agentDir := projectPath(c.projectRoot, c.config.SessionDir, "coordinator", attemptID)
 	if err := os.MkdirAll(agentDir, 0755); err != nil {
 		return fmt.Errorf("pi_coordinator: create coordinator planner dir: %w", err)
 	}
@@ -211,10 +227,243 @@ func (c *PiCoordinator) ensurePlannerAgent(ctx context.Context) error {
 		planner.SetStatusFunc(c.statusFn)
 	}
 	planner.SetLifecycleFunc(c.handlePlannerLifecycle)
-	if err := planner.Start(ctx); err != nil {
-		return err
+
+	timeout := c.config.PlannerStartTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	startCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	started := make(chan error, 1)
+	go func() {
+		started <- planner.Start(startCtx)
+	}()
+
+	select {
+	case err := <-started:
+		if err != nil {
+			return err
+		}
+	case <-ctx.Done():
+		_ = planner.Stop()
+		return ctx.Err()
+	case <-time.After(timeout):
+		cancel()
+		_ = planner.Stop()
+		return fmt.Errorf("coordinator planner startup timed out after %s", timeout)
+	}
+
+	c.plannerMu.Lock()
+	defer c.plannerMu.Unlock()
+	if c.plannerAgent != nil && c.plannerAgent.State() != supervisor.StateStopped {
+		_ = planner.Stop()
+		return nil
 	}
 	c.plannerAgent = planner
+	c.plannerAttemptID = attemptID
+	c.plannerSessionDir = agentDir
+	if c.traceFn != nil {
+		c.traceFn("coordinator planner process started")
+	}
+	return nil
+}
+
+// RecordPlannerGatewayActivity records gateway request activity for the
+// Coordinator planner. It is used as a prompt-delivery handshake during
+// /build-spec planning.
+func (c *PiCoordinator) RecordPlannerGatewayActivity(agentID, domainID, phase string) {
+	if agentID != "coordinator" && domainID != "coordinator" {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(phase)) {
+	case "queued", "admitted", "forwarding", "active", "completed":
+	default:
+		return
+	}
+	c.plannerGatewayMu.Lock()
+	defer c.plannerGatewayMu.Unlock()
+	if c.plannerGatewayOn {
+		c.plannerGatewayOn = false
+		close(c.plannerGatewayCh)
+	}
+}
+
+func (c *PiCoordinator) beginPlannerGatewayWatch() <-chan struct{} {
+	c.plannerGatewayMu.Lock()
+	defer c.plannerGatewayMu.Unlock()
+	c.plannerGatewayCh = make(chan struct{})
+	c.plannerGatewayOn = true
+	return c.plannerGatewayCh
+}
+
+func (c *PiCoordinator) waitForPlannerGatewayActivity(ctx context.Context, gatewayCh <-chan struct{}, outputPath string) error {
+	timeout := c.config.PlannerFirstRequestTimeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if _, err := os.Stat(outputPath); err == nil {
+			if c.traceFn != nil {
+				c.traceFn("coordinator plan artifact appeared before first gateway request was observed")
+			}
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-gatewayCh:
+			if c.traceFn != nil {
+				c.traceFn("coordinator inference request observed at gateway")
+			}
+			return nil
+		case <-timer.C:
+			return fmt.Errorf("no coordinator inference request observed within %s after prompt dispatch; planner_raw_tail=%q", timeout, c.tailPlannerRawLog(12))
+		case <-ticker.C:
+		}
+	}
+}
+
+func (c *PiCoordinator) sendPlanningPromptWithHandshake(ctx context.Context, prompt, outputPath string) error {
+	var lastErr error
+	for attempt := 1; attempt <= 2; attempt++ {
+		if c.traceFn != nil {
+			c.traceFn(fmt.Sprintf("coordinator prompt send attempt %d starting", attempt))
+		}
+		c.plannerMu.Lock()
+		c.plannerCapture = nil
+		planner := c.plannerAgent
+		c.plannerMu.Unlock()
+
+		if planner == nil {
+			return fmt.Errorf("pi_coordinator: planner agent not started")
+		}
+
+		gatewayCh := c.beginPlannerGatewayWatch()
+		if err := planner.SendPrompt(prompt); err != nil {
+			if c.traceFn != nil {
+				c.traceFn(fmt.Sprintf("send prompt error: %v", err))
+			}
+			return fmt.Errorf("pi_coordinator: send planning prompt: %w", err)
+		}
+		if c.statusFn != nil {
+			c.statusFn("Coordinator prompt dispatched; awaiting first inference request...", "info")
+		}
+		if c.broadcastFn != nil {
+			if msg, err := hub.NewMessage(hub.MsgContextShare, "coordinator", "tui", map[string]string{
+				"type":    "text",
+				"content": "Coordinator prompt dispatched to the live planner.",
+				"role":    "assistant",
+			}); err == nil {
+				c.broadcastFn(*msg)
+			}
+		}
+
+		if err := c.waitForPlannerGatewayActivity(ctx, gatewayCh, outputPath); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			if c.traceFn != nil {
+				c.traceFn(fmt.Sprintf("coordinator prompt attempt %d did not reach gateway: %v", attempt, err))
+			}
+		}
+
+		if attempt == 1 {
+			if c.statusFn != nil {
+				c.statusFn("Coordinator prompt did not reach inference gateway; restarting planner once...", "warn")
+			}
+			if c.traceFn != nil {
+				c.traceFn("restarting coordinator planner after prompt-delivery timeout")
+			}
+			_ = c.StopPlanner()
+			c.plannerMu.Lock()
+			attemptID := c.plannerAttemptID
+			c.plannerMu.Unlock()
+			if err := c.ensurePlannerAgent(ctx, attemptID); err != nil {
+				return fmt.Errorf("pi_coordinator: restart planner after prompt-delivery timeout: %w", err)
+			}
+		}
+	}
+	return lastErr
+}
+
+func (c *PiCoordinator) tailPlannerRawLog(maxLines int) string {
+	c.plannerMu.Lock()
+	dir := c.plannerSessionDir
+	c.plannerMu.Unlock()
+	if strings.TrimSpace(dir) == "" {
+		dir = projectPath(c.projectRoot, c.config.SessionDir, "coordinator")
+	}
+	path := filepath.Join(dir, "pi_raw.log")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Sprintf("unavailable: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if maxLines > 0 && len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (c *PiCoordinator) plannerArtifactsPreparedMessage(paths planningArtifactPaths) {
+	if c.traceFn != nil {
+		c.traceFn(fmt.Sprintf("planning input artifact written: %s", paths.InputPath))
+		c.traceFn(fmt.Sprintf("planning output artifact expected: %s", paths.OutputPath))
+	}
+	if c.broadcastFn != nil {
+		if msg, err := hub.NewMessage(hub.MsgContextShare, "coordinator", "tui", map[string]string{
+			"type":    "text",
+			"content": "Coordinator planning artifacts prepared; starting live planner.",
+			"role":    "assistant",
+		}); err == nil {
+			c.broadcastFn(*msg)
+		}
+	}
+	if c.statusFn != nil {
+		c.statusFn("Coordinator planning artifacts prepared; starting planner...", "info")
+	}
+}
+
+func (c *PiCoordinator) plannerPromptRenderedMessage(prompt string, req PlanRequest) {
+	if c.traceFn != nil {
+		var files, modules int
+		if req.ProjectScan != nil {
+			files = req.ProjectScan.FileCount
+			modules = req.ProjectScan.ModuleCount
+		}
+		c.traceFn(fmt.Sprintf("prompt rendered: bytes=%d files=%d modules=%d", len(prompt), files, modules))
+		c.traceFn("prompt preview:\n" + truncateForTrace(prompt, 2000))
+	}
+}
+
+func (c *PiCoordinator) plannerReasoningMessage() {
+	if c.broadcastFn != nil {
+		if msg, err := hub.NewMessage(hub.MsgContextShare, "coordinator", "tui", map[string]string{
+			"type":    "thinking",
+			"content": "Coordinator is reasoning over the build spec and project scan.",
+			"role":    "assistant",
+		}); err == nil {
+			c.broadcastFn(*msg)
+		}
+	}
+	if c.statusFn != nil {
+		c.statusFn("Coordinator reasoning over build-spec input...", "info")
+	}
+}
+
+func (c *PiCoordinator) preparePlannerForPlanning(ctx context.Context, attemptID string) error {
+	if c.traceFn != nil {
+		c.traceFn("starting coordinator planner process")
+	}
+	if err := c.ensurePlannerAgent(ctx, attemptID); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -268,60 +517,31 @@ func (c *PiCoordinator) Plan(ctx context.Context, req PlanRequest) (*PlanRespons
 		}
 		return nil, fmt.Errorf("pi_coordinator: planner binary is not configured")
 	}
-
-	if err := c.ensurePlannerAgent(ctx); err != nil {
-		return nil, fmt.Errorf("pi_coordinator: ensure planner agent: %w", err)
-	}
+	req.AttemptID = plannerAttemptID(req.AttemptID)
 
 	artifactPaths, err := c.preparePlanningArtifacts(specText, req)
 	if err != nil {
 		return nil, err
 	}
+	c.plannerArtifactsPreparedMessage(artifactPaths)
+
 	prompt := GenerateCoordinatorPlanningInstruction(specText, req.ProjectScan, artifactPaths.InputPath, artifactPaths.OutputPath)
-	if c.traceFn != nil {
-		c.traceFn(fmt.Sprintf("planning input artifact written: %s", artifactPaths.InputPath))
-		c.traceFn(fmt.Sprintf("planning output artifact expected: %s", artifactPaths.OutputPath))
-		c.traceFn(fmt.Sprintf("prompt rendered: bytes=%d files=%d modules=%d", len(prompt), req.ProjectScan.FileCount, req.ProjectScan.ModuleCount))
-		c.traceFn("prompt preview:\n" + truncateForTrace(prompt, 2000))
-	}
-	if c.broadcastFn != nil {
-		if msg, err := hub.NewMessage(hub.MsgContextShare, "coordinator", "tui", map[string]string{
-			"type":    "thinking",
-			"content": "Coordinator is reasoning over the build spec and project scan.",
-			"role":    "assistant",
-		}); err == nil {
-			c.broadcastFn(*msg)
-		}
-	}
-	if c.statusFn != nil {
-		c.statusFn("Coordinator reasoning over build-spec input...", "info")
-	}
-	c.plannerMu.Lock()
-	c.plannerCapture = nil
-	planner := c.plannerAgent
-	c.plannerMu.Unlock()
+	c.plannerPromptRenderedMessage(prompt, req)
 
-	if planner == nil {
-		return nil, fmt.Errorf("pi_coordinator: planner agent not started")
+	if err := c.preparePlannerForPlanning(ctx, req.AttemptID); err != nil {
+		return nil, fmt.Errorf("pi_coordinator: ensure planner agent: %w", err)
 	}
+	defer func() { _ = c.StopPlanner() }()
+	c.plannerReasoningMessage()
 
-	if err := planner.SendPrompt(prompt); err != nil {
+	if err := c.sendPlanningPromptWithHandshake(ctx, prompt, artifactPaths.OutputPath); err != nil {
 		if c.traceFn != nil {
-			c.traceFn(fmt.Sprintf("send prompt error: %v", err))
+			c.traceFn(fmt.Sprintf("planning prompt handshake failed: %v", err))
 		}
-		return nil, fmt.Errorf("pi_coordinator: send planning prompt: %w", err)
+		return nil, fmt.Errorf("pi_coordinator: planning prompt was not accepted by coordinator runtime: %w", err)
 	}
 	if c.statusFn != nil {
 		c.statusFn("Coordinator prompt dispatched; awaiting plan response...", "info")
-	}
-	if c.broadcastFn != nil {
-		if msg, err := hub.NewMessage(hub.MsgContextShare, "coordinator", "tui", map[string]string{
-			"type":    "text",
-			"content": "Coordinator prompt dispatched to the live planner.",
-			"role":    "assistant",
-		}); err == nil {
-			c.broadcastFn(*msg)
-		}
 	}
 
 	plan, err := c.waitForPlanArtifact(ctx, artifactPaths.OutputPath)
@@ -356,8 +576,8 @@ type planningArtifactPaths struct {
 	ErrorPath  string
 }
 
-func (c *PiCoordinator) planningArtifactPaths() planningArtifactPaths {
-	dir := filepath.Join(c.projectRoot, "docs", "aion")
+func (c *PiCoordinator) planningArtifactPaths(attemptID string) planningArtifactPaths {
+	dir := filepath.Join(c.projectRoot, "docs", "aion", "planning", plannerAttemptID(attemptID))
 	return planningArtifactPaths{
 		Dir:        dir,
 		InputPath:  filepath.Join(dir, "planning_input.json"),
@@ -367,7 +587,7 @@ func (c *PiCoordinator) planningArtifactPaths() planningArtifactPaths {
 }
 
 func (c *PiCoordinator) preparePlanningArtifacts(specText string, req PlanRequest) (planningArtifactPaths, error) {
-	paths := c.planningArtifactPaths()
+	paths := c.planningArtifactPaths(req.AttemptID)
 	if err := os.MkdirAll(paths.Dir, 0755); err != nil {
 		return paths, fmt.Errorf("pi_coordinator: create planning artifact dir: %w", err)
 	}
@@ -378,11 +598,13 @@ func (c *PiCoordinator) preparePlanningArtifacts(specText string, req PlanReques
 	}
 	input := planningInputArtifact{
 		Type:          "aion_coordinator_planning_input",
+		AttemptHint:   req.AttemptID,
 		ProjectRoot:   c.projectRoot,
 		BuildSpecPath: filepath.Join(c.projectRoot, "docs", "build_spec.md"),
 		BuildSpec:     specText,
 		ProjectScan:   req.ProjectScan,
 		OutputPath:    paths.OutputPath,
+		ExcludedPaths: LoadAgentExcludePaths(c.projectRoot),
 		ValidationRules: []string{
 			"domains must be non-empty",
 			"nodes must be non-empty",
@@ -408,8 +630,16 @@ func (c *PiCoordinator) preparePlanningArtifacts(specText string, req PlanReques
 func (c *PiCoordinator) waitForPlanArtifact(ctx context.Context, outputPath string) (*PlanResponse, error) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
+	timeout := c.config.PlannerArtifactTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 
 	var lastErr error
+	var lastErrText string
+	lastTraceAt := time.Time{}
 	for {
 		plan, err := readPlanArtifact(outputPath)
 		if err == nil {
@@ -421,7 +651,13 @@ func (c *PiCoordinator) waitForPlanArtifact(ctx context.Context, outputPath stri
 		if !os.IsNotExist(err) {
 			lastErr = err
 			if c.traceFn != nil {
-				c.traceFn(fmt.Sprintf("plan artifact not ready: %v", err))
+				errText := err.Error()
+				now := time.Now()
+				if errText != lastErrText || now.Sub(lastTraceAt) >= 10*time.Second {
+					c.traceFn(fmt.Sprintf("plan artifact not ready: %v", err))
+					lastErrText = errText
+					lastTraceAt = now
+				}
 			}
 		}
 
@@ -431,6 +667,11 @@ func (c *PiCoordinator) waitForPlanArtifact(ctx context.Context, outputPath stri
 				return nil, lastErr
 			}
 			return nil, ctx.Err()
+		case <-timer.C:
+			if lastErr != nil {
+				return nil, fmt.Errorf("plan artifact was not written within %s; last_read_error=%v; planner_raw_tail=%q", timeout, lastErr, c.tailPlannerRawLog(20))
+			}
+			return nil, fmt.Errorf("plan artifact was not written within %s; planner_raw_tail=%q", timeout, c.tailPlannerRawLog(20))
 		case <-ticker.C:
 		}
 	}
@@ -465,9 +706,15 @@ func (c *PiCoordinator) repairPlanArtifact(ctx context.Context, outputPath strin
 		return nil, validationErr
 	}
 
-	paths := c.planningArtifactPaths()
+	dir := filepath.Dir(outputPath)
+	paths := planningArtifactPaths{
+		Dir:        dir,
+		InputPath:  filepath.Join(dir, "planning_input.json"),
+		OutputPath: outputPath,
+		ErrorPath:  filepath.Join(dir, "plan_validation_error.txt"),
+	}
 	_ = os.WriteFile(paths.ErrorPath, []byte(validationErr.Error()+"\n"), 0644)
-	if err := os.Remove(outputPath); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(paths.OutputPath); err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
 
@@ -476,15 +723,19 @@ func (c *PiCoordinator) repairPlanArtifact(ctx context.Context, outputPath strin
 Error:
 %s
 
-Read docs/aion/planning_input.json again and rewrite %s with a valid non-empty plan_response JSON object.
-Do not answer with the plan in chat. Write the file.`, outputPath, validationErr.Error(), outputPath))
+Read the planning input artifact at %s again and overwrite the output artifact with a valid, non-empty plan_response JSON object:
+%s
+
+Do not answer with the plan in chat. Write the corrected artifact directly.`, outputPath, validationErr.Error(), paths.InputPath, outputPath))
 	if c.traceFn != nil {
 		c.traceFn("requesting coordinator plan artifact repair after validation failure")
 	}
 	if c.statusFn != nil {
 		c.statusFn("Coordinator plan artifact failed validation; requesting repair...", "warn")
 	}
-	if err := planner.SendFollowUp(repairPrompt); err != nil {
+	// The planner may be idle after writing the rejected artifact. A direct
+	// prompt starts a new turn reliably in both active and idle Pi sessions.
+	if err := planner.SendPrompt(repairPrompt); err != nil {
 		if c.traceFn != nil {
 			c.traceFn(fmt.Sprintf("repair prompt error: %v", err))
 		}
@@ -1034,4 +1285,20 @@ func projectPath(projectRoot string, parts ...string) string {
 		return filepath.Join(cleaned...)
 	}
 	return filepath.Join(append([]string{projectRoot}, cleaned...)...)
+}
+
+func plannerAttemptID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		value = "plan_" + time.Now().UTC().Format("20060102T150405.000000000Z")
+	}
+	value = regexp.MustCompile(`[^A-Za-z0-9._-]+`).ReplaceAllString(value, "-")
+	value = strings.Trim(value, ".-")
+	if value == "" {
+		return "plan"
+	}
+	if len(value) > 120 {
+		return value[:120]
+	}
+	return value
 }

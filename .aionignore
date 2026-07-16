@@ -1,0 +1,21 @@
+# Aion agent ignore policy
+# Domain agents should not inspect or modify these runtime/generated paths.
+.aion/
+.git/
+.agents/
+.codex/
+.idea/
+.vscode/
+node_modules/
+vendor/
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+.venv/
+venv/
+target/
+dist/
+build/
+.next/
+.nuxt/
+coverage/
