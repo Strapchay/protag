@@ -96,7 +96,6 @@ kernel/
 │   ├── supervisor/           # Agent process supervisor
 │   ├── hub/                  # Context Hub message routing
 │   ├── coordinator/          # Coordinator plugin (DAG planner)
-│   ├── stub/                 # Stub contract management
 │   └── memory/               # Semantic memory (Chromem-Go)
 ├── proto/                    # Protobuf service definitions
 ├── flatbuf/                  # FlatBuffer schema files
@@ -105,6 +104,8 @@ kernel/
 ├── configs/                  # Configuration files
 └── test/                     # Integration tests & mocks
 ```
+
+Durable cross-domain contracts are provided by the composable `aion-coordination` module. The kernel remains the only runtime and projects contract effects into the DAG, Context Hub, and supervisor lifecycle.
 
 ## Configuration
 

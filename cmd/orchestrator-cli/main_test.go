@@ -155,6 +155,52 @@ func TestParseUpdateNodeRequiresAgentIdentity(t *testing.T) {
 	}
 }
 
+func TestParseArtifactContractLifecycleCommands(t *testing.T) {
+	artifact := filepath.Join(t.TempDir(), "boundary.json")
+	if err := os.WriteFile(artifact, []byte(`{"entrypoint":"PublicBoundary"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request, err := parseCommand("contract-request", []string{"--contract", `{"id":"contract-1","producer_agent_id":"agent-a","producer_node_id":"node-a","consumer_agent_id":"agent-b","consumer_node_id":"node-b","details":{"name":"Boundary","kind":"interface"}}`, "--command-id", "request-1"})
+	if err != nil {
+		t.Fatalf("parse contract request: %v", err)
+	}
+	if request["command_id"] != "request-1" || request["contract"] == nil {
+		t.Fatalf("request params = %#v", request)
+	}
+
+	publish, err := parseCommand("contract-publish", []string{"--contract-id", "contract-1", "--artifact-file", artifact, "--expected-revision", "2", "--command-id", "publish-3"})
+	if err != nil {
+		t.Fatalf("parse contract publish: %v", err)
+	}
+	if publish["expected_revision"] != int64(2) || string(publish["content"].([]byte)) != `{"entrypoint":"PublicBoundary"}` {
+		t.Fatalf("publish params = %#v", publish)
+	}
+
+	if _, err := parseCommand("contract-validate", []string{"--contract-id", "contract-1", "--revision", "0"}); err == nil {
+		t.Fatal("expected revision validation failure")
+	}
+}
+
+func TestWriteFetchedContractAtomicallyMaterializesArtifact(t *testing.T) {
+	outputPath := filepath.Join(t.TempDir(), "contracts", "boundary.json")
+	raw := json.RawMessage(`{"contract":{"id":"contract-1","revision":1},"content":"eyJlbnRyeXBvaW50IjoiUHVibGljQm91bmRhcnkifQ=="}`)
+	output := captureStdout(t, func() {
+		if err := writeFetchedContract(raw, outputPath); err != nil {
+			t.Fatalf("write fetched contract: %v", err)
+		}
+	})
+	content, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("read fetched artifact: %v", err)
+	}
+	if string(content) != `{"entrypoint":"PublicBoundary"}` {
+		t.Fatalf("artifact content = %q", content)
+	}
+	if !strings.Contains(output, `"status": "fetched"`) || !strings.Contains(output, "contract-1") {
+		t.Fatalf("fetch output = %s", output)
+	}
+}
+
 func TestResolveDebugStatusAddrFromProjectServerInfo(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, ".aion"), 0o755); err != nil {
@@ -189,7 +235,8 @@ func TestPrintDebugStatusPretty(t *testing.T) {
 		"addr":"127.0.0.1:50051",
 		"build_spec_status":"active",
 		"dag_nodes":3,
-		"inference_gateway":{"enabled":true,"queued":1}
+		"inference_gateway":{"enabled":true,"queued":1},
+		"coordination":{"contracts":2,"pending_effects":1}
 	}`)
 
 	output := captureStdout(t, func() {
@@ -203,6 +250,9 @@ func TestPrintDebugStatusPretty(t *testing.T) {
 	}
 	if !strings.Contains(output, "inference_gateway:") || !strings.Contains(output, `"queued": 1`) {
 		t.Fatalf("pretty output missing nested gateway JSON:\n%s", output)
+	}
+	if !strings.Contains(output, "coordination:") || !strings.Contains(output, `"pending_effects": 1`) {
+		t.Fatalf("pretty output missing coordination snapshot:\n%s", output)
 	}
 }
 

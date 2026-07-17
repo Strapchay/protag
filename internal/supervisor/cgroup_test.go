@@ -162,6 +162,9 @@ func TestResourceGovernance(t *testing.T) {
 		}
 		t.Fatalf("CreateCgroup failed: %v", err)
 	}
+	if isCgroupSkipped(config.BasePath) {
+		t.Skip("cgroup root is mounted but not delegated to this test process")
+	}
 	defer DestroyCgroup(config.BasePath, config.AgentID)
 
 	// Since we can't easily OOM the current test process without crashing the test test runner,

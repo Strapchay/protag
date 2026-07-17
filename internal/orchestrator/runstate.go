@@ -15,6 +15,7 @@ type RunState struct {
 	AgentSessionsDir string `json:"agent_sessions_dir"`
 	PiSessionsDir    string `json:"pi_sessions_dir"`
 	LogsDir          string `json:"logs_dir"`
+	CoordinationDir  string `json:"coordination_dir"`
 	DagFile          string `json:"dag_file"`
 	WalFile          string `json:"wal_file"`
 	CreatedAt        string `json:"created_at"`
@@ -72,6 +73,7 @@ func newRunState(projectRoot string, config *Config, runID string) *RunState {
 		AgentSessionsDir: filepath.Join(root, "agent_sessions"),
 		PiSessionsDir:    filepath.Join(root, "pi_sessions"),
 		LogsDir:          filepath.Join(root, "logs"),
+		CoordinationDir:  filepath.Join(root, "coordination"),
 		DagFile:          filepath.Join(root, filepath.Base(config.Orchestrator.DagFile)),
 		WalFile:          filepath.Join(root, filepath.Base(config.Orchestrator.WalFile)),
 		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
@@ -83,6 +85,12 @@ func (r *RunState) ensure() error {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("run state: create %s: %w", dir, err)
 		}
+	}
+	if err := os.MkdirAll(r.CoordinationDir, 0700); err != nil {
+		return fmt.Errorf("run state: create %s: %w", r.CoordinationDir, err)
+	}
+	if err := os.Chmod(r.CoordinationDir, 0700); err != nil {
+		return fmt.Errorf("run state: protect %s: %w", r.CoordinationDir, err)
 	}
 	return nil
 }

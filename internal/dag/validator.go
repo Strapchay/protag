@@ -101,22 +101,22 @@ func ValidateNodeCeiling(nodes []DagNode, maxNodes uint32) error {
 	return nil
 }
 
-// ValidateStubEdges checks that all stub edges reference valid nodes.
-func ValidateStubEdges(nodes []DagNode, edges []DagEdge) error {
+// ValidateContractEdges checks that all contract edges reference valid nodes.
+func ValidateContractEdges(nodes []DagNode, edges []DagEdge) error {
 	nodeSet := make(map[string]bool, len(nodes))
 	for _, n := range nodes {
 		nodeSet[n.ID] = true
 	}
 
 	for _, e := range edges {
-		if e.Type != EdgeStubContract {
+		if e.Type != EdgeContract {
 			continue
 		}
 		if !nodeSet[e.FromNode] {
-			return fmt.Errorf("dag: stub edge references non-existent from_node '%s'", e.FromNode)
+			return fmt.Errorf("dag: contract edge references non-existent from_node '%s'", e.FromNode)
 		}
 		if !nodeSet[e.ToNode] {
-			return fmt.Errorf("dag: stub edge references non-existent to_node '%s'", e.ToNode)
+			return fmt.Errorf("dag: contract edge references non-existent to_node '%s'", e.ToNode)
 		}
 	}
 
@@ -134,7 +134,7 @@ func ValidateAll(dag *DagData) error {
 	if err := ValidateNodeCeiling(dag.Nodes, dag.Header.MaxNodes); err != nil {
 		return err
 	}
-	if err := ValidateStubEdges(dag.Nodes, dag.Edges); err != nil {
+	if err := ValidateContractEdges(dag.Nodes, dag.Edges); err != nil {
 		return err
 	}
 	return nil

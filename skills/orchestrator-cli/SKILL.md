@@ -1,6 +1,6 @@
 ---
 name: orchestrator-cli
-description: Aion-Kernel coordination tools for multi-agent orchestration. Provides file locking, DAG state management, stub contracts, and heartbeat monitoring.
+description: Aion-Kernel coordination tools for multi-agent orchestration. Provides file locking, DAG state management, durable artifact contracts, and heartbeat monitoring.
 ---
 
 # orchestrator-cli Skill
@@ -23,8 +23,8 @@ This skill provides the `orchestrator-cli` tool for coordinating with the Aion-K
 Acquire an exclusive write lock on a file. **You MUST acquire a lock before writing any file.**
 
 - Returns `{"status": "acquired"}` on success
-- Returns error if file locked by another agent or is a shared file
-- Shared files (go.mod, main.go, etc.) cannot be locked — coordinate via stub contracts
+- Returns error if file is locked by another agent or is shared
+- Shared files cannot be locked; coordinate through artifact contracts
 
 ### `orchestrator-cli release-lock --file <path> --agent-id <uuid>`
 
@@ -39,42 +39,62 @@ The CLI uses the supervisor-issued capability automatically. The orchestrator de
 - Call with `InProgress` when you begin a task
 - Call with `Done` when the task is complete
 - Call with `Failed` if the task cannot be completed
+- `Done` is deferred while an outbound artifact contract from that node is non-terminal
 
-### `orchestrator-cli create-stub --contract '<json>'`
+### `orchestrator-cli contract-request --contract '<json>'`
 
-Create a stub contract when you need a resource from another domain that doesn't exist yet.
+Request a versioned artifact from another domain. Producer and consumer node IDs are mandatory so the kernel can authorize both parties, detect hard-wait cycles, and gate node completion.
 
-Contract JSON format:
 ```json
 {
-  "id": "stub-unique-id",
-  "producer_id": "agent-uuid-that-should-create-it",
-  "consumer_id": "your-agent-uuid",
-  "contract": {
+  "id": "contract-unique-id",
+  "producer_agent_id": "agent-provider",
+  "producer_node_id": "provider-node",
+  "consumer_agent_id": "agent-consumer",
+  "consumer_node_id": "consumer-node",
+  "details": {
     "name": "FunctionName",
     "kind": "function",
-    "inputs": ["string", "int"],
-    "outputs": ["error"],
-    "file_path": "internal/pkg/file.go"
+    "language": "go",
+    "public_entrypoint": "package.FunctionName",
+    "signature": {"inputs": ["string", "int"], "outputs": ["error"]},
+    "acceptance": ["returns a typed error for invalid input"]
   }
 }
 ```
 
-### `orchestrator-cli inject-edge --from <node-id> --to <node-id>`
+### Artifact contract lifecycle
 
-Report a newly discovered dependency between tasks. The Orchestrator will validate this doesn't create a cycle.
+```bash
+# Producer publishes a concrete artifact. Revision 0 means none exists yet.
+orchestrator-cli contract-publish --contract-id <id> --artifact-file <path> --expected-revision 0
 
-### `orchestrator-cli split-node --node-id <uuid> --into '<json>'`
+# Consumer materializes an immutable revision in its own workspace.
+orchestrator-cli contract-fetch --contract-id <id> --revision 1 --output <path>
 
-Split a task into sub-tasks when you discover it's too large.
+# Consumer accepts it or requests a corrected revision.
+orchestrator-cli contract-validate --contract-id <id> --revision 1 --evidence '{"tests":"passed"}'
+orchestrator-cli contract-correct --contract-id <id> --revision 1 --reason <text>
 
-### `orchestrator-cli read-dag [--node-id <uuid>]`
+# Declare or clear a hard execution wait. Hard waits participate in cycle detection.
+orchestrator-cli contract-wait --contract-id <id>
+orchestrator-cli contract-wait --contract-id <id> --clear
 
-Read current DAG state. Without `--node-id`, returns the full DAG snapshot. With `--node-id`, returns a single node.
+# Inspect or terminate contracts.
+orchestrator-cli contract-status --contract-id <id>
+orchestrator-cli contract-list
+orchestrator-cli contract-fail --contract-id <id> --reason <text>
+orchestrator-cli contract-cancel --contract-id <id> --reason <text>
+```
 
-### `orchestrator-cli heartbeat --agent-id <uuid>`
+Every mutation is capability-authorized and idempotent. Use a stable `--command-id` when retrying after a transport failure. Publishing requires the revision you observed in `--expected-revision`; stale writers are rejected.
 
-Send a heartbeat to the Orchestrator. **Call every 15-30 seconds during long operations** to avoid being marked unresponsive.
+### Other orchestration commands
+
+- `inject-edge --from <node-id> --to <node-id>` reports a newly discovered dependency.
+- `split-node --node-id <uuid> --into '<json>'` splits a task that is too large.
+- `read-dag [--node-id <uuid>]` reads the current DAG or one node.
+- `heartbeat --agent-id <uuid>` reports liveness during long local operations.
 
 ## Execution Loop
 
@@ -82,41 +102,48 @@ Every Domain Agent follows this loop for each assigned task:
 
 ### 1. ORIENT
 - Read your current task via `read-dag --node-id <your-task-id>`
-- Understand the task_spec, target_files, and dependencies
-- Check if any dependencies are still pending
+- Understand the task spec, target files, and dependencies
+- Check whether dependencies are pending
 
 ### 2. DECOMPOSE
-- If the task is too large, use `split-node` to break it down
-- If you discover a dependency on another domain, use `inject-edge`
-- If you need a resource from another domain, use `create-stub`
+- If the task is too large, use `split-node`
+- If you discover a task dependency, use `inject-edge`
+- If you need a cross-domain resource, use `contract-request`
 
 ### 3. ACT
 - `acquire-lock` on each file before writing
 - Write the code
 - `release-lock` after writing
-- Call `heartbeat` periodically during long operations
+- Call `heartbeat` periodically during long local operations
 
 ### 4. VALIDATE
 - Run tests or verification for the code you wrote
-- If a stub you depend on has been fulfilled (you'll receive a `follow_up` notification), validate the fulfillment matches your expectations
+- Fetch and validate every produced artifact revision before relying on it
+- Request correction with a concrete reason when acceptance criteria fail
 
 ### 5. CHECKPOINT
 - `update-node --status Done` when the task is complete
-- `update-node --status Failed` if it cannot be completed (with explanation)
+- `update-node --status Failed` if it cannot be completed
 
 ## Handling Context Messages
 
-The Orchestrator may send you `follow_up` messages containing context from other agents:
+The Orchestrator delivers durable coordination events as a new prompt while
+Pi is idle or queues them behind the active turn:
 
-- **StubFulfilled**: A dependency you were waiting for is now available. Validate it and continue.
-- **CorrectionRequest**: Your stub implementation doesn't match the contract. Fix it.
-- **ContextShare**: Additional context from a peer agent. Incorporate into your understanding.
+- **ContractRequested**: A consumer needs an artifact from your domain. Publish a concrete revision.
+- **ContractProduced**: A requested revision is available. Fetch and validate it.
+- **ContractFulfilled**: The consumer accepted the revision.
+- **CorrectionRequested**: The consumer rejected a revision. Address the reason and publish the next revision.
+- **ContractTerminal**: A contract failed, expired, or was cancelled. Do not continue waiting on it.
+- **CycleDetected**: Hard waits form a cycle. Stop dependent work until the kernel reports recovery.
+- **ContextShare**: Additional context from a peer agent. Incorporate it.
 
 ## Coordination Rules
 
-1. **Never write without a lock.** Always `acquire-lock` → write → `release-lock`.
-2. **Never lock shared files.** Files like `go.mod`, `main.go`, `package.json` are managed by the Utility Agent.
-3. **Create stubs early.** If you need something from another domain, create a stub contract immediately.
-4. **Heartbeat regularly.** Call `heartbeat` every 15-30 seconds during long operations.
-5. **Report new dependencies.** If you discover that your task depends on another task, call `inject-edge`.
-6. **Mark tasks promptly.** Call `update-node` as soon as you start (`InProgress`) or finish (`Done`/`Failed`).
+1. **Never write without a lock.** Always `acquire-lock`, write, then `release-lock`.
+2. **Never lock shared files.** Shared entrypoints are coordinated through explicit contracts.
+3. **Request contracts early.** Do not invent another domain's interface or inspect its workspace.
+4. **Validate revisions.** A produced artifact is not fulfilled until the consumer accepts it.
+5. **Use stable command IDs for retries.** A conflicting reuse is rejected.
+6. **Heartbeat during local work.** Gateway queue and active inference states are tracked separately by the kernel.
+7. **Mark tasks promptly.** Call `update-node` as soon as you start or finish.

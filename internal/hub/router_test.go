@@ -26,10 +26,10 @@ func TestRouterDeliverToAgent(t *testing.T) {
 	agent := &mockDeliverer{id: "agent-1"}
 	router.RegisterAgent("agent-1", agent)
 
-	payload, _ := json.Marshal(StubFulfilledPayload{StubID: "stub-1"})
+	payload, _ := json.Marshal(map[string]any{"id": "contract-1", "revision": 1})
 	msg := Message{
 		ID:        "msg-1",
-		Type:      MsgStubFulfilled,
+		Type:      MsgContractFulfilled,
 		FromAgent: "agent-2",
 		ToAgent:   "agent-1",
 		Payload:   payload,
@@ -42,8 +42,8 @@ func TestRouterDeliverToAgent(t *testing.T) {
 	if len(agent.messages) != 1 {
 		t.Fatalf("expected 1 message delivered, got %d", len(agent.messages))
 	}
-	if agent.messages[0].Type != MsgStubFulfilled {
-		t.Fatalf("expected StubFulfilled, got %s", agent.messages[0].Type)
+	if agent.messages[0].Type != MsgContractFulfilled {
+		t.Fatalf("expected ContractFulfilled, got %s", agent.messages[0].Type)
 	}
 }
 

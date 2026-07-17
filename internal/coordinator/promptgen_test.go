@@ -29,7 +29,7 @@ func TestGenerateSystemInstructionsIncludesBuildSpecAndCoordinationRules(t *test
 		"isolated view containing only your domain's writable ownership mounts",
 		"The loaded orchestrator-cli skill is authoritative for commands and workflow.",
 		"Execute only dispatched nodes assigned to this agent",
-		"Use stub contracts or orchestrator messages for cross-domain work",
+		"Use durable artifact contracts or orchestrator messages for cross-domain work",
 		"Report blocked work instead of inventing missing dependencies or ownership.",
 		"project context",
 	} {
@@ -53,6 +53,8 @@ func TestGenerateCoordinatorPlanningInstructionUsesArtifactOnly(t *testing.T) {
 		"Output artifact: /tmp/project/docs/aion/plan_response.json",
 		"write the output artifact",
 		"complete, parseable JSON",
+		"\"from_node\":\"source-task-id\"",
+		"exact `from_node` and `to_node` field names",
 		"prefer 3-8 domains and 1-3 nodes per domain",
 		"Use the `excluded_paths` array",
 		"The build spec is inside the planning input artifact",

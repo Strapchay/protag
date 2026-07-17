@@ -10,12 +10,16 @@ import (
 type MessageType string
 
 const (
-	// MsgStubFulfilled signals that a stub contract has been fulfilled.
-	MsgStubFulfilled MessageType = "StubFulfilled"
 	// MsgContextShare delivers context from one agent to another.
 	MsgContextShare MessageType = "ContextShare"
-	// MsgCorrectionRequest asks a producer to fix a broken stub implementation.
+	// MsgCorrectionRequest asks a producer to publish a corrected artifact revision.
 	MsgCorrectionRequest MessageType = "CorrectionRequest"
+	MsgContractRequested MessageType = "ContractRequested"
+	MsgContractProduced  MessageType = "ContractProduced"
+	MsgContractFulfilled MessageType = "ContractFulfilled"
+	MsgContractWait      MessageType = "ContractWait"
+	MsgContractTerminal  MessageType = "ContractTerminal"
+	MsgContractCycle     MessageType = "ContractCycle"
 	// MsgDependencyDiscovered reports a new dependency edge (internal to orchestrator).
 	MsgDependencyDiscovered MessageType = "DependencyDiscovered"
 	// MsgProgressUpdate reports node status change (internal to orchestrator).
@@ -50,24 +54,18 @@ func NewMessage(msgType MessageType, fromAgent, toAgent string, payload interfac
 	}, nil
 }
 
-// StubFulfilledPayload is sent when a stub contract has been fulfilled.
-type StubFulfilledPayload struct {
-	StubID   string `json:"stub_id"`
-	Contract string `json:"contract"`
-	FilePath string `json:"file_path"`
-}
-
 // ContextSharePayload delivers context information between agents.
 type ContextSharePayload struct {
 	Summary        string   `json:"summary"`
 	FileReferences []string `json:"file_references,omitempty"`
 }
 
-// CorrectionRequestPayload asks a producer to fix a broken stub.
+// CorrectionRequestPayload is the subset of a durable contract needed for
+// correction telemetry. The full contract remains in Message.Payload.
 type CorrectionRequestPayload struct {
-	StubID           string `json:"stub_id"`
-	ErrorDescription string `json:"error_description"`
-	ExpectedContract string `json:"expected_contract"`
+	ID               string `json:"id"`
+	Revision         int64  `json:"revision"`
+	CorrectionReason string `json:"correction_reason"`
 }
 
 // DependencyDiscoveredPayload reports a newly discovered dependency.

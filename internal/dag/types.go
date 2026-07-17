@@ -37,16 +37,16 @@ func (s NodeStatus) IsTerminal() bool {
 type EdgeType byte
 
 const (
-	EdgeDependency   EdgeType = 0
-	EdgeStubContract EdgeType = 1
+	EdgeDependency EdgeType = 0
+	EdgeContract   EdgeType = 1
 )
 
 func (e EdgeType) String() string {
 	switch e {
 	case EdgeDependency:
 		return "Dependency"
-	case EdgeStubContract:
-		return "StubContract"
+	case EdgeContract:
+		return "Contract"
 	default:
 		return "Unknown"
 	}
@@ -90,8 +90,8 @@ type DagEdge struct {
 	ToNode string `json:"to_node"`
 	// Type is the edge type.
 	Type EdgeType `json:"edge_type"`
-	// StubID is the stub contract UUID, for StubContract edges only.
-	StubID string `json:"stub_id,omitempty"`
+	// ContractID identifies the durable coordination contract for Contract edges.
+	ContractID string `json:"contract_id,omitempty"`
 }
 
 // DagHeader contains metadata about the DAG.

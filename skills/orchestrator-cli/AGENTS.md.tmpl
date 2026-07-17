@@ -16,7 +16,7 @@ You are responsible for all files under:
 - `{{.}}`
 {{end}}
 
-**You MUST NOT write to files outside your assigned paths.** If you need something from another domain, create a stub contract.
+**You MUST NOT write to files outside your assigned paths.** If you need something from another domain, request an artifact contract.
 
 ## Your Tasks
 
@@ -31,16 +31,9 @@ Complete these tasks in priority order. Check dependencies before starting each 
 - **Status**: {{.Status}}
 {{end}}
 
-## Stub Dependencies
+## Contract Dependencies
 
-{{if .StubDependencies}}
-The following tasks have stub contracts — they depend on resources from other domains:
-{{range .StubDependencies}}
-- **Stub {{.StubID}}**: Waiting on `{{.ProducerID}}` to provide `{{.ContractName}}` at `{{.FilePath}}`
-{{end}}
-{{else}}
-No external dependencies. You can proceed independently.
-{{end}}
+Read the current DAG and `contract-list` after dispatch. Cross-domain contracts are created dynamically and remain authoritative across restarts.
 
 ## Execution Protocol
 
@@ -66,7 +59,7 @@ orchestrator-cli inject-edge --from <this-task> --to <dependency-task>
 
 If you need something from another domain:
 ```bash
-orchestrator-cli create-stub --contract '{"id":"...","producer_id":"...","consumer_id":"{{.AgentID}}",...}'
+orchestrator-cli contract-request --contract '{"id":"contract-...","producer_agent_id":"agent-provider","producer_node_id":"provider-node","consumer_agent_id":"{{.AgentID}}","consumer_node_id":"<task-id>","details":{"name":"resource-name","kind":"interface","acceptance":["observable acceptance criterion"]}}'
 ```
 
 ### Step 3: ACT
@@ -78,7 +71,12 @@ orchestrator-cli heartbeat --agent-id {{.AgentID}}
 ```
 
 ### Step 4: VALIDATE
-Run relevant tests for your changes. If a stub fulfillment arrives via `follow_up`, validate it.
+Run relevant tests for your changes. When a contract revision arrives, fetch and validate it:
+```bash
+orchestrator-cli contract-fetch --contract-id <id> --revision <N> --output <path>
+orchestrator-cli contract-validate --contract-id <id> --revision <N> --evidence '{"tests":"passed"}'
+```
+If the revision does not satisfy the acceptance criteria, use `contract-correct` with a concrete reason.
 
 ### Step 5: CHECKPOINT
 ```bash
@@ -87,9 +85,14 @@ orchestrator-cli update-node --node-id <task-id> --status Done
 
 ## Context Messages
 
-You may receive `follow_up` messages from the Orchestrator:
-- **StubFulfilled**: A dependency you were waiting for is available. Continue your work.
-- **CorrectionRequest**: Your stub implementation needs fixing. Read the error and fix it.
+The Orchestrator delivers context as a new prompt while you are idle or queues
+it behind your active turn:
+- **ContractRequested**: Publish the requested artifact with `contract-publish`.
+- **ContractProduced**: Fetch and validate the immutable revision.
+- **ContractFulfilled**: The consumer accepted the revision.
+- **CorrectionRequested**: Fix the reported issue and publish the next revision.
+- **ContractTerminal**: The dependency failed, expired, or was cancelled.
+- **CycleDetected**: Stop dependent work while the kernel resolves a hard-wait cycle.
 - **ContextShare**: Information from a peer agent. Incorporate it.
 
 ## Rules
@@ -98,6 +101,6 @@ You may receive `follow_up` messages from the Orchestrator:
 2. Always release locks after writing
 3. Never write outside your assigned paths
 4. Call heartbeat every 15-30 seconds during long operations
-5. Create stubs early when you need cross-domain resources
+5. Request contracts early when you need cross-domain resources
 6. Mark tasks Done/Failed promptly
 7. Never read the `.env` file unless explicitly requested by the user

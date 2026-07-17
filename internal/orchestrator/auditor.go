@@ -13,7 +13,7 @@ import (
 )
 
 // Auditor periodically scans the Orchestrator's state to detect anomalies
-// like stalled tasks, orphaned locks, and stale stubs.
+// like stalled tasks, orphaned locks, and stale contracts.
 type Auditor struct {
 	dagManager       *dag.Manager
 	lockManager      *locking.Manager

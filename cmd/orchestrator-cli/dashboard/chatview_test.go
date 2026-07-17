@@ -143,6 +143,36 @@ func TestAnonymousTranscriptEventDoesNotInheritDestinationIdentity(t *testing.T)
 	}
 }
 
+func TestContractEventsRenderConciseMainAndAgentContext(t *testing.T) {
+	payload := json.RawMessage(`{"id":"contract-api","producer_agent_id":"agent-api","producer_node_id":"api-node","consumer_agent_id":"agent-web","consumer_node_id":"web-node","status":"Produced","revision":2,"details":{"name":"PublicAPI"}}`)
+	events := (&tuiEventNormalizer{}).Normalize(hub.Message{
+		Type:      hub.MsgContractProduced,
+		FromAgent: "orchestrator",
+		ToAgent:   "agent-web",
+		Payload:   payload,
+	})
+	if len(events) != 2 {
+		t.Fatalf("expected agent and main events, got %#v", events)
+	}
+	if events[0].Audience != tuiAudienceLogs || events[0].AgentID != "agent-web" || !strings.Contains(events[0].Content, "revision 2") {
+		t.Fatalf("agent contract event = %#v", events[0])
+	}
+	if events[1].Audience != tuiAudienceChat || events[1].Author != "Orchestrator" || strings.Contains(events[1].Content, `producer_agent_id`) {
+		t.Fatalf("main contract event = %#v", events[1])
+	}
+}
+
+func TestContractCycleRendersAffectedNodes(t *testing.T) {
+	events := (&tuiEventNormalizer{}).Normalize(hub.Message{
+		Type:      hub.MsgContractCycle,
+		FromAgent: "orchestrator",
+		Payload:   json.RawMessage(`{"id":"cycle-1","node_ids":["node-a","node-b"],"contract_ids":["contract-a","contract-b"]}`),
+	})
+	if len(events) != 2 || !strings.Contains(events[1].Content, "node-a, node-b") {
+		t.Fatalf("cycle events = %#v", events)
+	}
+}
+
 func TestResponseTextFormatsBuildProgress(t *testing.T) {
 	raw := json.RawMessage(`{"client_summary":"Overall build progress is 50%.","overall_percent":50,"milestones":[{"title":"API","status":"active","percent":50,"client_summary":"API is active."}],"warnings":["fallback used"],"open_recoveries":[{"summary":"API task failed.","suggested_command":"/continue-agents"}],"recent_events":[{"summary":"Task API started."}]}`)
 	text := responseText(raw)

@@ -13,12 +13,12 @@ import (
 	"syscall"
 	"time"
 
+	coordinationruntime "aion-coordination"
 	"aion-kernel/internal/coordinator"
 	"aion-kernel/internal/dag"
 	"aion-kernel/internal/hub"
 	"aion-kernel/internal/locking"
 	"aion-kernel/internal/memory"
-	"aion-kernel/internal/stub"
 	"aion-kernel/internal/supervisor"
 )
 
@@ -28,7 +28,7 @@ type Daemon struct {
 	config                 *Config
 	dagManager             *dag.Manager
 	lockManager            *locking.Manager
-	stubRegistry           *stub.Registry
+	coordinationManager    *coordinationruntime.Manager
 	hubRouter              *hub.Router
 	allocator              *Allocator
 	server                 *Server
@@ -51,6 +51,8 @@ type Daemon struct {
 	executionMonitorRun    uint64
 	executionMonitorActive bool
 	progressMu             sync.Mutex
+	coordinationEffectMu   sync.Mutex
+	coordinationWG         sync.WaitGroup
 	lastProgressSignature  string
 	staleMu                sync.Mutex
 	staleReported          map[string]bool
@@ -88,8 +90,11 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	// Initialize Lock Manager
 	lockMgr := locking.NewManager(config.Agents.SharedFiles)
 
-	// Initialize Stub Registry
-	stubReg := stub.NewRegistry()
+	coordinationManager, err := coordinationruntime.Open(coordinationruntime.Options{StateDir: runState.CoordinationDir})
+	if err != nil {
+		_ = dagMgr.Close()
+		return nil, fmt.Errorf("daemon: init coordination manager: %w", err)
+	}
 
 	// Initialize Hub Router
 	hubRouter := hub.NewRouter(runState.LogsDir)
@@ -137,7 +142,7 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	}
 
 	// Initialize Server
-	server := NewServer(dagMgr, lockMgr, stubReg, memStore)
+	server := NewServer(dagMgr, lockMgr, coordinationManager, memStore)
 	server.SetLogsDir(runState.LogsDir)
 	server.SetLogLevel(config.Orchestrator.LogLevel)
 	if inferenceGateway != nil {
@@ -166,23 +171,23 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	daemon := &Daemon{
-		config:           config,
-		dagManager:       dagMgr,
-		lockManager:      lockMgr,
-		stubRegistry:     stubReg,
-		hubRouter:        hubRouter,
-		allocator:        alloc,
-		server:           server,
-		coordinator:      coord,
-		memoryStore:      memStore,
-		inferenceGateway: inferenceGateway,
-		ipcPaths:         ipcPaths,
-		auditor:          aud,
-		runState:         runState,
-		projectRoot:      projectRoot,
-		ctx:              ctx,
-		cancel:           cancel,
-		staleReported:    make(map[string]bool),
+		config:              config,
+		dagManager:          dagMgr,
+		lockManager:         lockMgr,
+		coordinationManager: coordinationManager,
+		hubRouter:           hubRouter,
+		allocator:           alloc,
+		server:              server,
+		coordinator:         coord,
+		memoryStore:         memStore,
+		inferenceGateway:    inferenceGateway,
+		ipcPaths:            ipcPaths,
+		auditor:             aud,
+		runState:            runState,
+		projectRoot:         projectRoot,
+		ctx:                 ctx,
+		cancel:              cancel,
+		staleReported:       make(map[string]bool),
 	}
 
 	server.SetHubCallback(func(msg hub.Message) {
@@ -193,6 +198,9 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 			log.Printf("daemon: hub route error: %v", err)
 		}
 		server.BroadcastHubEvent(msg)
+	})
+	server.SetCoordinationEffectsCallback(func() {
+		go daemon.drainCoordinationEffects()
 	})
 
 	server.SetReplanCallback(func() {
@@ -759,6 +767,7 @@ func (d *Daemon) Start() error {
 
 	// Start Auditor
 	d.auditor.Start(d.ctx)
+	d.startCoordinationEffectLoop()
 
 	if err := d.startArchitectPhase(); err != nil {
 		log.Printf("daemon: failed to start architect coordinator: %v", err)
@@ -855,7 +864,11 @@ func (d *Daemon) ResetCurrentRun() error {
 	}
 
 	lockMgr := locking.NewManager(d.config.Agents.SharedFiles)
-	stubReg := stub.NewRegistry()
+	coordinationManager, err := coordinationruntime.Open(coordinationruntime.Options{StateDir: newRun.CoordinationDir})
+	if err != nil {
+		_ = dagMgr.Close()
+		return fmt.Errorf("init reset coordination manager: %w", err)
+	}
 	hubRouter := hub.NewRouter(newRun.LogsDir)
 	alloc := NewAllocator(d.config, d.projectRoot, hubRouter, dagMgr)
 	alloc.SetIPCDir(d.ipcPaths.Dir)
@@ -870,9 +883,11 @@ func (d *Daemon) ResetCurrentRun() error {
 		})
 	}
 
+	d.coordinationEffectMu.Lock()
 	d.dagManager = dagMgr
 	d.lockManager = lockMgr
-	d.stubRegistry = stubReg
+	oldCoordination := d.coordinationManager
+	d.coordinationManager = coordinationManager
 	d.hubRouter = hubRouter
 	d.allocator = alloc
 	d.coordinator = coord
@@ -880,11 +895,17 @@ func (d *Daemon) ResetCurrentRun() error {
 	d.auditor.dagManager = dagMgr
 	d.auditor.lockManager = lockMgr
 	d.auditor.hubRouter = hubRouter
-	d.server.SetRuntimeSubsystems(dagMgr, lockMgr, stubReg, d.memoryStore)
+	d.server.SetRuntimeSubsystems(dagMgr, lockMgr, coordinationManager, d.memoryStore)
 	d.server.SetLogsDir(newRun.LogsDir)
 	d.server.ClearAgentCapabilities()
 	d.server.ClearHubHistory()
 	d.configureAllocatorCallbacks()
+	if oldCoordination != nil {
+		if err := oldCoordination.Close(); err != nil {
+			log.Printf("daemon: close old coordination manager during reset: %v", err)
+		}
+	}
+	d.coordinationEffectMu.Unlock()
 
 	if oldDAG != nil {
 		if err := oldDAG.Close(); err != nil {
@@ -929,6 +950,7 @@ func (d *Daemon) Shutdown() {
 	if d.cancel != nil {
 		d.cancel()
 	}
+	d.coordinationWG.Wait()
 
 	log.Println("daemon: stopping agents...")
 	d.allocator.StopAll()
@@ -948,6 +970,11 @@ func (d *Daemon) Shutdown() {
 
 	log.Println("daemon: flushing DAG...")
 	d.dagManager.Close()
+	if d.coordinationManager != nil {
+		if err := d.coordinationManager.Close(); err != nil {
+			log.Printf("daemon: close coordination manager: %v", err)
+		}
+	}
 
 	log.Println("daemon: shutdown complete")
 }
@@ -962,9 +989,9 @@ func (d *Daemon) LockManager() *locking.Manager {
 	return d.lockManager
 }
 
-// StubRegistry returns the stub registry.
-func (d *Daemon) StubRegistry() *stub.Registry {
-	return d.stubRegistry
+// CoordinationManager returns the run-scoped in-process coordination manager.
+func (d *Daemon) CoordinationManager() *coordinationruntime.Manager {
+	return d.coordinationManager
 }
 
 // HubRouter returns the hub router.

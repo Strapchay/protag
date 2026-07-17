@@ -9,11 +9,10 @@ import (
 	"aion-kernel/internal/dag"
 	"aion-kernel/internal/hub"
 	"aion-kernel/internal/locking"
-	"aion-kernel/internal/stub"
 )
 
 func TestArchitectCommandHandlers(t *testing.T) {
-	s := NewServer(newTestDagManager(t), locking.NewManager(nil), stub.NewRegistry(), nil)
+	s := NewServer(newTestDagManager(t), locking.NewManager(nil), nil, nil)
 	retryCalled := false
 	continueCalled := false
 	resumeCalled := false
@@ -83,7 +82,7 @@ func TestArchitectCommandHandlers(t *testing.T) {
 }
 
 func TestArchitectCommandHandlerError(t *testing.T) {
-	s := NewServer(newTestDagManager(t), locking.NewManager(nil), stub.NewRegistry(), nil)
+	s := NewServer(newTestDagManager(t), locking.NewManager(nil), nil, nil)
 	s.SetArchitectRetryCallback(func() error { return errors.New("no retry") })
 	resp := s.handleRequest(Request{ID: "1", Method: "architect-retry"})
 	if resp.Error != "no retry" {
@@ -92,7 +91,7 @@ func TestArchitectCommandHandlerError(t *testing.T) {
 }
 
 func TestDebugStatusReportsRuntimeSnapshot(t *testing.T) {
-	s := NewServer(newTestDagManager(t), locking.NewManager(nil), stub.NewRegistry(), nil)
+	s := NewServer(newTestDagManager(t), locking.NewManager(nil), nil, nil)
 	dir := t.TempDir()
 	s.SetLogsDir(dir)
 	s.SetLogLevel("debug")
@@ -122,7 +121,7 @@ func TestDebugStatusReportsRuntimeSnapshot(t *testing.T) {
 }
 
 func TestHubSnapshotRegularRequestRoute(t *testing.T) {
-	s := NewServer(newTestDagManager(t), locking.NewManager(nil), stub.NewRegistry(), nil)
+	s := NewServer(newTestDagManager(t), locking.NewManager(nil), nil, nil)
 	s.BroadcastHubEvent(hubMessageForTest(t, "coordinator", "agent-api", "hello"))
 
 	resp := s.handleRequest(Request{ID: "snap-1", Method: "hub-snapshot"})
@@ -147,12 +146,12 @@ func TestHubSnapshotRegularRequestRoute(t *testing.T) {
 
 func TestTailHubEventsReplaysPersistedHistory(t *testing.T) {
 	dir := t.TempDir()
-	seed := NewServer(newTestDagManager(t), locking.NewManager(nil), stub.NewRegistry(), nil)
+	seed := NewServer(newTestDagManager(t), locking.NewManager(nil), nil, nil)
 	seed.SetLogsDir(dir)
 	seed.BroadcastHubEvent(hubMessageForTest(t, "coordinator", "agent-api", "hello one"))
 	seed.BroadcastHubEvent(hubMessageForTest(t, "agent-api", "tui", "hello two"))
 
-	srv := NewServer(newTestDagManager(t), locking.NewManager(nil), stub.NewRegistry(), nil)
+	srv := NewServer(newTestDagManager(t), locking.NewManager(nil), nil, nil)
 	srv.SetLogsDir(dir)
 
 	serverConn, clientConn := net.Pipe()

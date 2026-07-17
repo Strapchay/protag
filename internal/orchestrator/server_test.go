@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -11,7 +12,6 @@ import (
 	"aion-kernel/internal/dag"
 	"aion-kernel/internal/hub"
 	"aion-kernel/internal/locking"
-	"aion-kernel/internal/stub"
 )
 
 func startTestServer(t testing.TB) (*Server, string) {
@@ -30,9 +30,7 @@ func startTestServer(t testing.TB) (*Server, string) {
 	t.Cleanup(func() { dagMgr.Close() })
 
 	lockMgr := locking.NewManager([]string{"go.mod"})
-	stubReg := stub.NewRegistry()
-
-	srv := NewServer(dagMgr, lockMgr, stubReg, nil)
+	srv := NewServer(dagMgr, lockMgr, nil, nil)
 
 	// Listen on random port
 	ln, err := net.Listen("tcp", "localhost:0")
@@ -299,8 +297,8 @@ func TestStreamingObservability(t *testing.T) {
 	go func() {
 		for i := 0; i < 10; i++ {
 			msg := hub.Message{
-				ID:      "msg-idx",
-				Type:    hub.MsgStubFulfilled,
+				ID:      fmt.Sprintf("msg-%d", i),
+				Type:    hub.MsgContractFulfilled,
 				Payload: []byte(`{"status":"running"}`),
 			}
 			srv.BroadcastHubEvent(msg)
@@ -317,7 +315,7 @@ func TestStreamingObservability(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decode stream error at %d: %v", i, err)
 		}
-		if msg.Type != hub.MsgStubFulfilled {
+		if msg.Type != hub.MsgContractFulfilled {
 			t.Errorf("expected agent status, got %s", msg.Type)
 		}
 		received++
@@ -325,6 +323,24 @@ func TestStreamingObservability(t *testing.T) {
 
 	if received != 10 {
 		t.Errorf("expected to receive 10 stream emissions, got %d", received)
+	}
+}
+
+func TestBroadcastHubEventDeduplicatesReplay(t *testing.T) {
+	srv, _ := startTestServer(t)
+	msg := hub.Message{
+		ID:      "effect-stable-id",
+		Type:    hub.MsgContractProduced,
+		Payload: []byte(`{"contract_id":"contract-1","revision":1}`),
+	}
+
+	srv.BroadcastHubEvent(msg)
+	srv.BroadcastHubEvent(msg)
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if got := len(srv.hubHistory); got != 1 {
+		t.Fatalf("expected one persisted event after replay, got %d", got)
 	}
 }
 
@@ -341,11 +357,11 @@ func TestHubSnapshotCachePersists(t *testing.T) {
 	}
 	defer dagMgr.Close()
 
-	srv := NewServer(dagMgr, locking.NewManager([]string{"go.mod"}), stub.NewRegistry(), nil)
+	srv := NewServer(dagMgr, locking.NewManager([]string{"go.mod"}), nil, nil)
 	srv.SetLogsDir(dir)
 	srv.BroadcastHubEvent(hub.Message{
 		ID:        "snap-1",
-		Type:      hub.MsgStubFulfilled,
+		Type:      hub.MsgContractFulfilled,
 		FromAgent: "coordinator",
 		Payload:   []byte(`{"status":"ready"}`),
 		Timestamp: time.Now(),
@@ -355,7 +371,7 @@ func TestHubSnapshotCachePersists(t *testing.T) {
 		t.Fatalf("expected snapshot file: %v", err)
 	}
 
-	srv2 := NewServer(dagMgr, locking.NewManager([]string{"go.mod"}), stub.NewRegistry(), nil)
+	srv2 := NewServer(dagMgr, locking.NewManager([]string{"go.mod"}), nil, nil)
 	srv2.SetLogsDir(dir)
 	snap := srv2.loadHubSnapshot()
 	if len(snap) != 1 || snap[0].ID != "snap-1" {
@@ -368,7 +384,7 @@ func TestHubSnapshotAndSinceTail(t *testing.T) {
 
 	oldMsg := hub.Message{
 		ID:        "old-msg",
-		Type:      hub.MsgStubFulfilled,
+		Type:      hub.MsgContractFulfilled,
 		FromAgent: "coordinator",
 		Payload:   []byte(`{"status":"old"}`),
 		Timestamp: time.Now().Add(-2 * time.Second),
@@ -399,7 +415,7 @@ func TestHubSnapshotAndSinceTail(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	freshMsg := hub.Message{
 		ID:        "fresh-msg",
-		Type:      hub.MsgStubFulfilled,
+		Type:      hub.MsgContractFulfilled,
 		FromAgent: "coordinator",
 		Payload:   []byte(`{"status":"fresh"}`),
 		Timestamp: time.Now(),

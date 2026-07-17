@@ -8,6 +8,7 @@ CLI_BIN := $(BIN_DIR)/orchestrator-cli
 
 # Go settings
 GOFLAGS := -v
+GOBUILD_FLAGS := -v -trimpath
 GOTEST := go test $(GOFLAGS)
 
 # ============================================================
@@ -18,12 +19,12 @@ build: build-orchestrator build-cli
 
 build-orchestrator:
 	@mkdir -p $(BIN_DIR)
-	go build $(GOFLAGS) -o $(AION_KERNEL_BIN) ./cmd/orchestrator/
+	go build $(GOBUILD_FLAGS) -o $(AION_KERNEL_BIN) ./cmd/orchestrator/
 	cp $(AION_KERNEL_BIN) $(ORCHESTRATOR_BIN)
 
 build-cli:
 	@mkdir -p $(BIN_DIR)
-	go build $(GOFLAGS) -o $(CLI_BIN) ./cmd/orchestrator-cli/
+	go build $(GOBUILD_FLAGS) -o $(CLI_BIN) ./cmd/orchestrator-cli/
 
 # ============================================================
 # Code Generation

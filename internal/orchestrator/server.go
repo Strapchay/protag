@@ -17,11 +17,11 @@ import (
 	"sync"
 	"time"
 
+	coordination "aion-coordination"
 	"aion-kernel/internal/dag"
 	"aion-kernel/internal/hub"
 	"aion-kernel/internal/locking"
 	"aion-kernel/internal/memory"
-	"aion-kernel/internal/stub"
 )
 
 // Request represents a JSON-RPC-style request from orchestrator-cli.
@@ -45,7 +45,7 @@ type Server struct {
 	mu           sync.RWMutex
 	dagManager   *dag.Manager
 	lockManager  *locking.Manager
-	stubRegistry *stub.Registry
+	coordination *coordination.Manager
 	memoryStore  memory.Store
 	logsDir      string
 
@@ -75,6 +75,7 @@ type Server struct {
 	inferenceGatewayCapacityCb func(int) (InferenceGatewayStatus, error)
 	stopBuildSpecAgentsCb      func() error
 	agentListCb                func() []AgentInfo
+	coordinationEffectsCb      func()
 
 	listener     net.Listener
 	unixListener net.Listener
@@ -83,6 +84,7 @@ type Server struct {
 	hubSubs      map[chan hub.Message]struct{}
 	hubHistory   []hub.Message
 	hubSnapshot  []hub.Message
+	hubEventIDs  map[string]struct{}
 	logLevel     string
 	capabilities *agentCapabilityRegistry
 }
@@ -91,16 +93,17 @@ type Server struct {
 func NewServer(
 	dagManager *dag.Manager,
 	lockManager *locking.Manager,
-	stubRegistry *stub.Registry,
+	coordinationManager *coordination.Manager,
 	memoryStore memory.Store,
 ) *Server {
 	return &Server{
 		dagManager:   dagManager,
 		lockManager:  lockManager,
-		stubRegistry: stubRegistry,
+		coordination: coordinationManager,
 		memoryStore:  memoryStore,
 		heartbeats:   make(map[string]int64),
 		hubSubs:      make(map[chan hub.Message]struct{}),
+		hubEventIDs:  make(map[string]struct{}),
 		logLevel:     "info",
 		capabilities: newAgentCapabilityRegistry(),
 	}
@@ -130,8 +133,17 @@ func (s *Server) ClearAgentCapabilities() {
 // SetLogsDir configures the directory used to persist hub history.
 func (s *Server) SetLogsDir(dir string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.logsDir = dir
+	s.mu.Unlock()
+
+	history := s.loadHubHistory()
+	s.mu.Lock()
+	for _, msg := range history {
+		if msg.ID != "" {
+			s.hubEventIDs[msg.ID] = struct{}{}
+		}
+	}
+	s.mu.Unlock()
 }
 
 // SetLogLevel configures run-scoped RPC diagnostics.
@@ -163,6 +175,15 @@ func (s *Server) SetBuildSpecCallback(cb func(string)) {
 }
 
 func (s *Server) BroadcastHubEvent(msg hub.Message) {
+	s.mu.Lock()
+	if msg.ID != "" {
+		if _, exists := s.hubEventIDs[msg.ID]; exists {
+			s.mu.Unlock()
+			return
+		}
+		s.hubEventIDs[msg.ID] = struct{}{}
+	}
+	s.mu.Unlock()
 	s.appendHubEventToDisk(msg)
 	s.mu.Lock()
 	s.hubHistory = append(s.hubHistory, msg)
@@ -200,6 +221,17 @@ func (s *Server) SeedHubSnapshot(messages []hub.Message) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	filtered := messages[:0]
+	for _, msg := range messages {
+		if msg.ID != "" {
+			if _, exists := s.hubEventIDs[msg.ID]; exists {
+				continue
+			}
+			s.hubEventIDs[msg.ID] = struct{}{}
+		}
+		filtered = append(filtered, msg)
+	}
+	messages = filtered
 	s.hubHistory = append(s.hubHistory, messages...)
 	if len(s.hubHistory) > 500 {
 		s.hubHistory = s.hubHistory[len(s.hubHistory)-500:]
@@ -659,8 +691,26 @@ func (s *Server) handleRequest(req Request) Response {
 		return s.handleReleaseLock(req)
 	case "update-node":
 		return s.handleUpdateNode(req)
-	case "create-stub":
-		return s.handleCreateStub(req)
+	case "contract-request":
+		return s.handleContractRequest(req)
+	case "contract-publish":
+		return s.handleContractPublish(req)
+	case "contract-fetch":
+		return s.handleContractFetch(req)
+	case "contract-validate":
+		return s.handleContractValidate(req)
+	case "contract-correct":
+		return s.handleContractCorrect(req)
+	case "contract-wait":
+		return s.handleContractWait(req)
+	case "contract-cancel":
+		return s.handleContractCancel(req)
+	case "contract-fail":
+		return s.handleContractFail(req)
+	case "contract-status":
+		return s.handleContractStatus(req)
+	case "contract-list":
+		return s.handleContractList(req)
 	case "inject-edge":
 		return s.handleInjectEdge(req)
 	case "split-node":
@@ -807,12 +857,16 @@ func (s *Server) SetAgentListCallback(cb func() []AgentInfo) {
 	s.agentListCb = cb
 }
 
-func (s *Server) SetRuntimeSubsystems(dagManager *dag.Manager, lockManager *locking.Manager, stubRegistry *stub.Registry, memoryStore memory.Store) {
+func (s *Server) SetCoordinationEffectsCallback(cb func()) {
+	s.coordinationEffectsCb = cb
+}
+
+func (s *Server) SetRuntimeSubsystems(dagManager *dag.Manager, lockManager *locking.Manager, coordinationManager *coordination.Manager, memoryStore memory.Store) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dagManager = dagManager
 	s.lockManager = lockManager
-	s.stubRegistry = stubRegistry
+	s.coordination = coordinationManager
 	s.memoryStore = memoryStore
 }
 
@@ -820,6 +874,8 @@ func (s *Server) ClearHubHistory() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.hubHistory = nil
+	s.hubSnapshot = nil
+	s.hubEventIDs = make(map[string]struct{})
 }
 
 func (s *Server) handleSendMessage(req Request) Response {
@@ -1062,6 +1118,16 @@ func (s *Server) handleDebugStatus(req Request) Response {
 	if s.inferenceGatewayStatusCb != nil {
 		inferenceGateway = s.inferenceGatewayStatusCb()
 	}
+	var coordinationSnapshot interface{}
+	if s.coordination != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if snapshot, err := s.coordination.Snapshot(ctx); err == nil {
+			coordinationSnapshot = snapshot
+		} else {
+			coordinationSnapshot = map[string]string{"error": err.Error()}
+		}
+		cancel()
+	}
 
 	result := map[string]interface{}{
 		"addr":                     s.Addr(),
@@ -1078,6 +1144,7 @@ func (s *Server) handleDebugStatus(req Request) Response {
 		"dag_edges":                dagEdges,
 		"build_spec_status":        buildSpecStatus,
 		"inference_gateway":        inferenceGateway,
+		"coordination":             coordinationSnapshot,
 		"agents":                   agents,
 	}
 	return Response{ID: req.ID, Result: result}
@@ -1218,6 +1285,40 @@ func (s *Server) handleUpdateNode(req Request) Response {
 			CompletionTokens: params.CompletionTokens,
 		}
 	}
+	if status == dag.StatusDone && s.coordination != nil {
+		metadata, _ := json.Marshal(struct {
+			StartedAt        int64 `json:"started_at,omitempty"`
+			CompletedAt      int64 `json:"completed_at,omitempty"`
+			PromptTokens     int32 `json:"prompt_tokens,omitempty"`
+			CompletionTokens int32 `json:"completion_tokens,omitempty"`
+		}{params.StartedAt, params.CompletedAt, params.PromptTokens, params.CompletionTokens})
+		completion, completionErr := s.coordination.RequestNodeCompletion(context.Background(), s.coordinationPrincipal(params.AgentID), coordination.CompletionCommand{
+			NodeID:   params.NodeID,
+			Metadata: metadata,
+		})
+		if completionErr != nil {
+			return Response{ID: req.ID, Error: completionErr.Error()}
+		}
+		if !completion.Ready {
+			if err := s.dagManager.UpdateNodeForAgent(params.NodeID, params.AgentID, dag.StatusBlocked, metrics); err != nil {
+				return Response{ID: req.ID, Error: err.Error()}
+			}
+			if node, err := s.dagManager.GetNode(params.NodeID); err == nil && node != nil {
+				s.recordNodeProgressFact(*node, dag.StatusBlocked)
+			}
+			if s.coordinationEffectsCb != nil {
+				s.coordinationEffectsCb()
+			}
+			if s.progressChangedCb != nil {
+				go s.progressChangedCb("contract_completion_deferred")
+			}
+			return Response{ID: req.ID, Result: map[string]interface{}{
+				"status":            "completion_deferred",
+				"node_id":           params.NodeID,
+				"pending_contracts": completion.PendingContracts,
+			}}
+		}
+	}
 	err := s.dagManager.UpdateNodeForAgent(params.NodeID, params.AgentID, status, metrics)
 
 	if err != nil {
@@ -1237,39 +1338,6 @@ func (s *Server) handleUpdateNode(req Request) Response {
 	}
 
 	if status == dag.StatusDone {
-		// Check for unfulfilled stubs produced by this node/agent
-		pending := s.stubRegistry.GetPending(params.NodeID)
-		for _, stub := range pending {
-			// Mark fulfilled
-			if _, err := s.stubRegistry.Fulfill(stub.ID); err != nil {
-				log.Printf("server: failed to fulfill stub %s: %v", stub.ID, err)
-				continue
-			}
-
-			// Route message via Hub
-			if s.hubCallback != nil {
-				payload, _ := json.Marshal(stub)
-				s.hubCallback(hub.Message{
-					Type:      hub.MsgStubFulfilled,
-					FromAgent: stub.ProducerID,
-					ToAgent:   stub.ConsumerID,
-					Payload:   payload,
-				})
-			}
-			if s.recoveryResolvedCb != nil {
-				s.recoveryResolvedCb("stub_waiting", stub.ConsumerID, "")
-			}
-			if s.executionEventCb != nil {
-				s.executionEventCb(ExecutionJournalEvent{
-					Kind:     "stub_fulfilled",
-					Severity: "ok",
-					AgentID:  stub.ProducerID,
-					NodeID:   stub.ConsumerID,
-					Summary:  fmt.Sprintf("Stub %s was fulfilled for %s.", stub.ID, stub.ConsumerID),
-				})
-			}
-		}
-
 		// Fire-and-forget semantic memory writing if memory store is enabled
 		if s.memoryStore != nil {
 			node, err := s.dagManager.GetNode(params.NodeID)
@@ -1362,58 +1430,6 @@ func (s *Server) recordNodeProgressFact(node dag.DagNode, status dag.NodeStatus)
 			Summary:  summary,
 		})
 	}
-}
-
-func (s *Server) handleCreateStub(req Request) Response {
-	var params struct {
-		Contract stub.Contract `json:"contract"`
-	}
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		return Response{ID: req.ID, Error: fmt.Sprintf("invalid params: %v", err)}
-	}
-
-	if err := s.stubRegistry.Register(params.Contract); err != nil {
-		return Response{ID: req.ID, Error: err.Error()}
-	}
-
-	// Add stub edge to DAG
-	edge := dag.DagEdge{
-		FromNode: params.Contract.ProducerID,
-		ToNode:   params.Contract.ConsumerID,
-		Type:     dag.EdgeStubContract,
-		StubID:   params.Contract.ID,
-	}
-	// Best-effort edge addition (nodes might not match DAG node IDs)
-	s.dagManager.AddEdge(edge)
-	if s.executionEventCb != nil {
-		s.executionEventCb(ExecutionJournalEvent{
-			Kind:     "stub_created",
-			Severity: "warn",
-			AgentID:  params.Contract.ConsumerID,
-			NodeID:   params.Contract.ConsumerID,
-			Summary:  fmt.Sprintf("Stub %s created; %s is waiting on %s.", params.Contract.ID, params.Contract.ConsumerID, params.Contract.ProducerID),
-		})
-	}
-	if s.recoveryCb != nil {
-		s.recoveryCb(RecoveryRecord{
-			FailureID:        recoveryID("stub_waiting", params.Contract.ConsumerID, ""),
-			Kind:             "stub_waiting",
-			Severity:         "warn",
-			Status:           "open",
-			AgentID:          params.Contract.ConsumerID,
-			NodeID:           params.Contract.ConsumerID,
-			Summary:          fmt.Sprintf("%s is waiting on stub %s from %s.", params.Contract.ConsumerID, params.Contract.ID, params.Contract.ProducerID),
-			SuggestedCommand: "/progress",
-		})
-	}
-	if s.progressChangedCb != nil {
-		go s.progressChangedCb("stub_created")
-	}
-
-	return Response{ID: req.ID, Result: map[string]string{
-		"status":  "created",
-		"stub_id": params.Contract.ID,
-	}}
 }
 
 func (s *Server) handleQueryMemory(req Request) Response {

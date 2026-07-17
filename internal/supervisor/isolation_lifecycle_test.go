@@ -99,6 +99,10 @@ done
 		got, err := os.ReadFile(filepath.Join(sessionDir, "launch-count"))
 		return err == nil && string(got) == "2"
 	})
+	waitForSupervisor(t, 5*time.Second, func() bool {
+		got, err := os.ReadFile(filepath.Join(sessionDir, "capabilities"))
+		return err == nil && string(got) == "generation-1\ngeneration-2\n"
+	})
 	if got, err := os.ReadFile(filepath.Join(sessionDir, "launch-count")); err != nil {
 		t.Fatalf("read persisted launch count: %v", err)
 	} else if string(got) != "2" {

@@ -87,7 +87,7 @@ type AgentSupervisor struct {
 	state            AgentState
 	piAgent          *PiAgentProcess
 	healthMonitor    *HealthMonitor
-	contextCh        chan hub.Message
+	contextCh        chan contextDelivery
 	cancel           context.CancelFunc
 	crashCount       int
 	recentTools      []string // sliding window for loop detection
@@ -100,6 +100,11 @@ type AgentSupervisor struct {
 	isThinking       bool
 	workspace        isolation.Workspace
 	workspaceGen     uint64
+}
+
+type contextDelivery struct {
+	message hub.Message
+	result  chan error
 }
 
 type AgentRuntimeSnapshot struct {
@@ -131,7 +136,7 @@ func NewAgentSupervisor(config AgentConfig) *AgentSupervisor {
 	return &AgentSupervisor{
 		config:       config,
 		state:        StateStarting,
-		contextCh:    make(chan hub.Message, 64),
+		contextCh:    make(chan contextDelivery, 64),
 		recentTools:  make([]string, 0, 10),
 		workspaceGen: config.IsolationGeneration,
 	}
@@ -360,13 +365,22 @@ func (s *AgentSupervisor) spawnAgent(ctx context.Context) error {
 	return nil
 }
 
-// DeliverContext delivers a hub message to the Pi Agent as a follow_up.
+// DeliverContext delivers a Hub message through an active follow-up or an idle
+// prompt turn and reports only after Pi accepts the RPC command.
 func (s *AgentSupervisor) DeliverContext(msg hub.Message) error {
+	delivery := contextDelivery{message: msg, result: make(chan error, 1)}
 	select {
-	case s.contextCh <- msg:
-		return nil
+	case s.contextCh <- delivery:
 	default:
 		return fmt.Errorf("supervisor: context channel full for agent %s", s.config.AgentID)
+	}
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-delivery.result:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("supervisor: context delivery timed out for agent %s", s.config.AgentID)
 	}
 }
 
@@ -436,8 +450,9 @@ func (s *AgentSupervisor) SendPrompt(message string) error {
 	return nil
 }
 
-// SendFollowUp sends a follow-up message to the Pi Agent.
-func (s *AgentSupervisor) SendFollowUp(message string) error {
+// DeliverTurn queues a follow-up during an active turn and starts a prompt
+// immediately when Pi is idle.
+func (s *AgentSupervisor) DeliverTurn(message string) error {
 	s.mu.Lock()
 	s.lastThinking = ""
 	s.lastText = ""
@@ -863,9 +878,11 @@ func (s *AgentSupervisor) contextRouter(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case msg := <-s.contextCh:
+		case delivery := <-s.contextCh:
+			msg := delivery.message
 			// Filter out our own messages to prevent echo loops
 			if msg.FromAgent == s.config.AgentID {
+				delivery.result <- nil
 				continue
 			}
 
@@ -874,6 +891,7 @@ func (s *AgentSupervisor) contextRouter(ctx context.Context) {
 			s.mu.Unlock()
 
 			if piAgent == nil || !piAgent.IsAlive() {
+				delivery.result <- fmt.Errorf("supervisor: agent %s is not available for context delivery", s.config.AgentID)
 				continue
 			}
 
@@ -893,9 +911,12 @@ func (s *AgentSupervisor) contextRouter(ctx context.Context) {
 				followUpText = fmt.Sprintf("[Context Hub - %s] %s", msg.Type, string(payload))
 			}
 
-			if err := s.SendFollowUp(followUpText); err != nil {
+			if err := s.DeliverTurn(followUpText); err != nil {
 				log.Printf("supervisor: failed to deliver context to %s: %v", s.config.AgentID, err)
+				delivery.result <- err
+				continue
 			}
+			delivery.result <- nil
 		}
 	}
 }

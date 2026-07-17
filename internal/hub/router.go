@@ -20,7 +20,7 @@ type ContextDeliverer interface {
 }
 
 // Router routes typed context messages to the correct agent supervisor,
-// which then pushes them as follow_up to the Pi Agent.
+// which then delivers them through a state-aware Pi turn.
 type Router struct {
 	mu         sync.RWMutex
 	agents     map[string]ContextDeliverer // agentID → deliverer
@@ -97,7 +97,9 @@ func (r *Router) UnregisterAgent(agentID string) {
 // Route delivers a message to the appropriate agent(s).
 func (r *Router) Route(msg Message) error {
 	switch msg.Type {
-	case MsgStubFulfilled, MsgContextShare, MsgCorrectionRequest:
+	case MsgContextShare, MsgCorrectionRequest,
+		MsgContractRequested, MsgContractProduced, MsgContractFulfilled,
+		MsgContractWait, MsgContractTerminal:
 		if msg.Type == MsgCorrectionRequest {
 			r.recordCorrectionRequest(msg)
 		}
@@ -108,6 +110,13 @@ func (r *Router) Route(msg Message) error {
 	default:
 		return fmt.Errorf("hub: unknown message type: %s", msg.Type)
 	}
+}
+
+func (r *Router) HasAgent(agentID string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.agents[agentID]
+	return ok
 }
 
 func (r *Router) recordCorrectionRequest(msg Message) {
@@ -123,7 +132,7 @@ func (r *Router) recordCorrectionRequest(msg Message) {
 	if err := json.Unmarshal(msg.Payload, &payload); err == nil {
 		entry := memory.MemoryEntry{
 			ID:        msg.ID,
-			Text:      fmt.Sprintf("Correction Request for Stub %s: %s (Expected: %s)", payload.StubID, payload.ErrorDescription, payload.ExpectedContract),
+			Text:      fmt.Sprintf("Correction requested for contract %s revision %d: %s", payload.ID, payload.Revision, payload.CorrectionReason),
 			AgentID:   msg.FromAgent,
 			TaskID:    "correction",
 			ProjectID: "default",

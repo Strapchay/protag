@@ -4,14 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"aion-kernel/internal/hub"
 )
 
 func TestPiGatewayExtensionStreamsOverUnixSocket(t *testing.T) {
@@ -177,5 +181,269 @@ complete:
 	}
 	if thinking != "socket thought" || text != "socket reply" {
 		t.Fatalf("Pi stream thinking=%q text=%q", thinking, text)
+	}
+}
+
+func TestPiRPCTurnDeliverySemantics(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		deliver func(*PiAgentProcess) error
+	}{
+		{name: "idle-follow-up", deliver: func(process *PiAgentProcess) error {
+			return process.SendFollowUp("idle follow-up marker")
+		}},
+		{name: "idle-steer", deliver: func(process *PiAgentProcess) error {
+			return process.SendSteer("idle steer marker")
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			process, probe := spawnPiRPCProbe(t, false)
+			if err := testCase.deliver(process); err != nil {
+				t.Fatal(err)
+			}
+			assertNoPiRPCRequest(t, probe.requests, 750*time.Millisecond)
+		})
+	}
+
+	t.Run("idle-prompt-starts-turn", func(t *testing.T) {
+		process, probe := spawnPiRPCProbe(t, false)
+		if err := process.SendPrompt("idle prompt marker"); err != nil {
+			t.Fatal(err)
+		}
+		request := awaitPiRPCRequest(t, probe.requests)
+		if !strings.Contains(request.body, "idle prompt marker") {
+			t.Fatalf("prompt was not forwarded to inference: %s", request.body)
+		}
+	})
+
+	for _, testCase := range []struct {
+		name    string
+		marker  string
+		deliver func(*PiAgentProcess, string) error
+	}{
+		{name: "active-follow-up-queues-next-turn", marker: "active follow-up marker", deliver: func(process *PiAgentProcess, marker string) error {
+			return process.SendFollowUp(marker)
+		}},
+		{name: "active-steer-queues-next-turn", marker: "active steer marker", deliver: func(process *PiAgentProcess, marker string) error {
+			return process.SendSteer(marker)
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			process, probe := spawnPiRPCProbe(t, true)
+			if err := process.SendPrompt("start active turn"); err != nil {
+				t.Fatal(err)
+			}
+			_ = awaitPiRPCRequest(t, probe.requests)
+			if err := testCase.deliver(process, testCase.marker); err != nil {
+				t.Fatal(err)
+			}
+			close(probe.releaseFirst)
+			request := awaitPiRPCRequest(t, probe.requests)
+			if !strings.Contains(request.body, testCase.marker) {
+				t.Fatalf("queued command was not forwarded on the next turn: %s", request.body)
+			}
+		})
+	}
+}
+
+func TestAgentSupervisorUsesPromptForIdleContractDelivery(t *testing.T) {
+	probe, config := newPiRPCProbe(t, false)
+	supervisor := NewAgentSupervisor(AgentConfig{
+		AgentID:          "agent-consumer",
+		DomainID:         "consumer",
+		PiAgent:          config,
+		HeartbeatTimeout: time.Hour,
+		ProgressTimeout:  time.Hour,
+		MaxCrashRestarts: 1,
+	})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		supervisor.mu.Lock()
+		process := supervisor.piAgent
+		supervisor.mu.Unlock()
+		if process != nil {
+			_ = process.Kill()
+		}
+		_ = supervisor.Stop()
+	})
+
+	payload, _ := json.Marshal(map[string]any{"id": "contract-idle", "revision": 1})
+	if err := supervisor.DeliverContext(hub.Message{
+		ID:        "effect-idle",
+		Type:      hub.MsgContractProduced,
+		FromAgent: "orchestrator",
+		ToAgent:   "agent-consumer",
+		Payload:   payload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := awaitPiRPCRequest(t, probe.requests)
+	if !strings.Contains(request.body, "ContractProduced") || !strings.Contains(request.body, "contract-idle") {
+		t.Fatalf("idle contract event did not start a Pi prompt turn: %s", request.body)
+	}
+}
+
+func TestAgentSupervisorQueuesContractDuringActiveTurn(t *testing.T) {
+	probe, config := newPiRPCProbe(t, true)
+	supervisor := NewAgentSupervisor(AgentConfig{
+		AgentID:          "agent-producer",
+		DomainID:         "producer",
+		InitialPrompt:    "start active contract turn",
+		PiAgent:          config,
+		HeartbeatTimeout: time.Hour,
+		ProgressTimeout:  time.Hour,
+		MaxCrashRestarts: 1,
+	})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		supervisor.mu.Lock()
+		process := supervisor.piAgent
+		supervisor.mu.Unlock()
+		if process != nil {
+			_ = process.Kill()
+		}
+		_ = supervisor.Stop()
+	})
+
+	_ = awaitPiRPCRequest(t, probe.requests)
+	payload, _ := json.Marshal(map[string]any{"id": "contract-active", "revision": 0})
+	if err := supervisor.DeliverContext(hub.Message{
+		ID:        "effect-active",
+		Type:      hub.MsgContractRequested,
+		FromAgent: "orchestrator",
+		ToAgent:   "agent-producer",
+		Payload:   payload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	close(probe.releaseFirst)
+	request := awaitPiRPCRequest(t, probe.requests)
+	if !strings.Contains(request.body, "ContractRequested") || !strings.Contains(request.body, "contract-active") {
+		t.Fatalf("active contract event was not queued for the next Pi turn: %s", request.body)
+	}
+}
+
+type piRPCRequest struct {
+	number int32
+	body   string
+}
+
+type piRPCProbe struct {
+	requests     chan piRPCRequest
+	releaseFirst chan struct{}
+}
+
+func spawnPiRPCProbe(t *testing.T, blockFirst bool) (*PiAgentProcess, *piRPCProbe) {
+	t.Helper()
+	probe, config := newPiRPCProbe(t, blockFirst)
+	process, err := SpawnPiAgent(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = process.Kill() })
+	return process, probe
+}
+
+func newPiRPCProbe(t *testing.T, blockFirst bool) (*piRPCProbe, PiAgentConfig) {
+	t.Helper()
+	piBinary, err := exec.LookPath("pi")
+	if err != nil {
+		t.Skip("Pi is not installed")
+	}
+	extension, err := filepath.Abs(filepath.Join("..", "..", "install", "pi", "extensions", "aion-gateway-provider.ts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.MkdirTemp("/tmp", "aion-pi-turns-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	socketPath := filepath.Join(root, "inference.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := &piRPCProbe{
+		requests:     make(chan piRPCRequest, 8),
+		releaseFirst: make(chan struct{}),
+	}
+	var requestCount atomic.Int32
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/aion/gateway/extension-loaded" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path != "/v1/chat/completions" {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		body, readErr := io.ReadAll(r.Body)
+		if readErr != nil {
+			http.Error(w, "read request", http.StatusBadRequest)
+			return
+		}
+		number := requestCount.Add(1)
+		probe.requests <- piRPCRequest{number: number, body: string(body)}
+		if blockFirst && number == 1 {
+			select {
+			case <-probe.releaseFirst:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "data: {\"id\":\"response-%d\",\"model\":\"test-model\",\"choices\":[{\"delta\":{\"content\":\"reply-%d\"},\"finish_reason\":\"stop\"}]}\n\n", number, number)
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"usage\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = os.Remove(socketPath)
+	})
+	return probe, PiAgentConfig{
+		Binary:         piBinary,
+		SessionDir:     filepath.Join(root, "sessions"),
+		HostSessionDir: filepath.Join(root, "sessions"),
+		WorkingDir:     root,
+		Provider:       "aion-gateway",
+		Model:          "test-model",
+		ExtensionPaths: []string{extension},
+		Env: []string{
+			"AION_INFERENCE_GATEWAY_ENABLED=true",
+			"AION_INFERENCE_SOCKET=" + socketPath,
+			"AION_AGENT_CAPABILITY=test-capability",
+			"AION_TARGET_MODEL=test-model",
+			"AION_TARGET_PROFILE=test-profile",
+			"AION_TARGET_API=openai-completions",
+			"PI_CODING_AGENT_DIR=" + filepath.Join(root, "pi-config"),
+		},
+	}
+}
+
+func awaitPiRPCRequest(t *testing.T, requests <-chan piRPCRequest) piRPCRequest {
+	t.Helper()
+	select {
+	case request := <-requests:
+		return request
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Pi inference request")
+		return piRPCRequest{}
+	}
+}
+
+func assertNoPiRPCRequest(t *testing.T, requests <-chan piRPCRequest, duration time.Duration) {
+	t.Helper()
+	select {
+	case request := <-requests:
+		t.Fatalf("idle RPC command unexpectedly started inference request %d: %s", request.number, request.body)
+	case <-time.After(duration):
 	}
 }

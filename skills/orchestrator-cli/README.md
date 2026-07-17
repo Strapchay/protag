@@ -17,7 +17,15 @@ cd kernel && go build -o skills/orchestrator-cli/bin/orchestrator-cli ./cmd/orch
 | `acquire-lock` | `--file`, `--agent-id` | Exclusive file lock |
 | `release-lock` | `--file`, `--agent-id` | Release file lock |
 | `update-node` | `--node-id`, `--status`; agent identity via `--agent-id` or env | Update an assigned task status |
-| `create-stub` | `--contract` | Create stub contract |
+| `contract-request` | `--contract` | Request a versioned cross-domain artifact |
+| `contract-publish` | `--contract-id`, `--artifact-file` | Publish the next immutable artifact revision |
+| `contract-fetch` | `--contract-id`, `--output` | Materialize an artifact revision locally |
+| `contract-validate` | `--contract-id`, `--revision` | Accept a produced revision |
+| `contract-correct` | `--contract-id`, `--revision`, `--reason` | Reject a revision and request correction |
+| `contract-wait` | `--contract-id`; optional `--clear` | Declare or clear a hard wait |
+| `contract-status` | `--contract-id` | Read one durable contract |
+| `contract-list` | none | List visible durable contracts |
+| `contract-fail` / `contract-cancel` | `--contract-id` | Terminate a contract explicitly |
 | `inject-edge` | `--from`, `--to` | Report dependency |
 | `split-node` | `--node-id`, `--into` | Split task |
 | `read-dag` | (optional: `--node-id`) | Read DAG state |
@@ -32,6 +40,8 @@ cd kernel && go build -o skills/orchestrator-cli/bin/orchestrator-cli ./cmd/orch
 - `AION_ORCHESTRATOR_ADDR` — Explicit override when you want to bypass the resolved core address
 - `AION_AGENT_ID` — Default agent ID for `--agent-id` flags; node updates are rejected unless the node is assigned to this agent
 - `AION_AGENT_CAPABILITY` — Opaque runtime credential injected by the supervisor and consumed automatically; do not print, persist, or pass it manually
+
+Contract mutations are authorized from this capability. Cross-domain artifacts are content-addressed and revisioned; use `--command-id` to make retries idempotent and `--expected-revision` when publishing to reject stale writers.
 
 ## Output Format
 

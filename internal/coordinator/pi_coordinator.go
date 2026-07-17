@@ -726,6 +726,7 @@ Error:
 Read the planning input artifact at %s again and overwrite the output artifact with a valid, non-empty plan_response JSON object:
 %s
 
+Every edge object must use exactly this shape: {"from_node":"source-task-id","to_node":"dependent-task-id"}.
 Do not answer with the plan in chat. Write the corrected artifact directly.`, outputPath, validationErr.Error(), paths.InputPath, outputPath))
 	if c.traceFn != nil {
 		c.traceFn("requesting coordinator plan artifact repair after validation failure")
@@ -733,9 +734,10 @@ Do not answer with the plan in chat. Write the corrected artifact directly.`, ou
 	if c.statusFn != nil {
 		c.statusFn("Coordinator plan artifact failed validation; requesting repair...", "warn")
 	}
-	// The planner may be idle after writing the rejected artifact. A direct
-	// prompt starts a new turn reliably in both active and idle Pi sessions.
-	if err := planner.SendPrompt(repairPrompt); err != nil {
+	// Artifact validation can finish before Pi emits its turn-complete event.
+	// The supervisor queues a follow-up while active and promotes it to a direct
+	// prompt when idle, so the repair turn is accepted in either state.
+	if err := planner.DeliverTurn(repairPrompt); err != nil {
 		if c.traceFn != nil {
 			c.traceFn(fmt.Sprintf("repair prompt error: %v", err))
 		}
@@ -804,7 +806,7 @@ func (c *PiCoordinator) Continue(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return c.agent.SendFollowUp(text)
+	return c.agent.DeliverTurn(text)
 }
 
 func (c *PiCoordinator) Resume(ctx context.Context) error {
@@ -818,7 +820,7 @@ func (c *PiCoordinator) Resume(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return c.agent.SendFollowUp(prompt)
+	return c.agent.DeliverTurn(prompt)
 }
 
 func (c *PiCoordinator) handlePlannerLifecycle(event supervisor.AgentLifecycleEvent) {

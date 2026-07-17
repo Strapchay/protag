@@ -53,7 +53,7 @@ func buildDomainPrompt(domain Domain, projectContext, buildSpec string) string {
 	b.WriteString("## Coordination\n")
 	b.WriteString("The loaded orchestrator-cli skill is authoritative for commands and workflow.\n")
 	b.WriteString("- Execute only dispatched nodes assigned to this agent and report their progress through the skill.\n")
-	b.WriteString("- Use stub contracts or orchestrator messages for cross-domain work; do not widen your own file scope.\n")
+	b.WriteString("- Use durable artifact contracts or orchestrator messages for cross-domain work; do not widen your own file scope.\n")
 	b.WriteString("- Report blocked work instead of inventing missing dependencies or ownership.\n")
 
 	if projectContext != "" {
@@ -141,7 +141,8 @@ func GenerateCoordinatorPlanningInstruction(_ string, scan *ProjectScan, inputPa
 	b.WriteString(outputPath)
 	b.WriteString("\n\n")
 	b.WriteString("Write a JSON object directly to the output artifact with this shape:\n")
-	b.WriteString("{\"type\":\"plan_response\",\"domains\":[{\"domain_id\":\"short-stable-domain-id\",\"description\":\"owned implementation area\",\"assigned_paths\":[\"relative/path\"],\"agent_type\":\"domain\"}],\"nodes\":[{\"id\":\"short-stable-task-id\",\"domain_id\":\"short-stable-domain-id\",\"task_spec\":\"specific implementation task\",\"target_files\":[\"relative/path/file.ext\"],\"priority\":1}],\"edges\":[]}\n\n")
+	b.WriteString("{\"type\":\"plan_response\",\"domains\":[{\"domain_id\":\"short-stable-domain-id\",\"description\":\"owned implementation area\",\"assigned_paths\":[\"relative/path\"],\"agent_type\":\"domain\"}],\"nodes\":[{\"id\":\"short-stable-task-id\",\"domain_id\":\"short-stable-domain-id\",\"task_spec\":\"specific implementation task\",\"target_files\":[\"relative/path/file.ext\"],\"priority\":1}],\"edges\":[{\"from_node\":\"source-task-id\",\"to_node\":\"dependent-task-id\"}]}\n\n")
+	b.WriteString("Every edge must use the exact `from_node` and `to_node` field names shown above. Use an empty `edges` array when there are no dependencies.\n")
 	b.WriteString("The artifact must contain real, non-empty `domains` and `nodes` arrays. Do not copy placeholder IDs or empty arrays.\n")
 	b.WriteString("Keep the initial plan coarse enough for reliable artifact writing: prefer 3-8 domains and 1-3 nodes per domain. Do not exceed 18 nodes unless the spec truly cannot be represented otherwise.\n")
 	b.WriteString("Use the `excluded_paths` array from the planning input artifact.\n")

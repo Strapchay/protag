@@ -1,0 +1,308 @@
+package orchestrator
+
+import (
+	"context"
+	"encoding/json"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	coordination "aion-coordination"
+	"aion-kernel/internal/dag"
+	"aion-kernel/internal/hub"
+	"aion-kernel/internal/locking"
+)
+
+type coordinationTestAgent struct {
+	id       string
+	mu       sync.Mutex
+	messages []hub.Message
+}
+
+func (a *coordinationTestAgent) AgentID() string { return a.id }
+
+func (a *coordinationTestAgent) DeliverContext(message hub.Message) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.messages = append(a.messages, message)
+	return nil
+}
+
+func (a *coordinationTestAgent) hasMessage(messageType hub.MessageType) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, message := range a.messages {
+		if message.Type == messageType {
+			return true
+		}
+	}
+	return false
+}
+
+type coordinationKernelFixture struct {
+	manager      *coordination.Manager
+	dag          *dag.Manager
+	server       *Server
+	daemon       *Daemon
+	router       *hub.Router
+	capabilities map[string]string
+	agents       map[string]*coordinationTestAgent
+}
+
+func newCoordinationKernelFixture(t *testing.T, nodes ...dag.DagNode) *coordinationKernelFixture {
+	t.Helper()
+	root := t.TempDir()
+	dagManager, err := dag.NewManager(dag.ManagerConfig{
+		StoreFilePath: filepath.Join(root, "dag.bin"),
+		WalFilePath:   filepath.Join(root, "dag.wal"),
+		MaxNodes:      100,
+	})
+	if err != nil {
+		t.Fatalf("create DAG manager: %v", err)
+	}
+	for _, node := range nodes {
+		if err := dagManager.AddNode(node); err != nil {
+			t.Fatalf("add node %s: %v", node.ID, err)
+		}
+	}
+	coordinationManager, err := coordination.Open(coordination.Options{StateDir: filepath.Join(root, "coordination")})
+	if err != nil {
+		t.Fatalf("open coordination manager: %v", err)
+	}
+	router := hub.NewRouter(filepath.Join(root, "logs"))
+	server := NewServer(dagManager, locking.NewManager(nil), coordinationManager, nil)
+	server.SetLogsDir(filepath.Join(root, "logs"))
+	daemon := &Daemon{
+		dagManager:          dagManager,
+		coordinationManager: coordinationManager,
+		hubRouter:           router,
+		server:              server,
+		ctx:                 context.Background(),
+	}
+	server.coordinationEffectsCb = daemon.drainCoordinationEffects
+
+	fixture := &coordinationKernelFixture{
+		manager:      coordinationManager,
+		dag:          dagManager,
+		server:       server,
+		daemon:       daemon,
+		router:       router,
+		capabilities: make(map[string]string),
+		agents:       make(map[string]*coordinationTestAgent),
+	}
+	for _, node := range nodes {
+		agentID := node.AssignedAgent
+		if agentID == "" {
+			agentID = expectedAgentForNode(node.DomainID, "")
+		}
+		if _, exists := fixture.capabilities[agentID]; exists {
+			continue
+		}
+		capability, err := server.IssueAgentCapability(agentID)
+		if err != nil {
+			t.Fatalf("issue capability for %s: %v", agentID, err)
+		}
+		agent := &coordinationTestAgent{id: agentID}
+		router.RegisterAgent(agentID, agent)
+		fixture.capabilities[agentID] = capability
+		fixture.agents[agentID] = agent
+	}
+	t.Cleanup(func() {
+		router.Close()
+		if err := coordinationManager.Close(); err != nil {
+			t.Errorf("close coordination manager: %v", err)
+		}
+		if err := dagManager.Close(); err != nil {
+			t.Errorf("close DAG manager: %v", err)
+		}
+	})
+	return fixture
+}
+
+func coordinationNode(id, domain, agent string) dag.DagNode {
+	return dag.DagNode{
+		ID:            id,
+		DomainID:      domain,
+		AssignedAgent: agent,
+		TaskSpec:      "test " + id,
+		Status:        dag.StatusInProgress,
+	}
+}
+
+func coordinationContract(id, producerAgent, producerNode, consumerAgent, consumerNode string) coordination.Contract {
+	return coordination.Contract{
+		ID:              id,
+		ProducerAgentID: producerAgent,
+		ProducerNodeID:  producerNode,
+		ConsumerAgentID: consumerAgent,
+		ConsumerNodeID:  consumerNode,
+		Details: coordination.ContractDetails{
+			Name:       "PublicBoundary",
+			Kind:       "interface",
+			Acceptance: []string{"consumer integration test passes"},
+		},
+	}
+}
+
+func callCoordinationServer(t *testing.T, server *Server, method, capability string, params any) Response {
+	t.Helper()
+	raw, err := json.Marshal(params)
+	if err != nil {
+		t.Fatalf("encode %s request: %v", method, err)
+	}
+	return server.handleRequest(Request{ID: method + "-test", Method: method, Capability: capability, Params: raw})
+}
+
+func decodeCoordinationResult[T any](t *testing.T, response Response) T {
+	t.Helper()
+	if response.Error != "" {
+		t.Fatalf("coordination request failed: %s", response.Error)
+	}
+	raw, err := json.Marshal(response.Result)
+	if err != nil {
+		t.Fatalf("encode coordination response: %v", err)
+	}
+	var result T
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("decode coordination response: %v", err)
+	}
+	return result
+}
+
+func TestKernelCoordinationLifecycleAuthorizesArtifactsAndDefersCompletion(t *testing.T) {
+	producerAgent := "agent-provider"
+	consumerAgent := "agent-consumer"
+	fixture := newCoordinationKernelFixture(t,
+		coordinationNode("provider-node", "provider", producerAgent),
+		coordinationNode("consumer-node", "consumer", consumerAgent),
+	)
+	contract := coordinationContract("contract-lifecycle", producerAgent, "provider-node", consumerAgent, "consumer-node")
+
+	requested := decodeCoordinationResult[coordination.Contract](t, callCoordinationServer(t, fixture.server, "contract-request", fixture.capabilities[consumerAgent], map[string]any{
+		"command_id": "request-lifecycle",
+		"contract":   contract,
+	}))
+	if requested.Status != coordination.StatusRequested || !fixture.agents[producerAgent].hasMessage(hub.MsgContractRequested) {
+		t.Fatalf("request was not projected to producer: %+v", requested)
+	}
+
+	unauthorized := callCoordinationServer(t, fixture.server, "contract-publish", fixture.capabilities[consumerAgent], map[string]any{
+		"contract_id": contract.ID,
+		"content":     []byte("forbidden"),
+	})
+	if unauthorized.Error == "" || !strings.Contains(unauthorized.Error, "assigned producer") {
+		t.Fatalf("consumer publication should be rejected, got %+v", unauthorized)
+	}
+
+	deferred := decodeCoordinationResult[struct {
+		Status           string   `json:"status"`
+		PendingContracts []string `json:"pending_contracts"`
+	}](t, callCoordinationServer(t, fixture.server, "update-node", fixture.capabilities[producerAgent], map[string]any{
+		"node_id":  "provider-node",
+		"agent_id": producerAgent,
+		"status":   "Done",
+	}))
+	if deferred.Status != "completion_deferred" || len(deferred.PendingContracts) != 1 {
+		t.Fatalf("expected deferred completion, got %+v", deferred)
+	}
+	if node, _ := fixture.dag.GetNode("provider-node"); node.Status != dag.StatusBlocked {
+		t.Fatalf("provider node status = %s, want Blocked", node.Status)
+	}
+
+	produced := decodeCoordinationResult[coordination.Contract](t, callCoordinationServer(t, fixture.server, "contract-publish", fixture.capabilities[producerAgent], map[string]any{
+		"command_id":        "publish-lifecycle",
+		"contract_id":       contract.ID,
+		"expected_revision": 0,
+		"content":           []byte("versioned interface artifact"),
+		"media_type":        "text/plain",
+	}))
+	if produced.Revision != 1 || !fixture.agents[consumerAgent].hasMessage(hub.MsgContractProduced) {
+		t.Fatalf("artifact publication was not projected to consumer: %+v", produced)
+	}
+
+	fetched := decodeCoordinationResult[struct {
+		Content []byte `json:"content"`
+	}](t, callCoordinationServer(t, fixture.server, "contract-fetch", fixture.capabilities[consumerAgent], map[string]any{
+		"contract_id": contract.ID,
+		"revision":    1,
+	}))
+	if string(fetched.Content) != "versioned interface artifact" {
+		t.Fatalf("fetched artifact = %q", fetched.Content)
+	}
+
+	fulfilled := decodeCoordinationResult[coordination.Contract](t, callCoordinationServer(t, fixture.server, "contract-validate", fixture.capabilities[consumerAgent], map[string]any{
+		"command_id":  "validate-lifecycle",
+		"contract_id": contract.ID,
+		"revision":    1,
+		"evidence":    map[string]string{"integration": "passed"},
+	}))
+	if fulfilled.Status != coordination.StatusFulfilled {
+		t.Fatalf("contract status = %s, want Fulfilled", fulfilled.Status)
+	}
+	if node, _ := fixture.dag.GetNode("provider-node"); node.Status != dag.StatusDone {
+		t.Fatalf("provider node status = %s, want Done after contract fulfillment", node.Status)
+	}
+	if !fixture.agents[producerAgent].hasMessage(hub.MsgContractFulfilled) {
+		t.Fatal("producer did not receive stable ContractFulfilled effect")
+	}
+}
+
+func TestKernelCoordinationHardWaitCycleBlocksNodesAndSurfacesEvent(t *testing.T) {
+	agentA := "agent-a"
+	agentB := "agent-b"
+	fixture := newCoordinationKernelFixture(t,
+		coordinationNode("node-a", "a", agentA),
+		coordinationNode("node-b", "b", agentB),
+	)
+
+	contractAB := coordinationContract("contract-a-needs-b", agentB, "node-b", agentA, "node-a")
+	contractAB.HardWait = true
+	decodeCoordinationResult[coordination.Contract](t, callCoordinationServer(t, fixture.server, "contract-request", fixture.capabilities[agentA], map[string]any{
+		"command_id": "request-a-needs-b",
+		"contract":   contractAB,
+	}))
+
+	contractBA := coordinationContract("contract-b-needs-a", agentA, "node-a", agentB, "node-b")
+	contractBA.HardWait = true
+	decodeCoordinationResult[coordination.Contract](t, callCoordinationServer(t, fixture.server, "contract-request", fixture.capabilities[agentB], map[string]any{
+		"command_id": "request-b-needs-a",
+		"contract":   contractBA,
+	}))
+
+	for _, nodeID := range []string{"node-a", "node-b"} {
+		node, err := fixture.dag.GetNode(nodeID)
+		if err != nil || node.Status != dag.StatusBlocked {
+			t.Fatalf("cycle node %s was not blocked: node=%+v err=%v", nodeID, node, err)
+		}
+	}
+	snapshot, err := fixture.manager.Snapshot(context.Background())
+	if err != nil || len(snapshot.Cycles) != 1 {
+		t.Fatalf("expected one durable cycle, got %+v err=%v", snapshot.Cycles, err)
+	}
+
+	fixture.server.mu.Lock()
+	defer fixture.server.mu.Unlock()
+	found := false
+	for _, message := range fixture.server.hubHistory {
+		if message.Type == hub.MsgContractCycle {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("cycle was not surfaced in the main TUI Hub stream")
+	}
+}
+
+func TestContractCommandsFailClosedWithoutCoordinationManager(t *testing.T) {
+	server, _ := startTestServer(t)
+	capability, err := server.IssueAgentCapability("agent-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := callCoordinationServer(t, server, "contract-list", capability, map[string]any{})
+	if response.Error != "coordination manager is unavailable" {
+		t.Fatalf("unexpected unavailable-manager response: %+v", response)
+	}
+}

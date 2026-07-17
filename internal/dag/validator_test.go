@@ -111,22 +111,22 @@ func TestValidateNodeCeilingExceeded(t *testing.T) {
 	}
 }
 
-func TestValidateStubEdgesValid(t *testing.T) {
+func TestValidateContractEdgesValid(t *testing.T) {
 	nodes := []DagNode{{ID: "a"}, {ID: "b"}}
 	edges := []DagEdge{
-		{FromNode: "a", ToNode: "b", Type: EdgeStubContract, StubID: "stub-1"},
+		{FromNode: "a", ToNode: "b", Type: EdgeContract, ContractID: "contract-1"},
 	}
-	if err := ValidateStubEdges(nodes, edges); err != nil {
-		t.Fatalf("valid stub edge: %v", err)
+	if err := ValidateContractEdges(nodes, edges); err != nil {
+		t.Fatalf("valid contract edge: %v", err)
 	}
 }
 
-func TestValidateStubEdgesInvalid(t *testing.T) {
+func TestValidateContractEdgesInvalid(t *testing.T) {
 	nodes := []DagNode{{ID: "a"}}
 	edges := []DagEdge{
-		{FromNode: "a", ToNode: "missing", Type: EdgeStubContract},
+		{FromNode: "a", ToNode: "missing", Type: EdgeContract},
 	}
-	if err := ValidateStubEdges(nodes, edges); err == nil {
+	if err := ValidateContractEdges(nodes, edges); err == nil {
 		t.Fatal("expected error for missing node")
 	}
 }

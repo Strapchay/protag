@@ -77,7 +77,7 @@ func TestSeqlockConcurrentReadersOneWriter(t *testing.T) {
 	sl := NewSeqlock(&counter, DefaultMaxSpins)
 
 	// Shared data protected by seqlock
-	var sharedValue int64
+	var sharedValue atomic.Int64
 	var writerAtomic atomic.Int64
 
 	const numReaders = 8
@@ -93,7 +93,7 @@ func TestSeqlockConcurrentReadersOneWriter(t *testing.T) {
 			sl.WriterLock()
 			// Write a multi-word value: both halves should be consistent
 			writerAtomic.Store(i)
-			sharedValue = i
+			sharedValue.Store(i)
 			sl.WriterUnlock()
 			time.Sleep(time.Microsecond)
 		}
@@ -111,7 +111,7 @@ func TestSeqlockConcurrentReadersOneWriter(t *testing.T) {
 					continue
 				}
 				// Read the data
-				v := sharedValue
+				v := sharedValue.Load()
 				wv := writerAtomic.Load()
 
 				if sl.ReadValidate(seq) {

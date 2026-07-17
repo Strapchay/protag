@@ -100,6 +100,13 @@ func main() {
 		}
 		return
 	}
+	if command == "contract-fetch" {
+		outputPath := parseFlags(os.Args[2:])["output"]
+		if err := writeFetchedContract(resp.Result, outputPath); err != nil {
+			exitError(err.Error())
+		}
+		return
+	}
 
 	// Output result as JSON.
 	output, _ := json.MarshalIndent(json.RawMessage(resp.Result), "", "  ")
@@ -261,16 +268,135 @@ func parseCommand(command string, args []string) (map[string]interface{}, error)
 
 		return res, nil
 
-	case "create-stub":
+	case "contract-request":
 		contractJSON := flags["contract"]
 		if contractJSON == "" {
-			return nil, fmt.Errorf("create-stub requires --contract '<json>'")
+			return nil, fmt.Errorf("%s requires --contract '<json>'", command)
 		}
 		var contract interface{}
 		if err := json.Unmarshal([]byte(contractJSON), &contract); err != nil {
 			return nil, fmt.Errorf("invalid contract JSON: %w", err)
 		}
-		return map[string]interface{}{"contract": contract}, nil
+		result := map[string]interface{}{"contract": contract}
+		if commandID := flags["command-id"]; commandID != "" {
+			result["command_id"] = commandID
+		}
+		return result, nil
+
+	case "contract-publish":
+		contractID := flags["contract-id"]
+		artifactFile := flags["artifact-file"]
+		if contractID == "" || artifactFile == "" {
+			return nil, fmt.Errorf("contract-publish requires --contract-id <id> --artifact-file <path>")
+		}
+		content, err := os.ReadFile(artifactFile)
+		if err != nil {
+			return nil, fmt.Errorf("read contract artifact: %w", err)
+		}
+		expectedRevision := int64(0)
+		if value := flags["expected-revision"]; value != "" {
+			if _, err := fmt.Sscanf(value, "%d", &expectedRevision); err != nil || expectedRevision < 0 {
+				return nil, fmt.Errorf("contract-publish --expected-revision must be a non-negative integer")
+			}
+		}
+		result := map[string]interface{}{
+			"contract_id":       contractID,
+			"expected_revision": expectedRevision,
+			"content":           content,
+			"media_type":        flags["media-type"],
+		}
+		if evidence := flags["evidence"]; evidence != "" {
+			var decoded interface{}
+			if err := json.Unmarshal([]byte(evidence), &decoded); err != nil {
+				return nil, fmt.Errorf("invalid evidence JSON: %w", err)
+			}
+			result["evidence"] = decoded
+		}
+		if commandID := flags["command-id"]; commandID != "" {
+			result["command_id"] = commandID
+		}
+		return result, nil
+
+	case "contract-fetch":
+		contractID := flags["contract-id"]
+		if contractID == "" || flags["output"] == "" {
+			return nil, fmt.Errorf("contract-fetch requires --contract-id <id> --output <path>")
+		}
+		revision := int64(0)
+		if value := flags["revision"]; value != "" {
+			if _, err := fmt.Sscanf(value, "%d", &revision); err != nil || revision < 1 {
+				return nil, fmt.Errorf("contract-fetch --revision must be a positive integer")
+			}
+		}
+		return map[string]interface{}{"contract_id": contractID, "revision": revision}, nil
+
+	case "contract-validate":
+		contractID := flags["contract-id"]
+		revision, err := requiredPositiveRevision(flags, "contract-validate")
+		if err != nil || contractID == "" {
+			if err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("contract-validate requires --contract-id <id> --revision <N>")
+		}
+		result := map[string]interface{}{"contract_id": contractID, "revision": revision}
+		if evidence := flags["evidence"]; evidence != "" {
+			var decoded interface{}
+			if err := json.Unmarshal([]byte(evidence), &decoded); err != nil {
+				return nil, fmt.Errorf("invalid evidence JSON: %w", err)
+			}
+			result["evidence"] = decoded
+		}
+		if commandID := flags["command-id"]; commandID != "" {
+			result["command_id"] = commandID
+		}
+		return result, nil
+
+	case "contract-correct":
+		contractID := flags["contract-id"]
+		revision, err := requiredPositiveRevision(flags, "contract-correct")
+		if err != nil {
+			return nil, err
+		}
+		if contractID == "" || flags["reason"] == "" {
+			return nil, fmt.Errorf("contract-correct requires --contract-id <id> --revision <N> --reason <text>")
+		}
+		result := map[string]interface{}{"contract_id": contractID, "revision": revision, "reason": flags["reason"]}
+		if commandID := flags["command-id"]; commandID != "" {
+			result["command_id"] = commandID
+		}
+		return result, nil
+
+	case "contract-wait":
+		contractID := flags["contract-id"]
+		if contractID == "" {
+			return nil, fmt.Errorf("contract-wait requires --contract-id <id> [--clear]")
+		}
+		result := map[string]interface{}{"contract_id": contractID, "hard": flags["clear"] == ""}
+		if commandID := flags["command-id"]; commandID != "" {
+			result["command_id"] = commandID
+		}
+		return result, nil
+
+	case "contract-cancel", "contract-fail":
+		contractID := flags["contract-id"]
+		if contractID == "" {
+			return nil, fmt.Errorf("%s requires --contract-id <id> [--reason <text>]", command)
+		}
+		result := map[string]interface{}{"contract_id": contractID, "reason": flags["reason"]}
+		if commandID := flags["command-id"]; commandID != "" {
+			result["command_id"] = commandID
+		}
+		return result, nil
+
+	case "contract-status":
+		if flags["contract-id"] == "" {
+			return nil, fmt.Errorf("contract-status requires --contract-id <id>")
+		}
+		return map[string]interface{}{"contract_id": flags["contract-id"]}, nil
+
+	case "contract-list":
+		return map[string]interface{}{}, nil
 
 	case "inject-edge":
 		from := flags["from"]
@@ -364,6 +490,60 @@ func parseCommand(command string, args []string) (map[string]interface{}, error)
 	}
 }
 
+func requiredPositiveRevision(flags map[string]string, command string) (int64, error) {
+	var revision int64
+	if _, err := fmt.Sscanf(flags["revision"], "%d", &revision); err != nil || revision < 1 {
+		return 0, fmt.Errorf("%s requires --revision <positive integer>", command)
+	}
+	return revision, nil
+}
+
+func writeFetchedContract(raw json.RawMessage, outputPath string) error {
+	if strings.TrimSpace(outputPath) == "" {
+		return fmt.Errorf("contract-fetch requires --output <path>")
+	}
+	var result struct {
+		Contract interface{} `json:"contract"`
+		Content  []byte      `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return fmt.Errorf("decode fetched contract: %w", err)
+	}
+	if len(result.Content) == 0 {
+		return fmt.Errorf("fetched contract artifact is empty")
+	}
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
+		return fmt.Errorf("create artifact output directory: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(outputPath), ".contract-*")
+	if err != nil {
+		return fmt.Errorf("create temporary artifact: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(result.Content); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write artifact: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("sync artifact: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close artifact: %w", err)
+	}
+	if err := os.Rename(tmpPath, outputPath); err != nil {
+		return fmt.Errorf("publish artifact: %w", err)
+	}
+	output, _ := json.MarshalIndent(map[string]interface{}{"status": "fetched", "file": outputPath, "contract": result.Contract}, "", "  ")
+	fmt.Println(string(output))
+	return nil
+}
+
 func printDebugStatus(raw json.RawMessage, pretty bool, key string) error {
 	var result map[string]interface{}
 	if err := json.Unmarshal(raw, &result); err != nil {
@@ -402,6 +582,7 @@ func printDebugStatus(raw json.RawMessage, pretty bool, key string) error {
 		"heartbeat_count",
 		"last_hub_event_at",
 		"inference_gateway",
+		"coordination",
 		"agents",
 	}
 	printed := map[string]bool{}
@@ -514,7 +695,16 @@ Commands:
   acquire-lock    --file <path> --agent-id <uuid>
   release-lock    --file <path> --agent-id <uuid>
 	  update-node     --node-id <uuid> --status <Pending|InProgress|Done|Failed> [--agent-id <uuid>]
-  create-stub     --contract '<json>'
+	contract-request  --contract '<json>'
+	contract-publish  --contract-id <id> --artifact-file <path> [--expected-revision N]
+	contract-fetch    --contract-id <id> [--revision N] --output <path>
+	contract-validate --contract-id <id> --revision <N> [--evidence '<json>']
+	contract-correct  --contract-id <id> --revision <N> --reason <text>
+	contract-wait     --contract-id <id> [--clear]
+	contract-cancel   --contract-id <id> [--reason <text>]
+	contract-fail     --contract-id <id> [--reason <text>]
+	contract-status   --contract-id <id>
+	contract-list
   inject-edge     --from <node> --to <node>
   split-node      --node-id <uuid> --into '<json>'
   read-dag        [--node-id <uuid>]

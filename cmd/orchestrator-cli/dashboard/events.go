@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"aion-kernel/internal/hub"
@@ -71,6 +72,25 @@ func (n *tuiEventNormalizer) Normalize(msg hub.Message) []tuiEventMsg {
 		}
 		return events
 	}
+	if content, ok := summarizeContractEvent(msg); ok {
+		target := strings.TrimSpace(msg.ToAgent)
+		if target == "" {
+			target = "orchestrator"
+		}
+		logEvent := tuiEventMsg{
+			Audience: tuiAudienceLogs,
+			Kind:     tuiKindStatus,
+			AgentID:  target,
+			Author:   "Orchestrator",
+			Content:  content,
+			Raw:      string(msg.Payload),
+		}
+		chatEvent := logEvent
+		chatEvent.Audience = tuiAudienceChat
+		chatEvent.Kind = tuiKindText
+		chatEvent.AgentID = "orchestrator"
+		return []tuiEventMsg{logEvent, chatEvent}
+	}
 
 	agentID := n.normalizeAgentID(msg)
 	payload := parseTUIPayload(msg.Payload)
@@ -107,6 +127,66 @@ func (n *tuiEventNormalizer) Normalize(msg hub.Message) []tuiEventMsg {
 		events = append(events, chatEvent)
 	}
 	return events
+}
+
+func summarizeContractEvent(msg hub.Message) (string, bool) {
+	type contractPayload struct {
+		ID               string `json:"id"`
+		ProducerAgentID  string `json:"producer_agent_id"`
+		ProducerNodeID   string `json:"producer_node_id"`
+		ConsumerAgentID  string `json:"consumer_agent_id"`
+		ConsumerNodeID   string `json:"consumer_node_id"`
+		Status           string `json:"status"`
+		Revision         int64  `json:"revision"`
+		CorrectionReason string `json:"correction_reason"`
+		TerminalReason   string `json:"terminal_reason"`
+		Details          struct {
+			Name string `json:"name"`
+		} `json:"details"`
+	}
+	var payload contractPayload
+	switch msg.Type {
+	case hub.MsgContractRequested, hub.MsgContractProduced, hub.MsgContractFulfilled,
+		hub.MsgCorrectionRequest, hub.MsgContractTerminal:
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			return "", false
+		}
+	case hub.MsgContractCycle:
+		var cycle struct {
+			ID          string   `json:"id"`
+			NodeIDs     []string `json:"node_ids"`
+			ContractIDs []string `json:"contract_ids"`
+		}
+		if err := json.Unmarshal(msg.Payload, &cycle); err != nil {
+			return "", false
+		}
+		return fmt.Sprintf("Coordination cycle %s blocked nodes %s (contracts: %s).", cycle.ID, strings.Join(cycle.NodeIDs, ", "), strings.Join(cycle.ContractIDs, ", ")), true
+	default:
+		return "", false
+	}
+
+	label := payload.ID
+	if payload.Details.Name != "" {
+		label += " (" + payload.Details.Name + ")"
+	}
+	switch msg.Type {
+	case hub.MsgContractRequested:
+		return fmt.Sprintf("Contract %s requested by %s for %s.", label, payload.ConsumerNodeID, payload.ProducerNodeID), true
+	case hub.MsgContractProduced:
+		return fmt.Sprintf("Contract %s revision %d was published for validation by %s.", label, payload.Revision, payload.ConsumerAgentID), true
+	case hub.MsgContractFulfilled:
+		return fmt.Sprintf("Contract %s revision %d was accepted; dependent work may continue.", label, payload.Revision), true
+	case hub.MsgCorrectionRequest:
+		return fmt.Sprintf("Contract %s revision %d needs correction: %s", label, payload.Revision, payload.CorrectionReason), true
+	case hub.MsgContractTerminal:
+		reason := payload.TerminalReason
+		if reason == "" {
+			reason = "no reason supplied"
+		}
+		return fmt.Sprintf("Contract %s ended as %s: %s", label, payload.Status, reason), true
+	default:
+		return "", false
+	}
 }
 
 type tuiPayload struct {

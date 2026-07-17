@@ -16,8 +16,8 @@ enum NodeStatus : byte {
 enum EdgeType : byte {
     /// Normal task dependency: to_node cannot start until from_node is Done.
     Dependency = 0,
-    /// Stub contract: to_node needs an interface provided by from_node.
-    StubContract = 1
+    /// Artifact contract: to_node needs a resource provided by from_node.
+    Contract = 1
 }
 
 /// A single task node in the DAG.
@@ -58,8 +58,8 @@ table DagEdge {
     to_node: string;
     /// Type of this edge.
     edge_type: EdgeType = Dependency;
-    /// For StubContract edges, the stub contract UUID.
-    stub_id: string;
+    /// For Contract edges, the durable contract ID.
+    contract_id: string;
 }
 
 /// Header containing metadata about the DAG.
