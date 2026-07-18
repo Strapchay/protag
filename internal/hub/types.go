@@ -20,6 +20,8 @@ const (
 	MsgContractWait      MessageType = "ContractWait"
 	MsgContractTerminal  MessageType = "ContractTerminal"
 	MsgContractCycle     MessageType = "ContractCycle"
+	MsgTermsProposed     MessageType = "ContractTermsProposed"
+	MsgTermsAgreed       MessageType = "ContractTermsAgreed"
 	// MsgDependencyDiscovered reports a new dependency edge (internal to orchestrator).
 	MsgDependencyDiscovered MessageType = "DependencyDiscovered"
 	// MsgProgressUpdate reports node status change (internal to orchestrator).

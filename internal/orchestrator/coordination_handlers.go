@@ -157,6 +157,75 @@ func (s *Server) handleContractCorrect(req Request) Response {
 	return Response{ID: req.ID, Result: contract}
 }
 
+func (s *Server) handleContractProposeTerms(req Request) Response {
+	principal, err := s.authenticatedCoordinationPrincipal(req)
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	var command coordination.ProposeTermsCommand
+	if err := json.Unmarshal(req.Params, &command); err != nil {
+		return Response{ID: req.ID, Error: fmt.Sprintf("invalid params: %v", err)}
+	}
+	terms, err := s.coordination.ProposeTerms(context.Background(), principal, command)
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	s.afterCoordinationMutation("contract_terms_proposed")
+	return Response{ID: req.ID, Result: terms}
+}
+
+func (s *Server) handleContractAcceptTerms(req Request) Response {
+	principal, err := s.authenticatedCoordinationPrincipal(req)
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	var command coordination.AcceptTermsCommand
+	if err := json.Unmarshal(req.Params, &command); err != nil {
+		return Response{ID: req.ID, Error: fmt.Sprintf("invalid params: %v", err)}
+	}
+	terms, err := s.coordination.AcceptTerms(context.Background(), principal, command)
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	s.afterCoordinationMutation("contract_terms_accepted")
+	return Response{ID: req.ID, Result: terms}
+}
+
+func (s *Server) handleContractTerms(req Request) Response {
+	principal, err := s.authenticatedCoordinationPrincipal(req)
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	var params struct {
+		ContractID string `json:"contract_id"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return Response{ID: req.ID, Error: fmt.Sprintf("invalid params: %v", err)}
+	}
+	terms, err := s.coordination.Terms(context.Background(), principal, params.ContractID)
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	return Response{ID: req.ID, Result: map[string]interface{}{"terms": terms}}
+}
+
+func (s *Server) handleContractStandstill(req Request) Response {
+	principal, err := s.authenticatedCoordinationPrincipal(req)
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	var command coordination.StandstillCommand
+	if err := json.Unmarshal(req.Params, &command); err != nil {
+		return Response{ID: req.ID, Error: fmt.Sprintf("invalid params: %v", err)}
+	}
+	resolution, err := s.coordination.DeclareStandstill(context.Background(), principal, command)
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	s.afterCoordinationMutation("contract_standstill")
+	return Response{ID: req.ID, Result: resolution}
+}
+
 func (s *Server) handleContractWait(req Request) Response {
 	principal, err := s.authenticatedCoordinationPrincipal(req)
 	if err != nil {

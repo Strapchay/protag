@@ -21,6 +21,26 @@ type Coordinator interface {
 	GetArchitectAgent() interface{}
 }
 
+// ResolutionCoordinator is deliberately separate from Coordinator. Planning
+// and architect implementations do not gain access to reconciliation unless
+// they explicitly implement this sealed-artifact capability.
+type ResolutionCoordinator interface {
+	ResolveContract(ctx context.Context, req ResolutionRequest) (*ResolutionResult, error)
+}
+
+type ResolutionRequest struct {
+	ResolutionID    string `json:"resolution_id"`
+	ArtifactDir     string `json:"artifact_dir"`
+	SessionDir      string `json:"session_dir"`
+	Repair          bool   `json:"repair,omitempty"`
+	ValidationError string `json:"validation_error,omitempty"`
+	Progress        func() `json:"-"`
+}
+
+type ResolutionResult struct {
+	OutputPath string `json:"output_path"`
+}
+
 // PlanRequest contains everything the Coordinator needs to produce a plan.
 type PlanRequest struct {
 	// AttemptID scopes planner session and artifacts to one build-spec attempt.

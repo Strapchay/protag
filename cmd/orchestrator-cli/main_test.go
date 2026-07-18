@@ -181,6 +181,30 @@ func TestParseArtifactContractLifecycleCommands(t *testing.T) {
 	}
 }
 
+func TestParseContractNegotiationCommands(t *testing.T) {
+	proposal, err := parseCommand("contract-propose-terms", []string{
+		"--contract-id", "contract-1", "--revision", "2",
+		"--terms", `{"details":{"name":"Boundary","kind":"interface"},"tradeoffs":["bounded retry"]}`,
+		"--rationale", "avoid retry amplification",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proposal["expected_revision"] != int64(2) || proposal["details"] == nil || proposal["tradeoffs"] == nil {
+		t.Fatalf("proposal = %#v", proposal)
+	}
+	standstill, err := parseCommand("contract-standstill", []string{
+		"--contract-id", "contract-1", "--revision", "3", "--reason", "incompatible guarantees",
+		"--terminal", "--evidence", `["producer cannot meet latency"]`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if standstill["terms_revision"] != int64(3) || standstill["terminal_incompatibility"] != true {
+		t.Fatalf("standstill = %#v", standstill)
+	}
+}
+
 func TestWriteFetchedContractAtomicallyMaterializesArtifact(t *testing.T) {
 	outputPath := filepath.Join(t.TempDir(), "contracts", "boundary.json")
 	raw := json.RawMessage(`{"contract":{"id":"contract-1","revision":1},"content":"eyJlbnRyeXBvaW50IjoiUHVibGljQm91bmRhcnkifQ=="}`)

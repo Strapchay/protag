@@ -14,6 +14,7 @@ import (
 	"time"
 
 	coordinationruntime "aion-coordination"
+	isolation "aion-isolation"
 	"aion-kernel/internal/coordinator"
 	"aion-kernel/internal/dag"
 	"aion-kernel/internal/hub"
@@ -25,37 +26,39 @@ import (
 // Daemon is the main Orchestrator process. It initializes all subsystems
 // and manages the full lifecycle from startup through shutdown.
 type Daemon struct {
-	config                 *Config
-	dagManager             *dag.Manager
-	lockManager            *locking.Manager
-	coordinationManager    *coordinationruntime.Manager
-	hubRouter              *hub.Router
-	allocator              *Allocator
-	server                 *Server
-	coordinator            coordinator.Coordinator
-	memoryStore            memory.Store
-	inferenceGateway       *InferenceGateway
-	ipcPaths               daemonIPCPaths
-	projectRoot            string
-	auditor                *Auditor
-	runState               *RunState
-	ctx                    context.Context
-	cancel                 context.CancelFunc
-	resetMu                sync.Mutex
-	buildSpecMu            sync.Mutex
-	buildSpecContinueArmed bool
-	buildSpecCancel        context.CancelFunc
-	buildSpecAttempt       *BuildSpecAttempt
-	executionMonitorMu     sync.Mutex
-	executionMonitorCancel context.CancelFunc
-	executionMonitorRun    uint64
-	executionMonitorActive bool
-	progressMu             sync.Mutex
-	coordinationEffectMu   sync.Mutex
-	coordinationWG         sync.WaitGroup
-	lastProgressSignature  string
-	staleMu                sync.Mutex
-	staleReported          map[string]bool
+	config                   *Config
+	dagManager               *dag.Manager
+	lockManager              *locking.Manager
+	coordinationManager      *coordinationruntime.Manager
+	hubRouter                *hub.Router
+	allocator                *Allocator
+	server                   *Server
+	coordinator              coordinator.Coordinator
+	memoryStore              memory.Store
+	inferenceGateway         *InferenceGateway
+	ipcPaths                 daemonIPCPaths
+	projectRoot              string
+	auditor                  *Auditor
+	runState                 *RunState
+	ctx                      context.Context
+	cancel                   context.CancelFunc
+	resetMu                  sync.Mutex
+	buildSpecMu              sync.Mutex
+	buildSpecContinueArmed   bool
+	buildSpecCancel          context.CancelFunc
+	buildSpecAttempt         *BuildSpecAttempt
+	executionMonitorMu       sync.Mutex
+	executionMonitorCancel   context.CancelFunc
+	executionMonitorRun      uint64
+	executionMonitorActive   bool
+	progressMu               sync.Mutex
+	coordinationEffectMu     sync.Mutex
+	coordinationWG           sync.WaitGroup
+	coordinationResolutionMu sync.Mutex
+	coordinationResolutionOn bool
+	lastProgressSignature    string
+	staleMu                  sync.Mutex
+	staleReported            map[string]bool
 }
 
 // NewDaemon creates a new Orchestrator daemon with the given config.
@@ -90,10 +93,15 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	// Initialize Lock Manager
 	lockMgr := locking.NewManager(config.Agents.SharedFiles)
 
-	coordinationManager, err := coordinationruntime.Open(coordinationruntime.Options{StateDir: runState.CoordinationDir})
+	coordinationManager, err := coordinationruntime.Open(coordinationOptions(config, runState.CoordinationDir))
 	if err != nil {
 		_ = dagMgr.Close()
 		return nil, fmt.Errorf("daemon: init coordination manager: %w", err)
+	}
+	if err := coordinationManager.RecoverResolutionLeases(context.Background(), time.Now().UTC()); err != nil {
+		_ = coordinationManager.Close()
+		_ = dagMgr.Close()
+		return nil, fmt.Errorf("daemon: recover coordination leases: %w", err)
 	}
 
 	// Initialize Hub Router
@@ -104,7 +112,12 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	alloc.SetIPCDir(ipcPaths.Dir)
 
 	// Initialize Coordinator
-	piCoord := newPiCoordinatorForRun(projectRoot, config, runState)
+	piCoord, err := newPiCoordinatorForRun(projectRoot, config, runState, ipcPaths.Dir)
+	if err != nil {
+		_ = coordinationManager.Close()
+		_ = dagMgr.Close()
+		return nil, fmt.Errorf("daemon: configure coordinator: %w", err)
+	}
 	coord := coordinator.Coordinator(piCoord)
 
 	// Initialize Semantic Memory (if enabled)
@@ -134,9 +147,9 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 				log.Printf("inference-gateway: liveness pulse agent=%s domain=%s phase=%s", agentID, domainID, phase)
 			}
 			if recorder, ok := coord.(interface {
-				RecordPlannerGatewayActivity(agentID, domainID, phase string)
+				RecordCoordinatorGatewayActivity(agentID, domainID, phase string)
 			}); ok {
-				recorder.RecordPlannerGatewayActivity(agentID, domainID, phase)
+				recorder.RecordCoordinatorGatewayActivity(agentID, domainID, phase)
 			}
 		})
 	}
@@ -148,6 +161,7 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	if inferenceGateway != nil {
 		inferenceGateway.SetUnixSocket(ipcPaths.InferenceSocket)
 		inferenceGateway.SetCapabilityResolver(server.ResolveAgentCapability)
+		configureResolutionCapability(piCoord, server, config)
 	}
 	if broadcaster, ok := coord.(interface{ SetBroadcastFunc(func(hub.Message)) }); ok {
 		broadcaster.SetBroadcastFunc(func(msg hub.Message) {
@@ -681,7 +695,7 @@ func (d *Daemon) recordStaleNode(node dag.DagNode, elapsed time.Duration) {
 	d.refreshBuildProgress("stale_active_work")
 }
 
-func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunState) *coordinator.PiCoordinator {
+func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunState, ipcDir string) (*coordinator.PiCoordinator, error) {
 	infConfig := config.Inference.Coordinator
 	provider := infConfig.Provider
 	model := infConfig.Model
@@ -723,7 +737,7 @@ func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunSta
 		)
 	}
 
-	return coordinator.NewPiCoordinator(projectRoot, coordinator.PiCoordinatorConfig{
+	piConfig := coordinator.PiCoordinatorConfig{
 		Binary:                     config.Agents.CommandPath,
 		SessionDir:                 runState.PiSessionsDir,
 		SessionStoreDir:            runState.AgentSessionsDir,
@@ -736,7 +750,96 @@ func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunSta
 		PlannerStartTimeout:        time.Duration(config.Health.CoordinatorPlannerStartTimeoutSec) * time.Second,
 		PlannerFirstRequestTimeout: time.Duration(config.Health.CoordinatorPlannerFirstRequestTimeoutSec) * time.Second,
 		PlannerArtifactTimeout:     time.Duration(config.Health.CoordinatorPlannerArtifactTimeoutSec) * time.Second,
-	})
+		ResolutionArtifactTimeout:  time.Duration(config.Coordination.ArtifactTimeoutSec) * time.Second,
+	}
+	if config.GatewayEnabled() {
+		engine, err := newDomainIsolationEngine(config)
+		if err != nil {
+			return nil, err
+		}
+		binary, binaryMounts, runtimePath, err := resolveAgentBinary(config.Agents.CommandPath)
+		if err != nil {
+			return nil, fmt.Errorf("resolution coordinator binary: %w", err)
+		}
+		skills, skillMounts, err := resolveAgentResources(projectRoot, config.Agents.SkillPaths)
+		if err != nil {
+			return nil, fmt.Errorf("resolution coordinator skills: %w", err)
+		}
+		extensions, extensionMounts, err := resolveAgentResources(projectRoot, config.Agents.ExtensionPaths)
+		if err != nil {
+			return nil, fmt.Errorf("resolution coordinator extensions: %w", err)
+		}
+		readOnly := append([]isolation.Mount{}, binaryMounts...)
+		readOnly = append(readOnly, skillMounts...)
+		readOnly = append(readOnly, extensionMounts...)
+		readOnly = append(readOnly, isolation.Mount{Source: ipcDir, Target: agentIPCMountPath, Kind: isolation.MountDirectory})
+		pathEntries := []string{"/runtime/bin"}
+		if runtimePath != "" {
+			pathEntries = append(pathEntries, runtimePath)
+		}
+		pathEntries = append(pathEntries, "/usr/local/bin", "/usr/bin", "/bin")
+		piConfig.ResolutionIsolationEngine = engine
+		piConfig.ResolutionPolicy = isolation.Policy{
+			Network:  isolation.NetworkIsolated,
+			ReadOnly: readOnly,
+			Environment: map[string]string{
+				"PATH":                strings.Join(uniqueStrings(pathEntries), ":"),
+				"PI_CODING_AGENT_DIR": "/state/pi/config",
+				"PI_TELEMETRY":        "0",
+			},
+		}
+		piConfig.ResolutionBinary = binary
+		piConfig.ResolutionSkillPaths = skills
+		piConfig.ResolutionExtensionPaths = extensions
+		piConfig.ResolutionEnv = []string{
+			"AION_INFERENCE_GATEWAY_ENABLED=true",
+			"AION_INFERENCE_SOCKET=" + agentInferenceSocket,
+			"AION_INFERENCE_GATEWAY_KEY=unix-capability",
+			"AION_TARGET_PROFILE=" + infConfig.UseProfile,
+			"AION_TARGET_MODEL=" + model,
+			"AION_TARGET_API=" + gatewayAPIForProvider(targetProviderForCoordinator(config, infConfig)),
+		}
+	}
+	return coordinator.NewPiCoordinator(projectRoot, piConfig), nil
+}
+
+func targetProviderForCoordinator(config *Config, providerConfig ProviderConfig) string {
+	if providerConfig.UseProfile != "" {
+		if profile, ok := config.Inference.Models[providerConfig.UseProfile]; ok {
+			return profile.Provider
+		}
+	}
+	return providerConfig.Provider
+}
+
+func configureResolutionCapability(piCoord *coordinator.PiCoordinator, server *Server, config *Config) {
+	if piCoord == nil || server == nil || config == nil || !config.GatewayEnabled() {
+		return
+	}
+	piCoord.SetResolutionEnvFunc(resolutionCapabilityIssuer(server, config))
+}
+
+func resolutionCapabilityIssuer(server *Server, config *Config) func() ([]string, error) {
+	providerConfig := config.Inference.Coordinator
+	profileName := providerConfig.UseProfile
+	if profileName == "" {
+		profileName = config.InferenceGateway.TargetProfile
+	}
+	model := providerConfig.Model
+	if profile, ok := config.Inference.Models[providerConfig.UseProfile]; ok && profile.Model != "" {
+		model = profile.Model
+	}
+	provider := targetProviderForCoordinator(config, providerConfig)
+	return func() ([]string, error) {
+		capability, err := server.IssueAgentRuntimeCapability(AgentCapabilityPolicy{
+			AgentID: "coordinator-resolution", DomainID: "coordinator", Profile: profileName,
+			Provider: provider, Model: model,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []string{"AION_AGENT_CAPABILITY=" + capability}, nil
+	}
 }
 
 // Start initializes and starts the Orchestrator daemon.
@@ -864,7 +967,7 @@ func (d *Daemon) ResetCurrentRun() error {
 	}
 
 	lockMgr := locking.NewManager(d.config.Agents.SharedFiles)
-	coordinationManager, err := coordinationruntime.Open(coordinationruntime.Options{StateDir: newRun.CoordinationDir})
+	coordinationManager, err := coordinationruntime.Open(coordinationOptions(d.config, newRun.CoordinationDir))
 	if err != nil {
 		_ = dagMgr.Close()
 		return fmt.Errorf("init reset coordination manager: %w", err)
@@ -876,7 +979,13 @@ func (d *Daemon) ResetCurrentRun() error {
 		d.server.BroadcastStatus(text, level)
 	})
 
-	coord := coordinator.Coordinator(newPiCoordinatorForRun(d.projectRoot, d.config, newRun))
+	piCoord, err := newPiCoordinatorForRun(d.projectRoot, d.config, newRun, d.ipcPaths.Dir)
+	if err != nil {
+		_ = coordinationManager.Close()
+		_ = dagMgr.Close()
+		return fmt.Errorf("configure reset coordinator: %w", err)
+	}
+	coord := coordinator.Coordinator(piCoord)
 	if statusAware, ok := coord.(interface{ SetStatusFunc(func(string, string)) }); ok {
 		statusAware.SetStatusFunc(func(text, level string) {
 			d.server.BroadcastStatus(text, level)
@@ -898,6 +1007,7 @@ func (d *Daemon) ResetCurrentRun() error {
 	d.server.SetRuntimeSubsystems(dagMgr, lockMgr, coordinationManager, d.memoryStore)
 	d.server.SetLogsDir(newRun.LogsDir)
 	d.server.ClearAgentCapabilities()
+	configureResolutionCapability(piCoord, d.server, d.config)
 	d.server.ClearHubHistory()
 	d.configureAllocatorCallbacks()
 	if oldCoordination != nil {

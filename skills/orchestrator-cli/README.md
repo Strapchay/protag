@@ -22,6 +22,10 @@ cd kernel && go build -o skills/orchestrator-cli/bin/orchestrator-cli ./cmd/orch
 | `contract-fetch` | `--contract-id`, `--output` | Materialize an artifact revision locally |
 | `contract-validate` | `--contract-id`, `--revision` | Accept a produced revision |
 | `contract-correct` | `--contract-id`, `--revision`, `--reason` | Reject a revision and request correction |
+| `contract-propose-terms` | `--contract-id`, `--revision`, `--terms`, `--rationale` | Propose immutable bilateral terms |
+| `contract-accept-terms` | `--contract-id`, `--revision` | Accept the latest terms revision |
+| `contract-terms` | `--contract-id` | Read terms proposal history |
+| `contract-standstill` | `--contract-id`, `--revision`, `--reason` | Request bounded Coordinator reconciliation |
 | `contract-wait` | `--contract-id`; optional `--clear` | Declare or clear a hard wait |
 | `contract-status` | `--contract-id` | Read one durable contract |
 | `contract-list` | none | List visible durable contracts |

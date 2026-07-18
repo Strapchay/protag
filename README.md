@@ -82,6 +82,42 @@ If the server is running, you can manually interact with the Orchestrator via th
 ./bin/orchestrator-cli query-memory --text "authentication" --top-k 5
 ```
 
+Domain agents negotiate cross-domain boundaries through capability-bound,
+durable contracts. The initial contract remains a direct path; tradeoffs can
+be negotiated explicitly before publication:
+
+```bash
+orchestrator-cli contract-propose-terms \
+  --contract-id contract-1 --revision 1 \
+  --terms '{"details":{"name":"PublicBoundary","kind":"interface"},"tradeoffs":["bounded retry"]}' \
+  --rationale "avoid retry amplification"
+
+orchestrator-cli contract-accept-terms --contract-id contract-1 --revision 2
+orchestrator-cli contract-standstill --contract-id contract-1 --revision 3 \
+  --reason "participants cannot satisfy the same compatibility guarantee"
+```
+
+Standstill starts one bounded, source-blind Coordinator reconciliation. Only
+the affected nodes pause; ownership from the accepted build plan cannot be
+transferred or expanded. Detailed proposal, lease, artifact, validation, and
+failure state is available through:
+
+```bash
+orchestrator-cli debug-status --key coordination --pretty
+```
+
+The main dashboard emits only generic reconciliation status. Detailed review
+and approval controls are intentionally deferred to a dedicated observability
+surface.
+
+Negotiation and reconciliation limits are configured with
+`AION_COORDINATION_MAX_NEGOTIATION_ROUNDS`,
+`AION_COORDINATION_MAX_PROCESS_ATTEMPTS`,
+`AION_COORDINATION_MAX_REPAIR_ATTEMPTS`,
+`AION_COORDINATION_MAX_CONTEXT_EXPANSIONS`,
+`AION_COORDINATION_LEASE_TIMEOUT_SEC`, and
+`AION_COORDINATION_ARTIFACT_TIMEOUT_SEC`.
+
 ## Project Structure
 
 ```

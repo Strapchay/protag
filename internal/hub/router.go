@@ -99,7 +99,7 @@ func (r *Router) Route(msg Message) error {
 	switch msg.Type {
 	case MsgContextShare, MsgCorrectionRequest,
 		MsgContractRequested, MsgContractProduced, MsgContractFulfilled,
-		MsgContractWait, MsgContractTerminal:
+		MsgContractWait, MsgContractTerminal, MsgTermsProposed, MsgTermsAgreed:
 		if msg.Type == MsgCorrectionRequest {
 			r.recordCorrectionRequest(msg)
 		}

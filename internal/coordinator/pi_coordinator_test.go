@@ -108,10 +108,48 @@ func TestPiCoordinator_PlannerGatewayActivityHandshake(t *testing.T) {
 		PlannerFirstRequestTimeout: time.Second,
 	})
 	ch := coord.beginPlannerGatewayWatch()
-	go coord.RecordPlannerGatewayActivity("coordinator", "coordinator", "forwarding")
+	go coord.RecordCoordinatorGatewayActivity("coordinator", "coordinator", "forwarding")
 
 	if err := coord.waitForPlannerGatewayActivity(context.Background(), ch, filepath.Join(t.TempDir(), "plan_response.json")); err != nil {
 		t.Fatalf("waitForPlannerGatewayActivity: %v", err)
+	}
+}
+
+func TestPiCoordinator_ResolutionGatewayActivityRenewsOnlyResolution(t *testing.T) {
+	coord := NewPiCoordinator(t.TempDir(), PiCoordinatorConfig{})
+	progress := 0
+	coord.setResolutionProgress(func() { progress++ })
+	planner := coord.beginPlannerGatewayWatch()
+
+	coord.RecordCoordinatorGatewayActivity("coordinator-resolution", "coordinator", "active")
+	if progress != 1 {
+		t.Fatalf("resolution progress calls = %d, want 1", progress)
+	}
+	select {
+	case <-planner:
+		t.Fatal("resolution activity incorrectly satisfied the planner handshake")
+	default:
+	}
+
+	coord.RecordCoordinatorGatewayActivity("coordinator", "coordinator", "forwarding")
+	select {
+	case <-planner:
+	default:
+		t.Fatal("planner activity did not satisfy the planner handshake")
+	}
+}
+
+func TestPiCoordinator_ResolutionProcessEnvUsesCredentialIssuer(t *testing.T) {
+	coord := NewPiCoordinator(t.TempDir(), PiCoordinatorConfig{ResolutionEnv: []string{"BASE=value"}})
+	coord.SetResolutionEnvFunc(func() ([]string, error) {
+		return []string{"AION_AGENT_CAPABILITY=opaque"}, nil
+	})
+	env, err := coord.resolutionProcessEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(env, "\n") != "BASE=value\nAION_AGENT_CAPABILITY=opaque" {
+		t.Fatalf("resolution env = %#v", env)
 	}
 }
 

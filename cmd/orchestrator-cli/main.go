@@ -367,6 +367,73 @@ func parseCommand(command string, args []string) (map[string]interface{}, error)
 		}
 		return result, nil
 
+	case "contract-propose-terms":
+		contractID := flags["contract-id"]
+		revision, err := requiredPositiveRevision(flags, "contract-propose-terms")
+		if err != nil {
+			return nil, err
+		}
+		termsJSON := flags["terms"]
+		if contractID == "" || termsJSON == "" || flags["rationale"] == "" {
+			return nil, fmt.Errorf("contract-propose-terms requires --contract-id <id> --revision <N> --terms '<json>' --rationale <text>")
+		}
+		var terms map[string]interface{}
+		if err := json.Unmarshal([]byte(termsJSON), &terms); err != nil {
+			return nil, fmt.Errorf("invalid terms JSON: %w", err)
+		}
+		result := map[string]interface{}{"contract_id": contractID, "expected_revision": revision, "rationale": flags["rationale"]}
+		for _, key := range []string{"details", "producer_obligations", "consumer_obligations", "tradeoffs"} {
+			if value, ok := terms[key]; ok {
+				result[key] = value
+			}
+		}
+		if commandID := flags["command-id"]; commandID != "" {
+			result["command_id"] = commandID
+		}
+		return result, nil
+
+	case "contract-accept-terms":
+		contractID := flags["contract-id"]
+		revision, err := requiredPositiveRevision(flags, "contract-accept-terms")
+		if err != nil {
+			return nil, err
+		}
+		if contractID == "" {
+			return nil, fmt.Errorf("contract-accept-terms requires --contract-id <id> --revision <N>")
+		}
+		return map[string]interface{}{"contract_id": contractID, "revision": revision, "command_id": flags["command-id"]}, nil
+
+	case "contract-terms":
+		if flags["contract-id"] == "" {
+			return nil, fmt.Errorf("contract-terms requires --contract-id <id>")
+		}
+		return map[string]interface{}{"contract_id": flags["contract-id"]}, nil
+
+	case "contract-standstill":
+		contractID := flags["contract-id"]
+		revision, err := requiredPositiveRevision(flags, "contract-standstill")
+		if err != nil {
+			return nil, err
+		}
+		if contractID == "" || flags["reason"] == "" {
+			return nil, fmt.Errorf("contract-standstill requires --contract-id <id> --revision <N> --reason <text>")
+		}
+		result := map[string]interface{}{
+			"contract_id": contractID, "terms_revision": revision, "reason": flags["reason"],
+			"terminal_incompatibility": flags["terminal"] != "",
+		}
+		if evidence := flags["evidence"]; evidence != "" {
+			var decoded []string
+			if err := json.Unmarshal([]byte(evidence), &decoded); err != nil {
+				return nil, fmt.Errorf("contract-standstill --evidence must be a JSON string array: %w", err)
+			}
+			result["evidence"] = decoded
+		}
+		if commandID := flags["command-id"]; commandID != "" {
+			result["command_id"] = commandID
+		}
+		return result, nil
+
 	case "contract-wait":
 		contractID := flags["contract-id"]
 		if contractID == "" {
@@ -700,6 +767,10 @@ Commands:
 	contract-fetch    --contract-id <id> [--revision N] --output <path>
 	contract-validate --contract-id <id> --revision <N> [--evidence '<json>']
 	contract-correct  --contract-id <id> --revision <N> --reason <text>
+	contract-propose-terms --contract-id <id> --revision <N> --terms '<json>' --rationale <text>
+	contract-accept-terms  --contract-id <id> --revision <N>
+	contract-terms         --contract-id <id>
+	contract-standstill    --contract-id <id> --revision <N> --reason <text> [--terminal] [--evidence '["..."]']
 	contract-wait     --contract-id <id> [--clear]
 	contract-cancel   --contract-id <id> [--reason <text>]
 	contract-fail     --contract-id <id> [--reason <text>]

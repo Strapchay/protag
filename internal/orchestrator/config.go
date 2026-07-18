@@ -17,10 +17,23 @@ type Config struct {
 	Health           HealthConfig           `yaml:"health"`
 	Execution        ExecutionConfig        `yaml:"execution"`
 	InferenceGateway InferenceGatewayConfig `yaml:"inference_gateway"`
+	Coordination     CoordinationConfig     `yaml:"coordination"`
 	Isolation        IsolationConfig        `yaml:"isolation"`
 	Cgroups          CgroupsConfig          `yaml:"cgroups"`
 	Inference        InferenceConfig        `yaml:"inference"`
 	Memory           MemoryConfig           `yaml:"memory"`
+}
+
+// CoordinationConfig bounds bilateral negotiation and coordinator-assisted
+// reconciliation. These limits are persisted into each resolution so restarts
+// cannot silently reset its retry budget.
+type CoordinationConfig struct {
+	MaxNegotiationRounds int `yaml:"max_negotiation_rounds"`
+	MaxProcessAttempts   int `yaml:"max_process_attempts"`
+	MaxRepairAttempts    int `yaml:"max_repair_attempts"`
+	MaxContextExpansions int `yaml:"max_context_expansions"`
+	LeaseTimeoutSec      int `yaml:"lease_timeout_sec"`
+	ArtifactTimeoutSec   int `yaml:"artifact_timeout_sec"`
 }
 
 // IsolationConfig configures the mandatory domain-agent process boundary.
@@ -227,6 +240,14 @@ inference_gateway:
   retry_max_delay_ms: ${AION_INFERENCE_GATEWAY_RETRY_MAX_DELAY_MS}
   upstream_timeout_sec: ${AION_INFERENCE_GATEWAY_UPSTREAM_TIMEOUT_SEC}
 
+coordination:
+  max_negotiation_rounds: ${AION_COORDINATION_MAX_NEGOTIATION_ROUNDS}
+  max_process_attempts: ${AION_COORDINATION_MAX_PROCESS_ATTEMPTS}
+  max_repair_attempts: ${AION_COORDINATION_MAX_REPAIR_ATTEMPTS}
+  max_context_expansions: ${AION_COORDINATION_MAX_CONTEXT_EXPANSIONS}
+  lease_timeout_sec: ${AION_COORDINATION_LEASE_TIMEOUT_SEC}
+  artifact_timeout_sec: ${AION_COORDINATION_ARTIFACT_TIMEOUT_SEC}
+
 isolation:
   backend: "${AION_ISOLATION_BACKEND}"
   runtime_base: "${AION_ISOLATION_RUNTIME_BASE}"
@@ -387,6 +408,24 @@ func applyDefaults(c *Config) {
 	if c.InferenceGateway.UpstreamTimeoutSec == 0 {
 		c.InferenceGateway.UpstreamTimeoutSec = 300
 	}
+	if c.Coordination.MaxNegotiationRounds == 0 {
+		c.Coordination.MaxNegotiationRounds = 3
+	}
+	if c.Coordination.MaxProcessAttempts == 0 {
+		c.Coordination.MaxProcessAttempts = 2
+	}
+	if c.Coordination.MaxRepairAttempts == 0 {
+		c.Coordination.MaxRepairAttempts = 1
+	}
+	if c.Coordination.MaxContextExpansions == 0 {
+		c.Coordination.MaxContextExpansions = 1
+	}
+	if c.Coordination.LeaseTimeoutSec == 0 {
+		c.Coordination.LeaseTimeoutSec = 180
+	}
+	if c.Coordination.ArtifactTimeoutSec == 0 {
+		c.Coordination.ArtifactTimeoutSec = 180
+	}
 	if strings.TrimSpace(c.Isolation.Backend) == "" {
 		c.Isolation.Backend = "bubblewrap"
 	}
@@ -479,6 +518,21 @@ func validateConfig(c *Config) error {
 	}
 	if c.InferenceGateway.MaxRetries < 1 || c.InferenceGateway.MaxRetries > 5 {
 		return fmt.Errorf("inference_gateway.max_retries must be between 1 and 5")
+	}
+	if c.Coordination.MaxNegotiationRounds < 2 || c.Coordination.MaxNegotiationRounds > 10 {
+		return fmt.Errorf("coordination.max_negotiation_rounds must be between 2 and 10")
+	}
+	if c.Coordination.MaxProcessAttempts < 1 || c.Coordination.MaxProcessAttempts > 3 {
+		return fmt.Errorf("coordination.max_process_attempts must be between 1 and 3")
+	}
+	if c.Coordination.MaxRepairAttempts < 1 || c.Coordination.MaxRepairAttempts > 2 {
+		return fmt.Errorf("coordination.max_repair_attempts must be between 1 and 2")
+	}
+	if c.Coordination.MaxContextExpansions < 1 || c.Coordination.MaxContextExpansions > 2 {
+		return fmt.Errorf("coordination.max_context_expansions must be between 1 and 2")
+	}
+	if c.Coordination.LeaseTimeoutSec < 30 || c.Coordination.ArtifactTimeoutSec < 30 {
+		return fmt.Errorf("coordination lease and artifact timeouts must be at least 30 seconds")
 	}
 	if c.InferenceGateway.RetryBaseDelayMS < 1 {
 		return fmt.Errorf("inference_gateway.retry_base_delay_ms must be >= 1")

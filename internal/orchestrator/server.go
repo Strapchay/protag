@@ -701,6 +701,14 @@ func (s *Server) handleRequest(req Request) Response {
 		return s.handleContractValidate(req)
 	case "contract-correct":
 		return s.handleContractCorrect(req)
+	case "contract-propose-terms":
+		return s.handleContractProposeTerms(req)
+	case "contract-accept-terms":
+		return s.handleContractAcceptTerms(req)
+	case "contract-terms":
+		return s.handleContractTerms(req)
+	case "contract-standstill":
+		return s.handleContractStandstill(req)
 	case "contract-wait":
 		return s.handleContractWait(req)
 	case "contract-cancel":

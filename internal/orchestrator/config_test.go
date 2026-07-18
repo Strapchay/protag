@@ -45,6 +45,9 @@ func TestLoadConfig(t *testing.T) {
 	if config.InferenceGateway.UpstreamTimeoutSec != 300 {
 		t.Fatalf("expected 300s gateway upstream timeout, got %d", config.InferenceGateway.UpstreamTimeoutSec)
 	}
+	if config.Coordination.MaxNegotiationRounds != 3 || config.Coordination.MaxProcessAttempts != 2 {
+		t.Fatalf("unexpected coordination limits: %#v", config.Coordination)
+	}
 }
 
 func TestEnvExampleLoadsConfig(t *testing.T) {
@@ -119,6 +122,9 @@ func TestConfigDefaults(t *testing.T) {
 	}
 	if config.InferenceGateway.UpstreamTimeoutSec != 300 {
 		t.Fatalf("unexpected gateway upstream timeout default: %d", config.InferenceGateway.UpstreamTimeoutSec)
+	}
+	if config.Coordination.LeaseTimeoutSec != 180 || config.Coordination.ArtifactTimeoutSec != 180 {
+		t.Fatalf("unexpected coordination timeout defaults: %#v", config.Coordination)
 	}
 }
 

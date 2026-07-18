@@ -546,7 +546,7 @@ func (d *Daemon) resetBuildSpecArtifactsLocked() error {
 	if err != nil {
 		return fmt.Errorf("reset dag manager: %w", err)
 	}
-	coordinationManager, err := coordinationruntime.Open(coordinationruntime.Options{StateDir: d.runState.CoordinationDir})
+	coordinationManager, err := coordinationruntime.Open(coordinationOptions(d.config, d.runState.CoordinationDir))
 	if err != nil {
 		_ = dagMgr.Close()
 		return fmt.Errorf("reset coordination manager: %w", err)

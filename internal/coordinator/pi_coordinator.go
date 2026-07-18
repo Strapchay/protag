@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	isolation "aion-isolation"
 	"aion-kernel/internal/hub"
 	"aion-kernel/internal/session"
 	"aion-kernel/internal/supervisor"
@@ -20,22 +21,25 @@ import (
 // PiCoordinator is an implementation of Coordinator that uses a persistent
 // Pi Agent to engage in refinement chat and produce a plan.
 type PiCoordinator struct {
-	agent             *supervisor.AgentSupervisor
-	plannerAgent      *supervisor.AgentSupervisor
-	config            PiCoordinatorConfig
-	projectRoot       string
-	sessionRT         *session.Runtime
-	statusFn          func(text, level string)
-	broadcastFn       func(msg hub.Message)
-	traceFn           func(text string)
-	plannerMu         sync.Mutex
-	plannerCapture    *planCapture
-	plannerAttemptID  string
-	plannerSessionDir string
-	plannerGatewayMu  sync.Mutex
-	plannerGatewayCh  chan struct{}
-	plannerGatewayOn  bool
-	lastUserText      string
+	agent              *supervisor.AgentSupervisor
+	plannerAgent       *supervisor.AgentSupervisor
+	config             PiCoordinatorConfig
+	projectRoot        string
+	sessionRT          *session.Runtime
+	statusFn           func(text, level string)
+	broadcastFn        func(msg hub.Message)
+	traceFn            func(text string)
+	plannerMu          sync.Mutex
+	plannerCapture     *planCapture
+	plannerAttemptID   string
+	plannerSessionDir  string
+	plannerGatewayMu   sync.Mutex
+	plannerGatewayCh   chan struct{}
+	plannerGatewayOn   bool
+	resolutionMu       sync.Mutex
+	resolutionProgress func()
+	resolutionEnvFn    func() ([]string, error)
+	lastUserText       string
 }
 
 // PiCoordinatorConfig configures the Pi-backed coordinator.
@@ -52,6 +56,13 @@ type PiCoordinatorConfig struct {
 	PlannerStartTimeout        time.Duration
 	PlannerFirstRequestTimeout time.Duration
 	PlannerArtifactTimeout     time.Duration
+	ResolutionIsolationEngine  isolation.Engine
+	ResolutionPolicy           isolation.Policy
+	ResolutionBinary           string
+	ResolutionSkillPaths       []string
+	ResolutionExtensionPaths   []string
+	ResolutionEnv              []string
+	ResolutionArtifactTimeout  time.Duration
 }
 
 type SolutionArchitectMetadata struct {
@@ -268,11 +279,19 @@ func (c *PiCoordinator) ensurePlannerAgent(ctx context.Context, attemptID string
 	return nil
 }
 
-// RecordPlannerGatewayActivity records gateway request activity for the
-// Coordinator planner. It is used as a prompt-delivery handshake during
-// /build-spec planning.
-func (c *PiCoordinator) RecordPlannerGatewayActivity(agentID, domainID, phase string) {
-	if agentID != "coordinator" && domainID != "coordinator" {
+// RecordCoordinatorGatewayActivity routes gateway activity to either the
+// /build-spec prompt handshake or the active reconciliation lease.
+func (c *PiCoordinator) RecordCoordinatorGatewayActivity(agentID, domainID, phase string) {
+	if agentID == "coordinator-resolution" {
+		c.resolutionMu.Lock()
+		progress := c.resolutionProgress
+		c.resolutionMu.Unlock()
+		if progress != nil {
+			progress()
+		}
+		return
+	}
+	if agentID != "coordinator" {
 		return
 	}
 	switch strings.ToLower(strings.TrimSpace(phase)) {
@@ -286,6 +305,35 @@ func (c *PiCoordinator) RecordPlannerGatewayActivity(agentID, domainID, phase st
 		c.plannerGatewayOn = false
 		close(c.plannerGatewayCh)
 	}
+}
+
+func (c *PiCoordinator) setResolutionProgress(progress func()) {
+	c.resolutionMu.Lock()
+	c.resolutionProgress = progress
+	c.resolutionMu.Unlock()
+}
+
+// SetResolutionEnvFunc installs the kernel-owned per-process credential
+// issuer used by the isolated reconciliation Coordinator.
+func (c *PiCoordinator) SetResolutionEnvFunc(fn func() ([]string, error)) {
+	c.resolutionMu.Lock()
+	c.resolutionEnvFn = fn
+	c.resolutionMu.Unlock()
+}
+
+func (c *PiCoordinator) resolutionProcessEnv() ([]string, error) {
+	c.resolutionMu.Lock()
+	fn := c.resolutionEnvFn
+	c.resolutionMu.Unlock()
+	env := append([]string(nil), c.config.ResolutionEnv...)
+	if fn == nil {
+		return env, nil
+	}
+	extra, err := fn()
+	if err != nil {
+		return nil, err
+	}
+	return append(env, extra...), nil
 }
 
 func (c *PiCoordinator) beginPlannerGatewayWatch() <-chan struct{} {

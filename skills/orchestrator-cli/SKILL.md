@@ -76,6 +76,18 @@ orchestrator-cli contract-fetch --contract-id <id> --revision 1 --output <path>
 orchestrator-cli contract-validate --contract-id <id> --revision 1 --evidence '{"tests":"passed"}'
 orchestrator-cli contract-correct --contract-id <id> --revision 1 --reason <text>
 
+# Either participant can propose a bounded tradeoff before publication.
+orchestrator-cli contract-propose-terms --contract-id <id> --revision 1 \
+  --terms '{"details":{"name":"FunctionName","kind":"function"},"producer_obligations":["typed errors"],"consumer_obligations":["bounded retry"],"tradeoffs":["one retry"]}' \
+  --rationale "prevent retry amplification"
+orchestrator-cli contract-accept-terms --contract-id <id> --revision 2
+orchestrator-cli contract-terms --contract-id <id>
+
+# Escalate only after the configured round limit, or use --terminal for a
+# concrete incompatibility that cannot be negotiated safely.
+orchestrator-cli contract-standstill --contract-id <id> --revision 3 \
+  --reason "incompatible guarantees" --evidence '["failing consumer contract test"]'
+
 # Declare or clear a hard execution wait. Hard waits participate in cycle detection.
 orchestrator-cli contract-wait --contract-id <id>
 orchestrator-cli contract-wait --contract-id <id> --clear
@@ -88,6 +100,10 @@ orchestrator-cli contract-cancel --contract-id <id> --reason <text>
 ```
 
 Every mutation is capability-authorized and idempotent. Use a stable `--command-id` when retrying after a transport failure. Publishing requires the revision you observed in `--expected-revision`; stale writers are rejected.
+Publication is also rejected while the latest terms revision is not accepted
+by both participants. A standstill pauses only the affected nodes while the
+kernel runs bounded reconciliation; inspect delivered term events and continue
+unrelated work. Agents never own the reconciliation lease or modify ownership.
 
 ### Other orchestration commands
 
@@ -135,6 +151,8 @@ Pi is idle or queues them behind the active turn:
 - **ContractFulfilled**: The consumer accepted the revision.
 - **CorrectionRequested**: The consumer rejected a revision. Address the reason and publish the next revision.
 - **ContractTerminal**: A contract failed, expired, or was cancelled. Do not continue waiting on it.
+- **ContractTermsProposed**: The other participant proposed revised obligations or tradeoffs. Inspect with `contract-terms`, then accept or counter.
+- **ContractTermsAgreed**: Both participants accepted the latest immutable terms; publication may continue.
 - **CycleDetected**: Hard waits form a cycle. Stop dependent work until the kernel reports recovery.
 - **ContextShare**: Additional context from a peer agent. Incorporate it.
 
@@ -147,3 +165,4 @@ Pi is idle or queues them behind the active turn:
 5. **Use stable command IDs for retries.** A conflicting reuse is rejected.
 6. **Heartbeat during local work.** Gateway queue and active inference states are tracked separately by the kernel.
 7. **Mark tasks promptly.** Call `update-node` as soon as you start or finish.
+8. **Escalate bounded standstills.** Counter or accept terms until the configured limit; use `contract-standstill` only with concrete evidence. Never request ownership changes.

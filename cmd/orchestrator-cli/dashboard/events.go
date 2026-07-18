@@ -161,6 +161,19 @@ func summarizeContractEvent(msg hub.Message) (string, bool) {
 			return "", false
 		}
 		return fmt.Sprintf("Coordination cycle %s blocked nodes %s (contracts: %s).", cycle.ID, strings.Join(cycle.NodeIDs, ", "), strings.Join(cycle.ContractIDs, ", ")), true
+	case hub.MsgTermsProposed, hub.MsgTermsAgreed:
+		var terms struct {
+			ContractID      string `json:"contract_id"`
+			Revision        int64  `json:"revision"`
+			ProposerAgentID string `json:"proposer_agent_id"`
+		}
+		if err := json.Unmarshal(msg.Payload, &terms); err != nil {
+			return "", false
+		}
+		if msg.Type == hub.MsgTermsProposed {
+			return fmt.Sprintf("Contract %s terms revision %d was proposed by %s.", terms.ContractID, terms.Revision, terms.ProposerAgentID), true
+		}
+		return fmt.Sprintf("Contract %s terms revision %d was accepted by both participants.", terms.ContractID, terms.Revision), true
 	default:
 		return "", false
 	}

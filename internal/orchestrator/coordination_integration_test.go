@@ -295,6 +295,57 @@ func TestKernelCoordinationHardWaitCycleBlocksNodesAndSurfacesEvent(t *testing.T
 	}
 }
 
+func TestKernelStandstillBlocksAndPrivatelyNotifiesOnlyAffectedParticipants(t *testing.T) {
+	producerAgent := "agent-provider"
+	consumerAgent := "agent-consumer"
+	fixture := newCoordinationKernelFixture(t,
+		coordinationNode("provider-node", "provider", producerAgent),
+		coordinationNode("consumer-node", "consumer", consumerAgent),
+		coordinationNode("unrelated-node", "unrelated", "agent-unrelated"),
+	)
+	contract := coordinationContract("contract-standstill", producerAgent, "provider-node", consumerAgent, "consumer-node")
+	decodeCoordinationResult[coordination.Contract](t, callCoordinationServer(t, fixture.server, "contract-request", fixture.capabilities[consumerAgent], map[string]any{
+		"command_id": "request-standstill", "contract": contract,
+	}))
+	decodeCoordinationResult[coordination.ContractTerms](t, callCoordinationServer(t, fixture.server, "contract-propose-terms", fixture.capabilities[producerAgent], map[string]any{
+		"command_id": "terms-2", "contract_id": contract.ID, "expected_revision": 1,
+		"details": contract.Details, "rationale": "producer requires typed failures",
+	}))
+	decodeCoordinationResult[coordination.ContractTerms](t, callCoordinationServer(t, fixture.server, "contract-propose-terms", fixture.capabilities[consumerAgent], map[string]any{
+		"command_id": "terms-3", "contract_id": contract.ID, "expected_revision": 2,
+		"details": contract.Details, "rationale": "consumer cannot accept that failure contract",
+	}))
+	resolution := decodeCoordinationResult[coordination.Resolution](t, callCoordinationServer(t, fixture.server, "contract-standstill", fixture.capabilities[producerAgent], map[string]any{
+		"command_id": "standstill", "contract_id": contract.ID, "terms_revision": 3,
+		"reason": "participants cannot satisfy one compatibility guarantee", "evidence": []string{"contract test mismatch"},
+	}))
+	if resolution.Status != coordination.ResolutionPending {
+		t.Fatalf("resolution = %#v", resolution)
+	}
+	for _, nodeID := range []string{"provider-node", "consumer-node"} {
+		node, err := fixture.dag.GetNode(nodeID)
+		if err != nil || node.Status != dag.StatusBlocked {
+			t.Fatalf("affected node %s = %#v, err=%v", nodeID, node, err)
+		}
+	}
+	if node, _ := fixture.dag.GetNode("unrelated-node"); node.Status != dag.StatusInProgress {
+		t.Fatalf("unrelated node status = %s", node.Status)
+	}
+	if !fixture.agents[producerAgent].hasMessage(hub.MsgContractWait) || !fixture.agents[consumerAgent].hasMessage(hub.MsgContractWait) {
+		t.Fatal("affected participants did not receive private reconciliation pause notices")
+	}
+	if fixture.agents["agent-unrelated"].hasMessage(hub.MsgContractWait) {
+		t.Fatal("unrelated participant received a reconciliation pause notice")
+	}
+	fixture.server.mu.Lock()
+	defer fixture.server.mu.Unlock()
+	for _, message := range fixture.server.hubHistory {
+		if strings.HasPrefix(message.ID, "resolution-notice:") {
+			t.Fatal("private resolution detail leaked into the main orchestration stream")
+		}
+	}
+}
+
 func TestContractCommandsFailClosedWithoutCoordinationManager(t *testing.T) {
 	server, _ := startTestServer(t)
 	capability, err := server.IssueAgentCapability("agent-a")

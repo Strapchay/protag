@@ -30,6 +30,7 @@ func (d *Daemon) startCoordinationEffectLoop() {
 			case <-ticker.C:
 				d.expireCoordinationContracts()
 				d.drainCoordinationEffects()
+				d.processNextCoordinationResolution()
 			}
 		}
 	}()
@@ -43,6 +44,7 @@ func (d *Daemon) expireCoordinationContracts() {
 	defer d.coordinationEffectMu.Unlock()
 	if d.coordinationManager != nil {
 		_, _ = d.coordinationManager.ExpireDue(d.ctx, time.Now().UTC())
+		_ = d.coordinationManager.ExpireResolutionLeases(d.ctx, time.Now().UTC())
 	}
 }
 
@@ -132,6 +134,24 @@ func (d *Daemon) applyCoordinationEffect(effect coordination.Effect) error {
 			d.recordCoordinationRecovery(coordination.Effect{ID: effect.ID, TargetNodeID: nodeID, Payload: effect.Payload}, "contract_cycle", "Cross-domain contract waits contain a cycle.", "error")
 		}
 		d.server.BroadcastStatus(fmt.Sprintf("Contract cycle detected across nodes: %s", strings.Join(cycle.NodeIDs, ", ")), "error")
+	case coordination.EffectResolutionRequested:
+		var resolution coordination.Resolution
+		if err := json.Unmarshal(effect.Payload, &resolution); err != nil {
+			return fmt.Errorf("decode resolution request: %w", err)
+		}
+		for _, nodeID := range resolution.AffectedNodeIDs {
+			if err := d.setCoordinationNodeStatus(nodeID, dag.StatusBlocked); err != nil {
+				return err
+			}
+		}
+		if err := d.notifyResolutionParticipants(resolution, effect.CreatedAt); err != nil {
+			return err
+		}
+		d.server.BroadcastStatus("Cross-domain reconciliation is in progress.", "warn")
+	case coordination.EffectResolutionResolved:
+		d.server.BroadcastStatus("Cross-domain reconciliation completed.", "ok")
+	case coordination.EffectResolutionReview:
+		d.server.BroadcastStatus("Cross-domain reconciliation requires user review. See debug status for details.", "error")
 	case coordination.EffectNodeCompletionReady:
 		if err := d.completeCoordinationNode(effect); err != nil {
 			return err
@@ -156,7 +176,9 @@ func (d *Daemon) applyCoordinationEffect(effect coordination.Effect) error {
 		if err := d.hubRouter.Route(message); err != nil {
 			return err
 		}
-		d.server.BroadcastHubEvent(message)
+		if !coordinationResolutionEffect(effect) {
+			d.server.BroadcastHubEvent(message)
+		}
 	} else if effect.Type == coordination.EffectCycleDetected {
 		d.server.BroadcastHubEvent(hub.Message{
 			ID:        effect.ID,
@@ -166,7 +188,7 @@ func (d *Daemon) applyCoordinationEffect(effect coordination.Effect) error {
 			Timestamp: effect.CreatedAt,
 		})
 	}
-	if d.server.executionEventCb != nil {
+	if d.server.executionEventCb != nil && !coordinationResolutionEffect(effect) {
 		d.server.executionEventCb(ExecutionJournalEvent{
 			Kind:     strings.ToLower(string(effect.Type)),
 			Severity: coordinationEffectSeverity(effect.Type),
@@ -181,11 +203,57 @@ func (d *Daemon) applyCoordinationEffect(effect coordination.Effect) error {
 	return nil
 }
 
+func (d *Daemon) notifyResolutionParticipants(resolution coordination.Resolution, createdAt time.Time) error {
+	for _, nodeID := range resolution.AffectedNodeIDs {
+		node, err := d.dagManager.GetNode(nodeID)
+		if err != nil {
+			return err
+		}
+		agentID := strings.TrimSpace(node.AssignedAgent)
+		if agentID == "" || !d.hubRouter.HasAgent(agentID) {
+			continue
+		}
+		payload, err := json.Marshal(map[string]interface{}{
+			"resolution_id": resolution.ID,
+			"node_id":       node.ID,
+			"status":        "blocked",
+			"instruction":   "Pause work on this node while its cross-domain contract is reconciled. Unrelated assigned work may continue.",
+		})
+		if err != nil {
+			return err
+		}
+		if err := d.hubRouter.Route(hub.Message{
+			ID:        "resolution-notice:" + resolution.ID + ":" + node.ID,
+			Type:      hub.MsgContractWait,
+			FromAgent: "orchestrator",
+			ToAgent:   agentID,
+			Payload:   payload,
+			Timestamp: createdAt,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func coordinationResolutionEffect(effect coordination.Effect) bool {
+	switch effect.Type {
+	case coordination.EffectResolutionRequested, coordination.EffectResolutionResolved, coordination.EffectResolutionReview:
+		return true
+	case coordination.EffectTermsAgreed:
+		var terms coordination.ContractTerms
+		return json.Unmarshal(effect.Payload, &terms) == nil && terms.ProposerAgentID == "coordinator"
+	default:
+		return false
+	}
+}
+
 func coordinationEffectRequiresDelivery(effect coordination.Effect) bool {
 	switch effect.Type {
 	case coordination.EffectContractRequested, coordination.EffectContractProduced,
 		coordination.EffectContractFulfilled, coordination.EffectCorrectionRequested,
-		coordination.EffectContractTerminal:
+		coordination.EffectContractTerminal, coordination.EffectTermsProposed,
+		coordination.EffectTermsAgreed:
 		return true
 	default:
 		return false
@@ -204,6 +272,10 @@ func coordinationHubMessageType(effectType coordination.EffectType) hub.MessageT
 		return hub.MsgCorrectionRequest
 	case coordination.EffectContractTerminal:
 		return hub.MsgContractTerminal
+	case coordination.EffectTermsProposed:
+		return hub.MsgTermsProposed
+	case coordination.EffectTermsAgreed:
+		return hub.MsgTermsAgreed
 	default:
 		return hub.MsgContractWait
 	}
