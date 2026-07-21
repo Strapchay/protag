@@ -87,6 +87,41 @@ durable contracts. The initial contract remains a direct path; tradeoffs can
 be negotiated explicitly before publication:
 
 ```bash
+# At the start of every dispatched turn, inspect the authoritative item.
+orchestrator-cli work-inbox --current
+
+# Create or retrieve one stable cross-domain dependency and yield while blocked.
+orchestrator-cli contract-ensure \
+  --producer-node provider-node \
+  --consumer-node consumer-node \
+  --resource public-boundary \
+  --details '{"kind":"interface","acceptance":["consumer contract test passes"]}' \
+  --wait
+
+# Preserve a concise recovery note without duplicating DAG or contract state.
+orchestrator-cli work-checkpoint \
+  --item consumer-node \
+  --summary "local adapter implemented" \
+  --next "validate the published boundary"
+```
+
+The work inbox is a kernel projection over DAG and coordination WAL state. It
+ranks correction, validation, publication, and then ready DAG work while never
+preempting an active node. Actionable Context Hub messages wake the relevant
+persisted Pi session; fulfilled and terminal notices are projected to
+observable history without starting a no-op model turn. Hub messages are
+delivery signals, not a second task database. Focused tests remain inside the
+owning domain path, for example
+`/workspace/<domain>/tests/`, unless another path was explicitly assigned.
+Direct `/msg <agent-id> <text>` intervention reopens a stopped agent's
+persisted Pi session when that agent is already managed by the current daemon.
+After a daemon restart, issue `/continue-agents` once to recreate the persisted
+agent set before targeting an individual agent.
+
+Lower-level negotiation remains available when the initial contract cannot be
+implemented as written:
+
+```bash
 orchestrator-cli contract-propose-terms \
   --contract-id contract-1 --revision 1 \
   --terms '{"details":{"name":"PublicBoundary","kind":"interface"},"tradeoffs":["bounded retry"]}' \

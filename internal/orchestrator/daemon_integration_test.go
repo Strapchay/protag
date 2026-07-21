@@ -84,7 +84,9 @@ func TestParametricDispatcher(t *testing.T) {
 while read line; do
     echo "$line" >> "$AION_AGENT_SESSION_DIR/received.jsonl"
 	# emit a ready event so supervisor knows we are alive
-    echo '{"type":"turn_start","message":"ready"}'
+	echo '{"type":"turn_start","message":"ready"}'
+	echo '{"type":"turn_end"}'
+	echo '{"type":"agent_end"}'
 done
 `), 0755)
 
@@ -157,7 +159,7 @@ done
 
 	go daemon.Allocator().MonitorExecution(ctx, 100*time.Millisecond)
 
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
 
 	// Simulate successful StatusDone emission of Node-A
 	err = daemon.DagManager().UpdateNode("Node-A", dag.StatusDone)

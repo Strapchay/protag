@@ -18,6 +18,21 @@ This skill provides the `orchestrator-cli` tool for coordinating with the Aion-K
 
 ## Commands
 
+### `orchestrator-cli work-inbox [--current]`
+
+Read the kernel-owned projection of your active, ready, waiting, and recently completed work. `--current` returns the active item when one exists, otherwise the highest-ranked ready item. Run it at the start of every dispatched turn and process only that item.
+
+For a `dag_node` item, `id` and `node_id` are the same raw DAG node ID; pass
+that value to both `update-node --node-id` and `work-checkpoint --item`. For a
+contract item, pass `contract_id` to lifecycle commands and `id` to
+`work-checkpoint`.
+
+Inbox order is correction, validation, publication, then ready DAG work. An active DAG node is never preempted. The projection is rebuilt from DAG and coordination WAL state, so it remains authoritative across restarts.
+
+### `orchestrator-cli work-checkpoint --item <work-item-id> --summary <text> [--next <text>]`
+
+Persist a concise recovery summary before yielding incomplete work. Checkpoints do not replace or duplicate DAG and contract state; the referenced item must be visible in your inbox.
+
 ### `orchestrator-cli acquire-lock --file <path> --agent-id <uuid>`
 
 Acquire an exclusive write lock on a file. **You MUST acquire a lock before writing any file.**
@@ -41,9 +56,15 @@ The CLI uses the supervisor-issued capability automatically. The orchestrator de
 - Call with `Failed` if the task cannot be completed
 - `Done` is deferred while an outbound artifact contract from that node is non-terminal
 
-### `orchestrator-cli contract-request --contract '<json>'`
+### `orchestrator-cli contract-ensure --producer-node <id> --consumer-node <id> --resource <name> [--details '<json>'|--details-file <path>] [--wait]`
 
-Request a versioned artifact from another domain. Producer and consumer node IDs are mandatory so the kernel can authorize both parties, detect hard-wait cycles, and gate node completion.
+Create or retrieve the stable contract for a discovered cross-domain dependency. The kernel derives participant identities from DAG ownership, rejects requests from agents that do not own the consumer node, and returns the producer work item's queue state. Use a stable resource name and retry the same command safely after transport failure.
+
+Use `--wait` only when the consumer cannot continue without the artifact. After ensuring a hard-wait contract, checkpoint the current item and end the turn. Do not poll or fabricate the dependency; the kernel wakes the correct agent when publication, validation, or correction becomes ready.
+
+### `orchestrator-cli contract-request --contract '<json>'` (advanced)
+
+Request a fully specified versioned artifact with an explicit contract ID. Prefer `contract-ensure` during ordinary domain work. This lower-level command is retained for callers that already own stable contract identities. Producer and consumer node IDs are mandatory so the kernel can authorize both parties, detect hard-wait cycles, and gate node completion.
 
 ```json
 {
@@ -117,14 +138,15 @@ unrelated work. Agents never own the reconciliation lease or modify ownership.
 Every Domain Agent follows this loop for each assigned task:
 
 ### 1. ORIENT
-- Read your current task via `read-dag --node-id <your-task-id>`
+- Run `work-inbox --current` and process only the returned item
+- For DAG work, read the node via `read-dag --node-id <your-task-id>`
 - Understand the task spec, target files, and dependencies
 - Check whether dependencies are pending
 
 ### 2. DECOMPOSE
 - If the task is too large, use `split-node`
 - If you discover a task dependency, use `inject-edge`
-- If you need a cross-domain resource, use `contract-request`
+- If you need a cross-domain resource, use `contract-ensure`; add `--wait` only for a hard dependency
 
 ### 3. ACT
 - `acquire-lock` on each file before writing
@@ -134,10 +156,12 @@ Every Domain Agent follows this loop for each assigned task:
 
 ### 4. VALIDATE
 - Run tests or verification for the code you wrote
+- Keep focused tests under an owned domain path such as `/workspace/<domain>/tests/`
 - Fetch and validate every produced artifact revision before relying on it
 - Request correction with a concrete reason when acceptance criteria fail
 
 ### 5. CHECKPOINT
+- Use `work-checkpoint` before yielding incomplete work
 - `update-node --status Done` when the task is complete
 - `update-node --status Failed` if it cannot be completed
 
@@ -166,3 +190,5 @@ Pi is idle or queues them behind the active turn:
 6. **Heartbeat during local work.** Gateway queue and active inference states are tracked separately by the kernel.
 7. **Mark tasks promptly.** Call `update-node` as soon as you start or finish.
 8. **Escalate bounded standstills.** Counter or accept terms until the configured limit; use `contract-standstill` only with concrete evidence. Never request ownership changes.
+9. **Honor the work inbox.** Process only `work-inbox --current`; never reorder work from transcript memory.
+10. **Yield hard waits.** Ensure the contract, checkpoint the consumer item, and end the turn rather than polling.

@@ -243,8 +243,20 @@ func TestKernelCoordinationLifecycleAuthorizesArtifactsAndDefersCompletion(t *te
 	if node, _ := fixture.dag.GetNode("provider-node"); node.Status != dag.StatusDone {
 		t.Fatalf("provider node status = %s, want Done after contract fulfillment", node.Status)
 	}
-	if !fixture.agents[producerAgent].hasMessage(hub.MsgContractFulfilled) {
-		t.Fatal("producer did not receive stable ContractFulfilled effect")
+	if fixture.agents[producerAgent].hasMessage(hub.MsgContractFulfilled) {
+		t.Fatal("status-only ContractFulfilled effect started a producer agent turn")
+	}
+	fixture.server.mu.Lock()
+	defer fixture.server.mu.Unlock()
+	foundFulfilled := false
+	for _, message := range fixture.server.hubHistory {
+		if message.Type == hub.MsgContractFulfilled && message.ToAgent == producerAgent {
+			foundFulfilled = true
+			break
+		}
+	}
+	if !foundFulfilled {
+		t.Fatal("ContractFulfilled effect was not projected to observable Hub history")
 	}
 }
 

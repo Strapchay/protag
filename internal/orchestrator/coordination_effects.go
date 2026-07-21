@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -70,6 +71,16 @@ func (d *Daemon) drainCoordinationEffects() {
 		if len(effects) == 0 {
 			return
 		}
+		sort.SliceStable(effects, func(i, j int) bool {
+			left, right := coordinationEffectDispatchOrder(effects[i].Type), coordinationEffectDispatchOrder(effects[j].Type)
+			if left != right {
+				return left < right
+			}
+			if !effects[i].CreatedAt.Equal(effects[j].CreatedAt) {
+				return effects[i].CreatedAt.Before(effects[j].CreatedAt)
+			}
+			return effects[i].ID < effects[j].ID
+		})
 		progress := false
 		for _, effect := range effects {
 			if err := d.applyCoordinationEffect(effect); err != nil {
@@ -162,9 +173,6 @@ func (d *Daemon) applyCoordinationEffect(effect coordination.Effect) error {
 		if strings.TrimSpace(effect.TargetAgentID) == "" {
 			return fmt.Errorf("coordination effect %s has no target agent", effect.ID)
 		}
-		if !d.hubRouter.HasAgent(effect.TargetAgentID) {
-			return fmt.Errorf("target agent %s is not active", effect.TargetAgentID)
-		}
 		message := hub.Message{
 			ID:        effect.ID,
 			Type:      coordinationHubMessageType(effect.Type),
@@ -173,8 +181,26 @@ func (d *Daemon) applyCoordinationEffect(effect coordination.Effect) error {
 			Payload:   effect.Payload,
 			Timestamp: effect.CreatedAt,
 		}
-		if err := d.hubRouter.Route(message); err != nil {
-			return err
+		workItemID := coordinationEffectWorkItemID(effect)
+		if coordinationEffectRequiresAgentTurn(effect) {
+			if !d.hubRouter.HasAgent(effect.TargetAgentID) {
+				return fmt.Errorf("target agent %s is not active", effect.TargetAgentID)
+			}
+			var deliveryErr error
+			if d.allocator != nil {
+				deliveryCtx := d.ctx
+				if deliveryCtx == nil {
+					deliveryCtx = context.Background()
+				}
+				deliveryErr = d.allocator.DeliverOrWakeContext(deliveryCtx, message, workItemID)
+			} else {
+				deliveryErr = d.hubRouter.Route(message)
+			}
+			if deliveryErr != nil {
+				return deliveryErr
+			}
+		} else if d.allocator != nil {
+			d.allocator.clearDispatchedWork(effect.TargetAgentID, "")
 		}
 		if !coordinationResolutionEffect(effect) {
 			d.server.BroadcastHubEvent(message)
@@ -201,6 +227,32 @@ func (d *Daemon) applyCoordinationEffect(effect coordination.Effect) error {
 		go d.server.progressChangedCb("coordination_effect")
 	}
 	return nil
+}
+
+func coordinationEffectDispatchOrder(effectType coordination.EffectType) int {
+	switch effectType {
+	case coordination.EffectCorrectionRequested:
+		return 0
+	case coordination.EffectContractProduced:
+		return 1
+	case coordination.EffectContractRequested:
+		return 2
+	default:
+		return 3
+	}
+}
+
+func coordinationEffectWorkItemID(effect coordination.Effect) string {
+	switch effect.Type {
+	case coordination.EffectContractRequested:
+		return contractWorkItemID(effect.ContractID, WorkItemContractPublish)
+	case coordination.EffectCorrectionRequested:
+		return contractWorkItemID(effect.ContractID, WorkItemContractCorrection)
+	case coordination.EffectContractProduced:
+		return contractWorkItemID(effect.ContractID, WorkItemContractValidate)
+	default:
+		return ""
+	}
 }
 
 func (d *Daemon) notifyResolutionParticipants(resolution coordination.Resolution, createdAt time.Time) error {
@@ -253,6 +305,17 @@ func coordinationEffectRequiresDelivery(effect coordination.Effect) bool {
 	case coordination.EffectContractRequested, coordination.EffectContractProduced,
 		coordination.EffectContractFulfilled, coordination.EffectCorrectionRequested,
 		coordination.EffectContractTerminal, coordination.EffectTermsProposed,
+		coordination.EffectTermsAgreed:
+		return true
+	default:
+		return false
+	}
+}
+
+func coordinationEffectRequiresAgentTurn(effect coordination.Effect) bool {
+	switch effect.Type {
+	case coordination.EffectContractRequested, coordination.EffectContractProduced,
+		coordination.EffectCorrectionRequested, coordination.EffectTermsProposed,
 		coordination.EffectTermsAgreed:
 		return true
 	default:

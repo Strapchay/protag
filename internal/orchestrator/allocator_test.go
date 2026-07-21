@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"aion-isolation/isolationtest"
 	"aion-kernel/internal/coordinator"
+	"aion-kernel/internal/dag"
 	"aion-kernel/internal/hub"
 )
 
@@ -63,13 +65,27 @@ done
 
 	router := hub.NewRouter(filepath.Join(root, "logs"))
 	defer router.Close()
-	allocator := NewAllocator(config, root, router, nil)
+	mgr, err := dag.NewManager(dag.ManagerConfig{
+		StoreFilePath: filepath.Join(root, "dag.dat"),
+		WalFilePath:   filepath.Join(root, "dag.wal"),
+	})
+	if err != nil {
+		t.Fatalf("new DAG manager: %v", err)
+	}
+	defer mgr.Close()
+	if err := mgr.AddNode(dag.DagNode{
+		ID: "api-work", DomainID: "api", TaskSpec: "finish API work",
+		Status: dag.StatusInProgress, AssignedAgent: "agent-api",
+	}); err != nil {
+		t.Fatalf("add assigned node: %v", err)
+	}
+	allocator := NewAllocator(config, root, router, mgr)
 	allocator.SetIsolationEngine(&isolationtest.FakeEngine{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	defer allocator.StopAll()
 
-	err := allocator.AllocateWithOptions(ctx,
+	err = allocator.AllocateWithOptions(ctx,
 		[]coordinator.Domain{{DomainID: "api", AssignedPaths: []string{"api"}}},
 		map[string]string{"api": "FULL INITIAL PROMPT"},
 		AllocationOptions{Mode: AllocationModeResume, ResumeMessage: "resume existing work"},
@@ -86,9 +102,164 @@ done
 	if strings.Contains(received, `"type":"prompt","message":"FULL INITIAL PROMPT"`) {
 		t.Fatalf("resume path sent fresh initial prompt:\n%s", received)
 	}
+	if count := strings.Count(received, `"type":"prompt"`); count != 1 {
+		t.Fatalf("resume path sent %d prompt commands, want exactly one:\n%s", count, received)
+	}
 	launch := waitForFileContains(t, filepath.Join(agentDir, "launch.env"), "resume=true")
 	if !strings.Contains(launch, "resume=true") {
 		t.Fatalf("resume path did not pass Pi --continue:\n%s", launch)
+	}
+}
+
+func TestUserInterventionRehydratesStoppedDomainAgent(t *testing.T) {
+	root := t.TempDir()
+	script := filepath.Join(root, "dummy-pi.sh")
+	if err := os.WriteFile(script, []byte(`#!/usr/bin/env bash
+session=""
+resume="false"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --session-dir)
+      session="$2"
+      shift 2
+      ;;
+    --continue)
+      resume="true"
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+mkdir -p "$session"
+echo "resume=$resume" >> "$session/launches.log"
+while IFS= read -r line; do
+  echo "$line" >> "$session/received.jsonl"
+  if [[ "$line" == *'"type":"prompt"'* ]]; then
+    echo '{"type":"turn_start"}'
+    echo '{"type":"agent_end"}'
+  fi
+done
+`), 0o755); err != nil {
+		t.Fatalf("write dummy pi: %v", err)
+	}
+
+	config := &Config{}
+	config.Agents.SessionDir = filepath.Join(root, "sessions")
+	config.Agents.CommandPath = script
+	config.Health.HeartbeatTimeoutSec = 60
+	config.Health.ProgressTimeoutSec = 60
+	config.Cgroups.Mode = "disabled"
+	config.Isolation.Network = "shared"
+
+	router := hub.NewRouter(filepath.Join(root, "logs"))
+	t.Cleanup(router.Close)
+	mgr, err := dag.NewManager(dag.ManagerConfig{
+		StoreFilePath: filepath.Join(root, "dag.dat"),
+		WalFilePath:   filepath.Join(root, "dag.wal"),
+	})
+	if err != nil {
+		t.Fatalf("new DAG manager: %v", err)
+	}
+	t.Cleanup(func() { _ = mgr.Close() })
+	if err := mgr.AddNode(dag.DagNode{
+		ID: "api-work", DomainID: "api", TaskSpec: "finish API work",
+		Status: dag.StatusInProgress, AssignedAgent: "agent-api",
+	}); err != nil {
+		t.Fatalf("add assigned node: %v", err)
+	}
+
+	allocator := NewAllocator(config, root, router, mgr)
+	allocator.SetIsolationEngine(&isolationtest.FakeEngine{})
+	t.Cleanup(allocator.StopAll)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := allocator.AllocateWithOptions(ctx,
+		[]coordinator.Domain{{DomainID: "api", AssignedPaths: []string{"api"}}},
+		map[string]string{"api": "domain orientation"},
+		AllocationOptions{Mode: AllocationModeInitial},
+	); err != nil {
+		t.Fatalf("allocate agent: %v", err)
+	}
+
+	allocator.mu.Lock()
+	agent := allocator.activeAgents["agent-api"]
+	allocator.mu.Unlock()
+	if agent == nil {
+		t.Fatal("allocated agent not found")
+	}
+	if err := agent.Stop(); err != nil {
+		t.Fatalf("stop agent: %v", err)
+	}
+
+	daemon := &Daemon{allocator: allocator, hubRouter: router, ctx: ctx}
+	message := hub.Message{
+		ID:        "user-recovery",
+		Type:      hub.MsgContextShare,
+		FromAgent: "user",
+		ToAgent:   "agent-api",
+		Payload:   json.RawMessage(`{"content":"finish the missing focused test"}`),
+	}
+	if err := daemon.routeHubMessage(message); err != nil {
+		t.Fatalf("route stopped-agent intervention: %v", err)
+	}
+
+	agentDir := filepath.Join(config.Agents.SessionDir, "agent-api")
+	received := waitForFileContains(t, filepath.Join(agentDir, "received.jsonl"), "finish the missing focused test")
+	if !strings.Contains(received, `"type":"prompt"`) {
+		t.Fatalf("intervention was not delivered as a direct prompt:\n%s", received)
+	}
+	launches := waitForFileContains(t, filepath.Join(agentDir, "launches.log"), "resume=true")
+	if !strings.Contains(launches, "resume=false") || !strings.Contains(launches, "resume=true") {
+		t.Fatalf("agent did not reopen its persisted session:\n%s", launches)
+	}
+}
+
+func TestRecoveryPromptTargetsAssignedInProgressNode(t *testing.T) {
+	root := t.TempDir()
+	mgr, err := dag.NewManager(dag.ManagerConfig{
+		StoreFilePath: filepath.Join(root, "dag.dat"),
+		WalFilePath:   filepath.Join(root, "dag.wal"),
+	})
+	if err != nil {
+		t.Fatalf("new DAG manager: %v", err)
+	}
+	t.Cleanup(func() { _ = mgr.Close() })
+
+	node := dag.DagNode{
+		ID:            "api-implementation",
+		DomainID:      "api",
+		TaskSpec:      "Implement the API and its focused tests",
+		Status:        dag.StatusInProgress,
+		AssignedAgent: "agent-api",
+		TargetFiles:   []string{"api/service.go", "api/service_test.go"},
+	}
+	if err := mgr.AddNode(node); err != nil {
+		t.Fatalf("add node: %v", err)
+	}
+
+	allocator := &Allocator{dagManager: mgr}
+	prompt := allocator.resumePromptForAgent("agent-api", "api", "Resume persisted build-spec work.")
+	for _, want := range []string{
+		"Resume persisted build-spec work.",
+		"api-implementation",
+		"Implement the API and its focused tests",
+		"api/service.go, api/service_test.go",
+		"Do not create /workspace/tests or another shared root",
+		"place focused tests under the owned domain path instead",
+		"Finish or explicitly fail/block this node",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("recovery prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestResumePromptWithoutAssignmentWaitsForAllocator(t *testing.T) {
+	allocator := &Allocator{}
+	if prompt := allocator.resumeLaunchPrompt("agent-api", "api", "Resume persisted work."); prompt != "" {
+		t.Fatalf("unassigned resumed agent received a launch prompt: %q", prompt)
 	}
 }
 
@@ -197,6 +368,21 @@ done
 		!strings.Contains(launch, "control_socket="+filepath.Join(root, ".aion", "ipc", "control.sock")) {
 		t.Fatalf("fake isolation did not map agent sockets to host fixtures:\n%s", launch)
 	}
+	contextPath := filepath.Join(config.Agents.SessionDir, "agent-api", "config", "AGENTS.md")
+	contextData, err := os.ReadFile(contextPath)
+	if err != nil {
+		t.Fatalf("read domain context: %v", err)
+	}
+	if string(contextData) != "initial prompt" {
+		t.Fatalf("domain context = %q", contextData)
+	}
+	time.Sleep(50 * time.Millisecond)
+	receivedPath := filepath.Join(config.Agents.SessionDir, "agent-api", "received.jsonl")
+	if received, err := os.ReadFile(receivedPath); err == nil && strings.Contains(string(received), `"type":"prompt"`) {
+		t.Fatalf("initial allocation spent a bootstrap inference turn:\n%s", received)
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read initial RPC input: %v", err)
+	}
 }
 
 func TestPrepareIsolatedAgentRuntimeOwnsOnlyAssignedPaths(t *testing.T) {
@@ -205,9 +391,13 @@ func TestPrepareIsolatedAgentRuntimeOwnsOnlyAssignedPaths(t *testing.T) {
 	defer router.Close()
 	config := &Config{}
 	config.Agents.CommandPath = filepath.Join(root, "pi")
+	config.Agents.CLIPath = filepath.Join(root, "orchestrator-cli")
 	config.Execution.Mode = "gateway"
 	config.InferenceGateway.Enabled = true
 	if err := os.WriteFile(config.Agents.CommandPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(config.Agents.CLIPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	allocator := NewAllocator(config, root, router, nil)
@@ -229,6 +419,15 @@ func TestPrepareIsolatedAgentRuntimeOwnsOnlyAssignedPaths(t *testing.T) {
 	}
 	if runtime.policy.Writable[1].Target != agentSandboxSessionDir {
 		t.Fatalf("unexpected session mount: %#v", runtime.policy.Writable[1])
+	}
+	foundCLI := false
+	for _, mount := range runtime.policy.ReadOnly {
+		if mount.Source == config.Agents.CLIPath && mount.Target == "/runtime/bin/orchestrator-cli" {
+			foundCLI = true
+		}
+	}
+	if !foundCLI || !strings.HasPrefix(runtime.policy.Environment["PATH"], "/runtime/bin:") {
+		t.Fatalf("matching orchestrator CLI was not prioritized: mounts=%#v path=%q", runtime.policy.ReadOnly, runtime.policy.Environment["PATH"])
 	}
 }
 

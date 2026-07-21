@@ -33,7 +33,7 @@ Complete these tasks in priority order. Check dependencies before starting each 
 
 ## Contract Dependencies
 
-Read the current DAG and `contract-list` after dispatch. Cross-domain contracts are created dynamically and remain authoritative across restarts.
+Cross-domain contracts are created on demand and remain authoritative across restarts. Never infer that a dependency exists from chat history alone. Use the work inbox and contract commands to inspect its persisted state.
 
 ## Execution Protocol
 
@@ -42,9 +42,13 @@ Node status updates use an automatically supplied runtime credential and only su
 
 ### Step 1: ORIENT
 ```bash
+orchestrator-cli work-inbox --current
 orchestrator-cli read-dag --node-id <task-id>
 orchestrator-cli update-node --node-id <task-id> --status InProgress
 ```
+
+Process only the item returned by `work-inbox --current`. The kernel ranks correction, validation, publication, and ready DAG work while preserving an active node.
+For `dag_node` work, pass the exact raw `node_id` to `update-node`; `id` is the same value. For contract work, pass `contract_id` to lifecycle commands and `id` to `work-checkpoint`.
 
 ### Step 2: DECOMPOSE
 If the task is too complex, split it:
@@ -59,8 +63,15 @@ orchestrator-cli inject-edge --from <this-task> --to <dependency-task>
 
 If you need something from another domain:
 ```bash
-orchestrator-cli contract-request --contract '{"id":"contract-...","producer_agent_id":"agent-provider","producer_node_id":"provider-node","consumer_agent_id":"{{.AgentID}}","consumer_node_id":"<task-id>","details":{"name":"resource-name","kind":"interface","acceptance":["observable acceptance criterion"]}}'
+orchestrator-cli contract-ensure \
+  --producer-node <provider-node> \
+  --consumer-node <task-id> \
+  --resource <stable-resource-name> \
+  --details '{"kind":"interface","acceptance":["observable acceptance criterion"]}' \
+  --wait
 ```
+
+`contract-ensure` is idempotent and reports the producer's queue position. With `--wait`, end the turn after recording a checkpoint. Do not poll, inspect the producer's workspace, or invent the missing contract.
 
 ### Step 3: ACT
 ```bash
@@ -78,10 +89,15 @@ orchestrator-cli contract-validate --contract-id <id> --revision <N> --evidence 
 ```
 If the revision does not satisfy the acceptance criteria, use `contract-correct` with a concrete reason.
 
+Keep focused tests under an assigned ownership path such as `/workspace/{{.DomainID}}/tests/`. Do not create `/workspace/tests` unless it is explicitly assigned.
+
 ### Step 5: CHECKPOINT
 ```bash
+orchestrator-cli work-checkpoint --item <work-item-id> --summary <completed-work> --next <next-action>
 orchestrator-cli update-node --node-id <task-id> --status Done
 ```
+
+Use `work-checkpoint` before yielding incomplete work. It stores a concise recovery summary without duplicating DAG or contract state.
 
 ## Context Messages
 
@@ -104,3 +120,5 @@ it behind your active turn:
 5. Request contracts early when you need cross-domain resources
 6. Mark tasks Done/Failed promptly
 7. Never read the `.env` file unless explicitly requested by the user
+8. Run `work-inbox --current` at the start of every dispatched turn
+9. Do not poll a waiting contract; checkpoint and yield to the kernel scheduler

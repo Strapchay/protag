@@ -181,6 +181,37 @@ func TestParseArtifactContractLifecycleCommands(t *testing.T) {
 	}
 }
 
+func TestParseWorkInboxAndContractEnsureCommands(t *testing.T) {
+	detailsPath := filepath.Join(t.TempDir(), "details.json")
+	if err := os.WriteFile(detailsPath, []byte(`{"name":"Boundary","kind":"interface"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ensure, err := parseCommand("contract-ensure", []string{
+		"--producer-node", "provider", "--consumer-node", "consumer", "--resource", "boundary",
+		"--details-file", detailsPath, "--wait",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ensure["hard_wait"] != true || ensure["details"] == nil {
+		t.Fatalf("ensure params = %#v", ensure)
+	}
+	if _, err := parseCommand("contract-ensure", []string{
+		"--producer-node", "provider", "--consumer-node", "consumer", "--resource", "boundary",
+		"--details", `{}`, "--details-file", detailsPath,
+	}); err == nil || !strings.Contains(err.Error(), "only one") {
+		t.Fatalf("mutually exclusive contract details error = %v", err)
+	}
+	inbox, err := parseCommand("work-inbox", []string{"--current"})
+	if err != nil || inbox["current"] != true {
+		t.Fatalf("inbox params = %#v, err = %v", inbox, err)
+	}
+	checkpoint, err := parseCommand("work-checkpoint", []string{"--item", "consumer", "--summary", "started", "--next", "test"})
+	if err != nil || checkpoint["work_item_id"] != "consumer" {
+		t.Fatalf("checkpoint params = %#v, err = %v", checkpoint, err)
+	}
+}
+
 func TestParseContractNegotiationCommands(t *testing.T) {
 	proposal, err := parseCommand("contract-propose-terms", []string{
 		"--contract-id", "contract-1", "--revision", "2",
@@ -251,6 +282,42 @@ func TestResolveDebugStatusAddrFromProjectServerInfo(t *testing.T) {
 
 	if got := resolveCommandAddr("debug-status"); got != "127.0.0.1:6124" {
 		t.Fatalf("resolveCommandAddr(debug-status) = %q", got)
+	}
+}
+
+func TestResolveProjectCommandAddrFromProjectServerInfo(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".aion"), 0o755); err != nil {
+		t.Fatalf("mkdir .aion: %v", err)
+	}
+	data, err := json.Marshal(map[string]string{"addr": "127.0.0.1:6125"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".aion", "server.json"), data, 0o644); err != nil {
+		t.Fatalf("write server info: %v", err)
+	}
+
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(oldwd)
+	})
+	if err := os.Chdir(root); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	if got := resolveCommandAddr("read-dag"); got != "127.0.0.1:6125" {
+		t.Fatalf("resolveCommandAddr(read-dag) = %q", got)
+	}
+}
+
+func TestResolveProjectCommandAddrPrefersAgentUnixSocket(t *testing.T) {
+	t.Setenv("AION_ORCHESTRATOR_SOCKET", "/run/aion/agent.sock")
+	if got := resolveCommandAddr("read-dag"); got != "unix:///run/aion/agent.sock" {
+		t.Fatalf("resolveCommandAddr(read-dag) = %q", got)
 	}
 }
 

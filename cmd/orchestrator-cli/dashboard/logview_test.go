@@ -1,12 +1,35 @@
 package dashboard
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+func TestAgentsPaneRetriesSnapshotAndStreamFailures(t *testing.T) {
+	m := NewMultiLogModelWithOptions("127.0.0.1:0", Options{Verbose: true})
+
+	updated, cmd := m.Update(agentHistorySnapshotMsg{Err: errors.New("not ready")})
+	m = updated.(*MultiLogModel)
+	if cmd == nil || m.reconnectAttempt != 1 {
+		t.Fatalf("snapshot failure did not schedule reconnect: attempt=%d cmd=%v", m.reconnectAttempt, cmd)
+	}
+
+	updated, cmd = m.Update(agentStreamClosedMsg{Err: errors.New("eof")})
+	m = updated.(*MultiLogModel)
+	if cmd == nil || m.reconnectAttempt != 2 {
+		t.Fatalf("stream failure did not schedule reconnect: attempt=%d cmd=%v", m.reconnectAttempt, cmd)
+	}
+
+	updated, _ = m.Update(agentHistorySnapshotMsg{})
+	m = updated.(*MultiLogModel)
+	if m.reconnectAttempt != 0 {
+		t.Fatalf("successful snapshot did not reset reconnect attempt: %d", m.reconnectAttempt)
+	}
+}
 
 func TestAgentsPaneFiltersNonAgentParticipants(t *testing.T) {
 	m := NewMultiLogModel("127.0.0.1:0")

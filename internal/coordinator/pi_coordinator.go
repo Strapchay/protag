@@ -169,6 +169,13 @@ func (c *PiCoordinator) StartArchitect(ctx context.Context) error {
 	}
 
 	prompt := GenerateArchitectInstruction("")
+	configDir := filepath.Join(agentDir, "config")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		return fmt.Errorf("pi_coordinator: create architect config dir: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "AGENTS.md"), []byte(prompt), 0644); err != nil {
+		return fmt.Errorf("pi_coordinator: write architect instructions: %w", err)
+	}
 	storeDir := c.config.SessionStoreDir
 	if storeDir == "" {
 		storeDir = filepath.Join(c.projectRoot, ".aion", "agent_sessions")
@@ -185,12 +192,11 @@ func (c *PiCoordinator) StartArchitect(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("pi_coordinator: start/resume architect session: %w", err)
 	}
-	prompt = start.Prompt
 
 	c.agent = supervisor.NewAgentSupervisor(supervisor.AgentConfig{
 		AgentID:          "orchestrator",
 		DomainID:         "architect",
-		InitialPrompt:    prompt,
+		InitialPrompt:    "",
 		HeartbeatTimeout: 30 * time.Minute, // Architect takes time to think/wait for user
 		ProgressTimeout:  1 * time.Hour,
 		PiAgent: supervisor.PiAgentConfig{
@@ -203,7 +209,11 @@ func (c *PiCoordinator) StartArchitect(ctx context.Context) error {
 			Endpoint:       c.config.Endpoint,
 			SkillPaths:     c.config.SkillPaths,
 			ExtensionPaths: c.config.ExtensionPaths,
-			Env:            append(c.config.Env, "AION_AGENT_ID=orchestrator", "AION_DOMAIN_ID=architect"),
+			Env: append(c.config.Env,
+				"PI_CODING_AGENT_DIR="+configDir,
+				"AION_AGENT_ID=orchestrator",
+				"AION_DOMAIN_ID=architect",
+			),
 		},
 	})
 	c.agent.SetLifecycleFunc(c.handleArchitectLifecycle)
@@ -659,6 +669,8 @@ func (c *PiCoordinator) preparePlanningArtifacts(specText string, req PlanReques
 			"domain IDs and node IDs must be stable, non-empty, and non-placeholder",
 			"each node must reference an existing domain",
 			"edges must reference existing nodes and must not be self-referential",
+			"edge direction is prerequisite/producer from_node -> dependent/consumer to_node",
+			"prefer one cohesive implementation-and-test node per explicit domain; split only independently schedulable work",
 			"the dependency graph must be acyclic",
 			"broad fallback path '.' must not be assigned to multiple domains",
 			"milestones are optional but recommended; prefer 3-8 coarse capability milestones and map each node to at most one milestone",
@@ -782,10 +794,25 @@ Do not answer with the plan in chat. Write the corrected artifact directly.`, ou
 	if c.statusFn != nil {
 		c.statusFn("Coordinator plan artifact failed validation; requesting repair...", "warn")
 	}
-	// Artifact validation can finish before Pi emits its turn-complete event.
-	// The supervisor queues a follow-up while active and promotes it to a direct
-	// prompt when idle, so the repair turn is accepted in either state.
-	if err := planner.DeliverTurn(repairPrompt); err != nil {
+	// Artifact validation normally finishes while Pi is still completing the
+	// write-tool turn. A follow-up sent at that boundary can remain queued after
+	// turn_end, so wait for idle and start repair with a direct prompt.
+	idleTimeout := c.config.PlannerArtifactTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = 120 * time.Second
+	}
+	idleCtx, cancelIdle := context.WithTimeout(ctx, idleTimeout)
+	defer cancelIdle()
+	if err := planner.WaitForTurnIdle(idleCtx); err != nil {
+		if c.traceFn != nil {
+			c.traceFn(fmt.Sprintf("repair wait for coordinator idle failed: %v", err))
+		}
+		return nil, validationErr
+	}
+	if c.traceFn != nil {
+		c.traceFn("coordinator idle; sending repair as direct prompt")
+	}
+	if err := planner.SendPrompt(repairPrompt); err != nil {
 		if c.traceFn != nil {
 			c.traceFn(fmt.Sprintf("repair prompt error: %v", err))
 		}

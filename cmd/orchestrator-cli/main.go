@@ -113,13 +113,14 @@ func main() {
 	fmt.Println(string(output))
 }
 
-func resolveCommandAddr(command string) string {
-	switch command {
-	case "debug-status", "set-gateway-capacity", "stop-agents":
-		return resolveDashboardAddr()
-	default:
-		return resolveOrchestratorAddr()
+func resolveCommandAddr(_ string) string {
+	// Sandboxed agents must always use their capability-scoped control socket.
+	if socket := strings.TrimSpace(os.Getenv("AION_ORCHESTRATOR_SOCKET")); socket != "" {
+		return "unix://" + socket
 	}
+	// Interactive commands should target the server belonging to the current
+	// project before considering process-wide environment defaults.
+	return resolveDashboardAddr()
 }
 
 func sendRequest(addr string, req Request) (*Response, error) {
@@ -278,6 +279,42 @@ func parseCommand(command string, args []string) (map[string]interface{}, error)
 			return nil, fmt.Errorf("invalid contract JSON: %w", err)
 		}
 		result := map[string]interface{}{"contract": contract}
+		if commandID := flags["command-id"]; commandID != "" {
+			result["command_id"] = commandID
+		}
+		return result, nil
+
+	case "contract-ensure":
+		producerNode := flags["producer-node"]
+		consumerNode := flags["consumer-node"]
+		resource := flags["resource"]
+		if producerNode == "" || consumerNode == "" || resource == "" {
+			return nil, fmt.Errorf("contract-ensure requires --producer-node <id> --consumer-node <id> --resource <name>")
+		}
+		detailsJSON := strings.TrimSpace(flags["details"])
+		if detailsFile := strings.TrimSpace(flags["details-file"]); detailsFile != "" {
+			if detailsJSON != "" {
+				return nil, fmt.Errorf("contract-ensure accepts only one of --details or --details-file")
+			}
+			data, err := os.ReadFile(detailsFile)
+			if err != nil {
+				return nil, fmt.Errorf("read contract details: %w", err)
+			}
+			detailsJSON = string(data)
+		}
+		details := map[string]interface{}{"name": resource, "kind": "interface"}
+		if detailsJSON != "" {
+			if err := json.Unmarshal([]byte(detailsJSON), &details); err != nil {
+				return nil, fmt.Errorf("invalid contract details JSON: %w", err)
+			}
+		}
+		result := map[string]interface{}{
+			"producer_node_id": producerNode,
+			"consumer_node_id": consumerNode,
+			"resource":         resource,
+			"details":          details,
+			"hard_wait":        flags["wait"] != "",
+		}
 		if commandID := flags["command-id"]; commandID != "" {
 			result["command_id"] = commandID
 		}
@@ -464,6 +501,17 @@ func parseCommand(command string, args []string) (map[string]interface{}, error)
 
 	case "contract-list":
 		return map[string]interface{}{}, nil
+
+	case "work-inbox":
+		return map[string]interface{}{"current": flags["current"] != ""}, nil
+
+	case "work-checkpoint":
+		item := flags["item"]
+		summary := flags["summary"]
+		if item == "" || summary == "" {
+			return nil, fmt.Errorf("work-checkpoint requires --item <work-id> --summary <text> [--next <text>]")
+		}
+		return map[string]interface{}{"work_item_id": item, "summary": summary, "next": flags["next"]}, nil
 
 	case "inject-edge":
 		from := flags["from"]
@@ -763,6 +811,7 @@ Commands:
   release-lock    --file <path> --agent-id <uuid>
 	  update-node     --node-id <uuid> --status <Pending|InProgress|Done|Failed> [--agent-id <uuid>]
 	contract-request  --contract '<json>'
+	contract-ensure   --producer-node <id> --consumer-node <id> --resource <name> [--details '<json>'|--details-file <path>] [--wait]
 	contract-publish  --contract-id <id> --artifact-file <path> [--expected-revision N]
 	contract-fetch    --contract-id <id> [--revision N] --output <path>
 	contract-validate --contract-id <id> --revision <N> [--evidence '<json>']
@@ -776,6 +825,8 @@ Commands:
 	contract-fail     --contract-id <id> [--reason <text>]
 	contract-status   --contract-id <id>
 	contract-list
+	work-inbox       [--current]
+	work-checkpoint   --item <work-id> --summary <text> [--next <text>]
   inject-edge     --from <node> --to <node>
   split-node      --node-id <uuid> --into '<json>'
   read-dag        [--node-id <uuid>]

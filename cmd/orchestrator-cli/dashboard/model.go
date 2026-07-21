@@ -2,10 +2,22 @@ package dashboard
 
 import (
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+func dashboardReconnectDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := 500 * time.Millisecond * time.Duration(1<<min(attempt-1, 3))
+	if delay > 5*time.Second {
+		return 5 * time.Second
+	}
+	return delay
+}
 
 // Model is the root element of our BubbleTea interface.
 type Model struct {

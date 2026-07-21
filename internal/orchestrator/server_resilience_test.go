@@ -90,6 +90,32 @@ func TestArchitectCommandHandlerError(t *testing.T) {
 	}
 }
 
+func TestCompletedNodeResolvesIncompleteAgentRecovery(t *testing.T) {
+	s := NewServer(newTestDagManager(t), locking.NewManager(nil), nil, nil)
+	type resolution struct {
+		kind    string
+		nodeID  string
+		agentID string
+	}
+	var resolutions []resolution
+	s.SetRecoveryResolvedCallback(func(kind, nodeID, agentID string) {
+		resolutions = append(resolutions, resolution{kind: kind, nodeID: nodeID, agentID: agentID})
+	})
+
+	s.recordNodeProgressFact(dag.DagNode{
+		ID:            "api-node",
+		DomainID:      "api",
+		AssignedAgent: "agent-api",
+	}, dag.StatusDone)
+
+	for _, got := range resolutions {
+		if got.kind == "task_incomplete" && got.nodeID == "" && got.agentID == "agent-api" {
+			return
+		}
+	}
+	t.Fatalf("task completion did not resolve agent-level incomplete recovery: %+v", resolutions)
+}
+
 func TestDebugStatusReportsRuntimeSnapshot(t *testing.T) {
 	s := NewServer(newTestDagManager(t), locking.NewManager(nil), nil, nil)
 	dir := t.TempDir()

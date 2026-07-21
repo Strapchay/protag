@@ -574,6 +574,15 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	body, err = normalizeGatewayProviderRequest(body, profile.Provider)
+	if err != nil {
+		g.rejected.Add(1)
+		g.recordError(err)
+		g.emitActivity(reqInfo, "failed")
+		g.recordFailure(reqInfo, http.StatusBadRequest, start, err.Error())
+		writeGatewayJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 
 	proxyCtx, cancelProxy := context.WithTimeout(r.Context(), time.Duration(g.upstreamTimeoutSec())*time.Second)
 	defer cancelProxy()
@@ -1054,6 +1063,50 @@ func enforceGatewayRequestModel(body []byte, model string) ([]byte, error) {
 	return encoded, nil
 }
 
+func normalizeGatewayProviderRequest(body []byte, provider string) ([]byte, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if !strings.Contains(provider, "cloudflare") && !strings.Contains(provider, "workers-ai") {
+		return body, nil
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("gateway request body is not valid JSON: %w", err)
+	}
+	encodedMessages, ok := payload["messages"]
+	if !ok {
+		return body, nil
+	}
+	var messages []map[string]json.RawMessage
+	if err := json.Unmarshal(encodedMessages, &messages); err != nil {
+		return nil, fmt.Errorf("gateway request messages are not valid JSON: %w", err)
+	}
+	changed := false
+	for _, message := range messages {
+		var role string
+		if err := json.Unmarshal(message["role"], &role); err != nil || role != "assistant" {
+			continue
+		}
+		if content, exists := message["content"]; exists && string(content) == "null" {
+			message["content"] = json.RawMessage(`""`)
+			changed = true
+		}
+	}
+	if !changed {
+		return body, nil
+	}
+	encodedMessages, err := json.Marshal(messages)
+	if err != nil {
+		return nil, fmt.Errorf("gateway request messages could not be encoded: %w", err)
+	}
+	payload["messages"] = encodedMessages
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("gateway request body could not be encoded: %w", err)
+	}
+	return encoded, nil
+}
+
 func gatewayPolicyAllowsPath(policy AgentCapabilityPolicy, path string) bool {
 	path = canonicalGatewayProxyPath(path)
 	switch gatewayAPIForProvider(policy.Provider) {
@@ -1248,12 +1301,50 @@ func applyUpstreamAuth(headers http.Header, profile ModelProfile) {
 }
 
 func firstProfileCredential(env map[string]string) (string, string) {
-	for key, value := range env {
-		if strings.TrimSpace(value) != "" {
-			return key, value
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	bestRank := 100
+	bestKey := ""
+	bestValue := ""
+	for _, key := range keys {
+		value := strings.TrimSpace(env[key])
+		if value == "" {
+			continue
+		}
+		rank, eligible := profileCredentialRank(key)
+		if eligible && rank < bestRank {
+			bestRank, bestKey, bestValue = rank, key, value
 		}
 	}
-	return "", ""
+	return bestKey, bestValue
+}
+
+func profileCredentialRank(key string) (int, bool) {
+	normalized := strings.ToUpper(strings.TrimSpace(key))
+	for _, marker := range []string{"ACCOUNT_ID", "PROJECT_ID", "ORG_ID", "ORGANIZATION_ID", "TENANT_ID", "SUBSCRIPTION_ID"} {
+		if strings.Contains(normalized, marker) {
+			return 0, false
+		}
+	}
+	for _, marker := range []string{"API_KEY", "API_TOKEN"} {
+		if strings.Contains(normalized, marker) {
+			return 0, true
+		}
+	}
+	if strings.Contains(normalized, "TOKEN") || strings.Contains(normalized, "AUTH") {
+		return 1, true
+	}
+	if strings.Contains(normalized, "SECRET") || strings.Contains(normalized, "PASSWORD") || strings.Contains(normalized, "CREDENTIAL") {
+		return 2, true
+	}
+	if strings.Contains(normalized, "KEY") {
+		return 3, true
+	}
+	return 99, true
 }
 
 func gatewayAPIForProvider(provider string) string {

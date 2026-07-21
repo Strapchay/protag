@@ -17,24 +17,27 @@ import (
 )
 
 type MultiLogModel struct {
-	addr        string
-	viewports   map[string]viewport.Model
-	agentOutput map[string][]string
-	agentMeta   map[string]agentTraceMeta
-	renderCache map[string]string
-	renderDirty map[string]bool
-	agents      []string
-	activeIdx   int
-	tabStartIdx int
-	eventCh     chan tea.Msg
-	width       int
-	height      int
-	Focused     bool
-	input       textarea.Model
-	verbose     bool
+	addr             string
+	viewports        map[string]viewport.Model
+	agentOutput      map[string][]string
+	agentMeta        map[string]agentTraceMeta
+	renderCache      map[string]string
+	renderDirty      map[string]bool
+	agents           []string
+	activeIdx        int
+	tabStartIdx      int
+	eventCh          chan tea.Msg
+	width            int
+	height           int
+	Focused          bool
+	input            textarea.Model
+	verbose          bool
+	reconnectAttempt int
 }
 
 type agentListTickMsg struct{}
+type agentHistoryRetryMsg struct{}
+type agentStreamClosedMsg struct{ Err error }
 
 type agentHistorySnapshotMsg struct {
 	Messages []hub.Message
@@ -169,10 +172,11 @@ func (m *MultiLogModel) fetchSnapshotCmd() tea.Cmd {
 }
 
 func (m *MultiLogModel) startStreamCmd(since time.Time) tea.Cmd {
+	eventCh := m.eventCh
 	return func() tea.Msg {
 		go func() {
 			if m.verbose {
-				m.eventCh <- StatusMsg{Text: "Opening live agent/hub stream at " + m.addr, Level: "info"}
+				eventCh <- StatusMsg{Text: "Opening live agent/hub stream at " + m.addr, Level: "info"}
 			}
 			req := map[string]interface{}{
 				"method": "tail-hub-events",
@@ -183,19 +187,19 @@ func (m *MultiLogModel) startStreamCmd(since time.Time) tea.Cmd {
 
 			conn, err := net.Dial("tcp", m.addr)
 			if err != nil {
-				m.eventCh <- StatusMsg{Text: "Orchestrator connection failed: " + err.Error(), Level: "error"}
+				eventCh <- agentStreamClosedMsg{Err: err}
 				return
 			}
 			defer conn.Close()
 
 			if _, err := conn.Write(reqBytes); err != nil {
-				m.eventCh <- StatusMsg{Text: "Orchestrator stream failed: " + err.Error(), Level: "error"}
+				eventCh <- agentStreamClosedMsg{Err: err}
 				return
 			}
 			if m.verbose {
-				m.eventCh <- StatusMsg{Text: "Live agent/hub stream connected", Level: "ok"}
+				eventCh <- StatusMsg{Text: "Live agent/hub stream connected", Level: "ok"}
 			} else {
-				m.eventCh <- StatusMsg{Text: "Connected to orchestrator", Level: "ok"}
+				eventCh <- StatusMsg{Text: "Connected to orchestrator", Level: "ok"}
 			}
 
 			decoder := json.NewDecoder(conn)
@@ -203,21 +207,27 @@ func (m *MultiLogModel) startStreamCmd(since time.Time) tea.Cmd {
 			for {
 				var msg hub.Message
 				if err := decoder.Decode(&msg); err != nil {
-					m.eventCh <- StatusMsg{Text: "Orchestrator stream closed: " + err.Error(), Level: "warn"}
+					eventCh <- agentStreamClosedMsg{Err: err}
 					break
 				}
 
 				for _, event := range normalizer.Normalize(msg) {
 					if event.Audience == tuiAudienceStatus {
-						m.eventCh <- StatusMsg{Text: event.Content, Level: event.Level}
+						eventCh <- StatusMsg{Text: event.Content, Level: event.Level}
 					} else {
-						m.eventCh <- event
+						eventCh <- event
 					}
 				}
 			}
 		}()
 		return nil
 	}
+}
+
+func (m *MultiLogModel) reconnectCmd() tea.Cmd {
+	m.reconnectAttempt++
+	delay := dashboardReconnectDelay(m.reconnectAttempt)
+	return tea.Tick(delay, func(time.Time) tea.Msg { return agentHistoryRetryMsg{} })
 }
 
 func (m *MultiLogModel) readNextCmd() tea.Cmd {
@@ -365,12 +375,15 @@ func (m *MultiLogModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentHistorySnapshotMsg:
 		if msg.Err != nil {
-			m.appendSystemLine("History snapshot failed: " + msg.Err.Error())
+			if m.verbose {
+				m.appendSystemLine("History snapshot unavailable; retrying: " + msg.Err.Error())
+			}
 			cmds = append(cmds, func() tea.Msg {
-				return StatusMsg{Text: "Agent history snapshot failed: " + msg.Err.Error(), Level: "error"}
-			})
+				return StatusMsg{Text: "Waiting for orchestrator agent history...", Level: "warn"}
+			}, m.reconnectCmd())
 			return m, tea.Batch(cmds...)
 		}
+		m.reconnectAttempt = 0
 		if m.verbose {
 			cmds = append(cmds, func() tea.Msg {
 				return StatusMsg{Text: fmt.Sprintf("Agent history snapshot loaded: %d event(s)", len(msg.Messages)), Level: "info"}
@@ -405,6 +418,18 @@ func (m *MultiLogModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewports[id] = vp
 		}
 		cmds = append(cmds, m.startStreamCmd(msg.AsOf), m.readNextCmd())
+
+	case agentStreamClosedMsg:
+		if m.verbose && msg.Err != nil {
+			m.appendSystemLine("Agent stream disconnected; reconnecting: " + msg.Err.Error())
+		}
+		cmds = append(cmds,
+			func() tea.Msg { return StatusMsg{Text: "Agent stream disconnected; reconnecting...", Level: "warn"} },
+			m.reconnectCmd(),
+		)
+
+	case agentHistoryRetryMsg:
+		cmds = append(cmds, m.fetchSnapshotCmd())
 
 	case tuiEventMsg:
 		if msg.Audience != tuiAudienceLogs {

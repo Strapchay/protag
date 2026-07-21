@@ -150,7 +150,7 @@ function streamAionUnixOpenAI(
       }
 
       stream.push({ type: "start", partial: output });
-      await consumeOpenAIStream(response, model, output, stream);
+      await consumeOpenAIStream(response, model, output, stream, new Set((context.tools ?? []).map((tool) => tool.name)));
       if (options?.signal?.aborted) {
         throw new Error("Request was aborted");
       }
@@ -414,9 +414,7 @@ function buildOpenAIRequest(model: Model<any>, context: Context, options?: Simpl
     stream: true,
     stream_options: { include_usage: true },
   };
-  if (options?.maxTokens) {
-    payload.max_tokens = options.maxTokens;
-  }
+  payload.max_tokens = options?.maxTokens || model.maxTokens || 4096;
   if (options?.temperature !== undefined) {
     payload.temperature = options.temperature;
   }
@@ -497,14 +495,45 @@ async function consumeOpenAIStream(
   model: Model<any>,
   output: AssistantMessage,
   stream: AssistantMessageEventStream,
+  toolNames: Set<string>,
 ) {
   let currentBlock: any = null;
+  const startTextBlock = (block: any) => {
+    if (block.eventsStarted) return;
+    block.eventsStarted = true;
+    const contentIndex = output.content.indexOf(block);
+    stream.push({ type: "text_start", contentIndex, partial: output });
+    if (block.text) {
+      stream.push({ type: "text_delta", contentIndex, delta: block.text, partial: output });
+    }
+  };
   const finishCurrentBlock = () => {
     if (!currentBlock) return;
     const contentIndex = output.content.indexOf(currentBlock);
     if (contentIndex < 0) return;
     if (currentBlock.type === "text") {
-      stream.push({ type: "text_end", contentIndex, content: currentBlock.text, partial: output });
+      const recovered = parseTextEncodedToolCall(currentBlock.text, toolNames);
+      if (recovered && !currentBlock.eventsStarted) {
+        const toolCall = {
+          type: "toolCall",
+          id: `call-aion-recovered-${Date.now()}-${contentIndex}`,
+          name: recovered.name,
+          arguments: recovered.arguments,
+        };
+        output.content[contentIndex] = toolCall;
+        stream.push({ type: "toolcall_start", contentIndex, partial: output });
+        stream.push({
+          type: "toolcall_delta",
+          contentIndex,
+          delta: JSON.stringify(recovered.arguments),
+          partial: output,
+        });
+        stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
+        output.stopReason = "toolUse";
+      } else {
+        startTextBlock(currentBlock);
+        stream.push({ type: "text_end", contentIndex, content: currentBlock.text, partial: output });
+      }
     } else if (currentBlock.type === "thinking") {
       stream.push({
         type: "thinking_end",
@@ -565,17 +594,20 @@ async function consumeOpenAIStream(
     if (delta.content) {
       if (!currentBlock || currentBlock.type !== "text") {
         finishCurrentBlock();
-        currentBlock = { type: "text", text: "" };
+        currentBlock = { type: "text", text: "", eventsStarted: false };
         output.content.push(currentBlock);
-        stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
       }
       currentBlock.text += delta.content;
-      stream.push({
-        type: "text_delta",
-        contentIndex: output.content.indexOf(currentBlock),
-        delta: delta.content,
-        partial: output,
-      });
+      if (currentBlock.eventsStarted) {
+        stream.push({
+          type: "text_delta",
+          contentIndex: output.content.indexOf(currentBlock),
+          delta: delta.content,
+          partial: output,
+        });
+      } else if (!couldBeTextEncodedToolCall(currentBlock.text)) {
+        startTextBlock(currentBlock);
+      }
     }
     for (const toolCall of delta.tool_calls ?? []) {
       const streamIndex = typeof toolCall.index === "number" ? toolCall.index : undefined;
@@ -614,6 +646,88 @@ async function consumeOpenAIStream(
     }
   }
   finishCurrentBlock();
+}
+
+function couldBeTextEncodedToolCall(text: string): boolean {
+  const trimmed = text.trimStart();
+  if ("<function=".startsWith(trimmed) || trimmed.startsWith("<function=")) return true;
+  if (!trimmed.startsWith("{")) return false;
+  const firstKey = /^\{\s*"([^"]*)"/s.exec(trimmed);
+  if (firstKey) return firstKey[1] === "name";
+  return trimmed.length < 128;
+}
+
+function parseTextEncodedToolCall(
+  text: string,
+  toolNames: Set<string>,
+): { name: string; arguments: Record<string, unknown> } | null {
+  const marker = "</tool_call>";
+  const trimmed = text.trim();
+  if (!trimmed.endsWith(marker)) return null;
+  const encoded = trimmed.slice(0, -marker.length).trim();
+  try {
+    const value = JSON.parse(escapeJSONControlCharactersInStrings(encoded));
+    const name = typeof value?.name === "string" ? value.name : "";
+    const args = value?.parameters ?? value?.arguments;
+    if (!name || !toolNames.has(name) || !args || typeof args !== "object" || Array.isArray(args)) {
+      return null;
+    }
+    return { name, arguments: args as Record<string, unknown> };
+  } catch {
+    return parseTaggedToolCall(encoded, toolNames);
+  }
+}
+
+function parseTaggedToolCall(
+  encoded: string,
+  toolNames: Set<string>,
+): { name: string; arguments: Record<string, unknown> } | null {
+  const functionMatch = /^<function=([A-Za-z0-9_.-]+)>\s*([\s\S]*)\s*<\/function>$/.exec(encoded);
+  if (!functionMatch || !toolNames.has(functionMatch[1])) return null;
+  const body = functionMatch[2];
+  const argumentsValue: Record<string, unknown> = {};
+  const parameterPattern = /<parameter=([A-Za-z0-9_.-]+)>\s*([\s\S]*?)\s*<\/parameter>/g;
+  for (const match of body.matchAll(parameterPattern)) {
+    if (Object.prototype.hasOwnProperty.call(argumentsValue, match[1])) return null;
+    argumentsValue[match[1]] = match[2];
+  }
+  if (Object.keys(argumentsValue).length === 0) return null;
+  if (body.replace(parameterPattern, "").trim() !== "") return null;
+  return { name: functionMatch[1], arguments: argumentsValue };
+}
+
+function escapeJSONControlCharactersInStrings(value: string): string {
+  let result = "";
+  let inString = false;
+  let escaped = false;
+  for (const char of value) {
+    if (!inString) {
+      result += char;
+      if (char === '"') inString = true;
+      continue;
+    }
+    if (escaped) {
+      result += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      result += char;
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      result += char;
+      inString = false;
+      continue;
+    }
+    if (char === "\n") result += "\\n";
+    else if (char === "\r") result += "\\r";
+    else if (char === "\t") result += "\\t";
+    else if (char.charCodeAt(0) < 0x20) result += `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`;
+    else result += char;
+  }
+  return result;
 }
 
 function requestUnix(

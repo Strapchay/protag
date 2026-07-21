@@ -30,6 +30,7 @@ type Daemon struct {
 	dagManager               *dag.Manager
 	lockManager              *locking.Manager
 	coordinationManager      *coordinationruntime.Manager
+	workInbox                *WorkInboxService
 	hubRouter                *hub.Router
 	allocator                *Allocator
 	server                   *Server
@@ -110,6 +111,8 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	// Initialize Allocator
 	alloc := NewAllocator(config, projectRoot, hubRouter, dagMgr)
 	alloc.SetIPCDir(ipcPaths.Dir)
+	workInbox := NewWorkInboxService(dagMgr, coordinationManager, filepath.Join(runState.Root, "work_checkpoints.json"))
+	alloc.SetWorkInboxService(workInbox)
 
 	// Initialize Coordinator
 	piCoord, err := newPiCoordinatorForRun(projectRoot, config, runState, ipcPaths.Dir)
@@ -156,6 +159,7 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 
 	// Initialize Server
 	server := NewServer(dagMgr, lockMgr, coordinationManager, memStore)
+	server.SetWorkInboxService(workInbox)
 	server.SetLogsDir(runState.LogsDir)
 	server.SetLogLevel(config.Orchestrator.LogLevel)
 	if inferenceGateway != nil {
@@ -189,6 +193,7 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 		dagManager:          dagMgr,
 		lockManager:         lockMgr,
 		coordinationManager: coordinationManager,
+		workInbox:           workInbox,
 		hubRouter:           hubRouter,
 		allocator:           alloc,
 		server:              server,
@@ -208,7 +213,7 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 		if msg.Type == hub.MsgDependencyDiscovered {
 			go daemon.handleReplan(msg)
 		}
-		if err := daemon.hubRouter.Route(msg); err != nil {
+		if err := daemon.routeHubMessage(msg); err != nil {
 			log.Printf("daemon: hub route error: %v", err)
 		}
 		server.BroadcastHubEvent(msg)
@@ -400,6 +405,17 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	return daemon, nil
 }
 
+func (d *Daemon) routeHubMessage(msg hub.Message) error {
+	if d.allocator != nil && msg.Type == hub.MsgContextShare && msg.FromAgent == "user" && d.allocator.ManagesAgent(msg.ToAgent) {
+		ctx := d.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		return d.allocator.DeliverOrWakeContext(ctx, msg, "")
+	}
+	return d.hubRouter.Route(msg)
+}
+
 func (d *Daemon) configureAllocatorCallbacks() {
 	if d == nil || d.allocator == nil || d.server == nil {
 		return
@@ -431,6 +447,7 @@ func (d *Daemon) configureAllocatorCallbacks() {
 		d.server.BroadcastHubEvent(msg)
 	})
 	d.allocator.SetAgentRuntimeCapabilityFunc(d.server.IssueAgentRuntimeCapability)
+	d.allocator.SetWorkInboxService(d.workInbox)
 	if d.auditor != nil {
 		d.auditor.SetSuppressStaleNodeFunc(func(node dag.DagNode) bool {
 			return d.shouldSuppressStaleNodeAudit(node)
@@ -638,6 +655,8 @@ func classifyLifecycleFailure(agentID string, event supervisor.AgentLifecycleEve
 	severity = "warn"
 	command = "/continue-agents"
 	switch {
+	case event.Kind == "task_incomplete":
+		return "task_incomplete", "warn", fmt.Sprintf("%s ended its agent loop before reporting task completion.", agentID), "/continue-agents"
 	case strings.Contains(text, "401") || strings.Contains(text, "403") || strings.Contains(text, "auth") || strings.Contains(text, "unauthorized") || strings.Contains(text, "forbidden"):
 		return "provider_auth_error", "error", fmt.Sprintf("%s has provider authentication/configuration failure.", agentID), "/progress"
 	case strings.Contains(text, "429") || strings.Contains(text, "rate limit"):
@@ -975,6 +994,8 @@ func (d *Daemon) ResetCurrentRun() error {
 	hubRouter := hub.NewRouter(newRun.LogsDir)
 	alloc := NewAllocator(d.config, d.projectRoot, hubRouter, dagMgr)
 	alloc.SetIPCDir(d.ipcPaths.Dir)
+	workInbox := NewWorkInboxService(dagMgr, coordinationManager, filepath.Join(newRun.Root, "work_checkpoints.json"))
+	alloc.SetWorkInboxService(workInbox)
 	alloc.SetStatusFunc(func(text, level string) {
 		d.server.BroadcastStatus(text, level)
 	})
@@ -997,6 +1018,7 @@ func (d *Daemon) ResetCurrentRun() error {
 	d.lockManager = lockMgr
 	oldCoordination := d.coordinationManager
 	d.coordinationManager = coordinationManager
+	d.workInbox = workInbox
 	d.hubRouter = hubRouter
 	d.allocator = alloc
 	d.coordinator = coord
@@ -1005,6 +1027,7 @@ func (d *Daemon) ResetCurrentRun() error {
 	d.auditor.lockManager = lockMgr
 	d.auditor.hubRouter = hubRouter
 	d.server.SetRuntimeSubsystems(dagMgr, lockMgr, coordinationManager, d.memoryStore)
+	d.server.SetWorkInboxService(workInbox)
 	d.server.SetLogsDir(newRun.LogsDir)
 	d.server.ClearAgentCapabilities()
 	configureResolutionCapability(piCoord, d.server, d.config)

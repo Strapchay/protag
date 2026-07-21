@@ -71,6 +71,7 @@ type AgentsConfig struct {
 	MaxAgents      int      `yaml:"max_agents"`
 	SharedFiles    []string `yaml:"shared_files"`
 	CommandPath    string   `yaml:"command_path"`
+	CLIPath        string   `yaml:"orchestrator_cli_path,omitempty"`
 	CommandArgs    []string `yaml:"command_args"`
 	SkillPaths     []string `yaml:"skill_paths,omitempty"`
 	ExtensionPaths []string `yaml:"extension_paths,omitempty"`

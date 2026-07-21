@@ -69,6 +69,153 @@ func TestPiGatewayExtensionStreamsOverUnixSocket(t *testing.T) {
 	}
 }
 
+func TestPiGatewayExtensionNormalizesTextEncodedToolCall(t *testing.T) {
+	piBinary, err := exec.LookPath("pi")
+	if err != nil {
+		t.Skip("Pi is not installed")
+	}
+	extension, err := filepath.Abs(filepath.Join("..", "..", "install", "pi", "extensions", "aion-gateway-provider.ts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	socketPath := filepath.Join(root, "inference.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestErrors := make(chan error, 3)
+	var requestCount atomic.Int32
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/aion/gateway/extension-loaded" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		body, readErr := io.ReadAll(r.Body)
+		if readErr != nil {
+			requestErrors <- readErr
+			http.Error(w, "read request", http.StatusBadRequest)
+			return
+		}
+		number := requestCount.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if number == 1 {
+			if !strings.Contains(string(body), `"name":"bash"`) {
+				requestErrors <- fmt.Errorf("Pi tools were not forwarded: %s", body)
+				return
+			}
+			encoded := "{\n  \"name\": \"bash\",\n  \"parameters\": {\"command\": \"printf recovered-tool-call\n\"}\n}\n</tool_call>\n"
+			chunk, _ := json.Marshal(map[string]any{
+				"id":    "text-tool-call",
+				"model": "test-model",
+				"choices": []any{map[string]any{
+					"delta":         map[string]any{"content": encoded},
+					"finish_reason": "stop",
+				}},
+			})
+			_, _ = fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", chunk)
+			requestErrors <- nil
+			return
+		}
+		if number == 2 {
+			if !strings.Contains(string(body), "recovered-tool-call") {
+				requestErrors <- fmt.Errorf("recovered JSON tool result missing from follow-up: %s", body)
+				return
+			}
+			encoded := "<function=bash>\n<parameter=command>\nprintf recovered-tagged-tool-call\n</parameter>\n</function>\n</tool_call>\n"
+			chunk, _ := json.Marshal(map[string]any{
+				"id":    "tagged-tool-call",
+				"model": "test-model",
+				"choices": []any{map[string]any{
+					"delta":         map[string]any{"content": encoded},
+					"finish_reason": "stop",
+				}},
+			})
+			_, _ = fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", chunk)
+			requestErrors <- nil
+			return
+		}
+		if !strings.Contains(string(body), "recovered-tagged-tool-call") {
+			requestErrors <- fmt.Errorf("recovered tool result missing from follow-up: %s", body)
+			return
+		}
+		chunk, _ := json.Marshal(map[string]any{
+			"id":    "after-tool-call",
+			"model": "test-model",
+			"choices": []any{map[string]any{
+				"delta":         map[string]any{"content": "fallback complete"},
+				"finish_reason": "stop",
+			}},
+		})
+		_, _ = fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", chunk)
+		requestErrors <- nil
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = os.Remove(socketPath)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	process, err := SpawnPiAgent(ctx, PiAgentConfig{
+		Binary:         piBinary,
+		SessionDir:     filepath.Join(root, "sessions"),
+		HostSessionDir: filepath.Join(root, "sessions"),
+		WorkingDir:     root,
+		Provider:       "aion-gateway",
+		Model:          "test-model",
+		ExtensionPaths: []string{extension},
+		Env: []string{
+			"AION_INFERENCE_GATEWAY_ENABLED=true",
+			"AION_INFERENCE_SOCKET=" + socketPath,
+			"AION_AGENT_CAPABILITY=test-capability",
+			"AION_TARGET_MODEL=test-model",
+			"AION_TARGET_PROFILE=test-profile",
+			"AION_TARGET_API=openai-completions",
+			"PI_CODING_AGENT_DIR=" + filepath.Join(root, "pi-config"),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = process.Kill() })
+	if err := process.SendPrompt("Exercise the text-encoded tool-call adapter."); err != nil {
+		t.Fatal(err)
+	}
+
+	var finalText string
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("Pi tool-call recovery timed out; requests=%d text=%q", requestCount.Load(), finalText)
+		case event, ok := <-process.Events():
+			if !ok {
+				t.Fatalf("Pi event stream closed; requests=%d text=%q", requestCount.Load(), finalText)
+			}
+			if message, parseErr := event.ParseMessage(); parseErr == nil && message.FullText() != "" {
+				finalText = message.FullText()
+			}
+			if event.Type == "agent_end" {
+				goto complete
+			}
+		}
+	}
+
+complete:
+	if requestCount.Load() != 3 {
+		t.Fatalf("expected recovered tool executions to produce three inference requests, got %d", requestCount.Load())
+	}
+	for range 3 {
+		if err := <-requestErrors; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if finalText != "fallback complete" {
+		t.Fatalf("unexpected final text %q", finalText)
+	}
+}
+
 func sseEvent(eventType, payload string) string {
 	return "event: " + eventType + "\ndata: " + payload
 }

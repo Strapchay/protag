@@ -136,6 +136,9 @@ agents:
   max_agents: ${AION_MAX_AGENTS}
   # Path to the Pi binary
   command_path: "${AION_AGENT_COMMAND_PATH}"
+  # Optional explicit path to the matching orchestrator CLI. When empty, the
+  # kernel prefers the binary shipped beside its own executable.
+  orchestrator_cli_path: "${AION_ORCHESTRATOR_CLI_PATH}"
   # Paths to Pi skills/extensions
   skill_paths:
     - "${AION_AGENT_SKILL_PATH}"

@@ -98,6 +98,7 @@ type AgentSupervisor struct {
 	lastThinking     string
 	lastText         string
 	isThinking       bool
+	recoveryPrompt   string
 	workspace        isolation.Workspace
 	workspaceGen     uint64
 }
@@ -241,6 +242,13 @@ func (s *AgentSupervisor) spawnAgent(ctx context.Context) error {
 	s.mu.Unlock()
 
 	piConfig := s.config.PiAgent
+	resumeSession := piConfig.ResumeSession
+	s.mu.Lock()
+	launchPrompt := s.config.InitialPrompt
+	if resumeSession && strings.TrimSpace(s.recoveryPrompt) != "" {
+		launchPrompt = s.recoveryPrompt
+	}
+	s.mu.Unlock()
 	var workspace isolation.Workspace
 	if s.config.IsolationEngine != nil {
 		s.mu.Lock()
@@ -327,7 +335,7 @@ func (s *AgentSupervisor) spawnAgent(ctx context.Context) error {
 		log.Printf("supervisor: agent %s health timeout: %d", agentID, status)
 		s.handleCrash("health timeout")
 	})
-	if strings.TrimSpace(s.config.InitialPrompt) == "" {
+	if strings.TrimSpace(launchPrompt) == "" {
 		hm.SetMonitoring(false)
 	}
 	hm.Start(ctx)
@@ -349,8 +357,8 @@ func (s *AgentSupervisor) spawnAgent(ctx context.Context) error {
 	go s.crashDetector(ctx)
 
 	// Send initial prompt
-	if s.config.InitialPrompt != "" {
-		if err := s.SendPrompt(s.config.InitialPrompt); err != nil {
+	if strings.TrimSpace(launchPrompt) != "" {
+		if err := s.SendPrompt(launchPrompt); err != nil {
 			hm.Stop()
 			_ = piAgent.Kill()
 			cleanupWorkspace()
@@ -431,19 +439,49 @@ func (s *AgentSupervisor) Stop() error {
 	return nil
 }
 
+// RestartWithPrompt reopens the persisted Pi session and starts one direct
+// recovery turn. The prompt becomes the crash-recovery prompt for this agent
+// until a later accepted direct prompt replaces it.
+func (s *AgentSupervisor) RestartWithPrompt(ctx context.Context, prompt string) error {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return fmt.Errorf("supervisor: restart prompt is required")
+	}
+	s.mu.Lock()
+	s.recoveryPrompt = prompt
+	s.mu.Unlock()
+	if err := s.Stop(); err != nil {
+		return err
+	}
+	return s.Start(ctx)
+}
+
 // SendPrompt sends an initial prompt to the Pi Agent.
 func (s *AgentSupervisor) SendPrompt(message string) error {
 	s.mu.Lock()
 	s.lastThinking = ""
 	s.lastText = ""
 	pa := s.piAgent
+	// Treat an accepted prompt command as an active turn immediately. Pi emits
+	// turn_start asynchronously, and leaving this false creates a dispatch race
+	// where a second command can be mistaken for an idle prompt.
+	s.isThinking = true
 	s.mu.Unlock()
 	if pa == nil {
+		s.mu.Lock()
+		s.isThinking = false
+		s.mu.Unlock()
 		return fmt.Errorf("agent not started")
 	}
 	if err := pa.SendPrompt(message); err != nil {
+		s.mu.Lock()
+		s.isThinking = false
+		s.mu.Unlock()
 		return err
 	}
+	s.mu.Lock()
+	s.recoveryPrompt = message
+	s.mu.Unlock()
 	if s.healthMonitor != nil {
 		s.healthMonitor.SetMonitoring(true)
 	}
@@ -468,15 +506,35 @@ func (s *AgentSupervisor) DeliverTurn(message string) error {
 			return err
 		}
 	} else {
-		// If idle, use prompt to trigger a new turn immediately
-		if err := pa.SendPrompt(message); err != nil {
-			return err
-		}
+		// If idle, use the supervisor prompt path so the pending turn is visible
+		// before Pi emits its asynchronous turn_start event.
+		return s.SendPrompt(message)
 	}
 	if s.healthMonitor != nil {
 		s.healthMonitor.SetMonitoring(true)
 	}
 	return nil
+}
+
+// WaitForTurnIdle waits until Pi has emitted agent_end. A turn_end only closes
+// one model/tool turn; Pi may immediately start another turn in the same agent
+// loop, so treating it as idle can race a direct prompt against that next turn.
+func (s *AgentSupervisor) WaitForTurnIdle(ctx context.Context) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		s.mu.Lock()
+		active := s.isThinking
+		s.mu.Unlock()
+		if !active {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // SendSteer sends a steer command to the Pi Agent.
@@ -596,14 +654,9 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 			s.healthMonitor.RecordHeartbeat()
 		}
 	case "turn_end":
-		s.mu.Lock()
-		s.isThinking = false
-		s.mu.Unlock()
 		s.emitLifecycle(AgentLifecycleEvent{Kind: "turn_end"})
-		s.emitStatus(s.displayLabel()+" is idle", "ok")
 		if s.healthMonitor != nil {
 			s.healthMonitor.RecordHeartbeat()
-			s.healthMonitor.SetMonitoring(false)
 		}
 	case "text", "thinking", "message_start", "message_update", "message_end":
 		pMsg, err := event.ParseMessage()
@@ -711,6 +764,7 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 		} else {
 			log.Printf("supervisor: agent %s finished normally", s.config.AgentID)
 			s.emitLifecycle(AgentLifecycleEvent{Kind: "agent_end"})
+			s.emitStatus(s.displayLabel()+" is idle", "ok")
 		}
 	}
 }

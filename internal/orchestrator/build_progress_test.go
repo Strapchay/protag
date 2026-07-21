@@ -142,6 +142,7 @@ func TestClassifyLifecycleFailure(t *testing.T) {
 		{name: "rate", kind: "tool_error", err: "429 rate limit", want: "provider_rate_limited"},
 		{name: "timeout", kind: "network_timeout", err: "request timeout", want: "network_timeout"},
 		{name: "context", kind: "agent_error", err: "context window too long", want: "context_window_error"},
+		{name: "incomplete", kind: "task_incomplete", err: "agent loop ended", want: "task_incomplete"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

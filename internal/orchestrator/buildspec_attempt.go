@@ -169,7 +169,11 @@ func clearBuildSpecArtifacts(runState *RunState) error {
 	if runState == nil {
 		return nil
 	}
-	for _, path := range []string{runState.DagFile, runState.WalFile} {
+	for _, path := range []string{
+		runState.DagFile,
+		runState.WalFile,
+		filepath.Join(runState.Root, "work_checkpoints.json"),
+	} {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return err
 		}

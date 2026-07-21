@@ -46,6 +46,7 @@ type Server struct {
 	dagManager   *dag.Manager
 	lockManager  *locking.Manager
 	coordination *coordination.Manager
+	workInbox    *WorkInboxService
 	memoryStore  memory.Store
 	logsDir      string
 
@@ -693,6 +694,8 @@ func (s *Server) handleRequest(req Request) Response {
 		return s.handleUpdateNode(req)
 	case "contract-request":
 		return s.handleContractRequest(req)
+	case "contract-ensure":
+		return s.handleContractEnsure(req)
 	case "contract-publish":
 		return s.handleContractPublish(req)
 	case "contract-fetch":
@@ -719,6 +722,10 @@ func (s *Server) handleRequest(req Request) Response {
 		return s.handleContractStatus(req)
 	case "contract-list":
 		return s.handleContractList(req)
+	case "work-inbox":
+		return s.handleWorkInbox(req)
+	case "work-checkpoint":
+		return s.handleWorkCheckpoint(req)
 	case "inject-edge":
 		return s.handleInjectEdge(req)
 	case "split-node":
@@ -876,6 +883,12 @@ func (s *Server) SetRuntimeSubsystems(dagManager *dag.Manager, lockManager *lock
 	s.lockManager = lockManager
 	s.coordination = coordinationManager
 	s.memoryStore = memoryStore
+}
+
+func (s *Server) SetWorkInboxService(service *WorkInboxService) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.workInbox = service
 }
 
 func (s *Server) ClearHubHistory() {
@@ -1394,6 +1407,7 @@ func (s *Server) recordNodeProgressFact(node dag.DagNode, status dag.NodeStatus)
 			s.recoveryResolvedCb("task_failed", node.ID, "")
 			s.recoveryResolvedCb("task_blocked", node.ID, "")
 			s.recoveryResolvedCb("stale_active_work", node.ID, "")
+			s.recoveryResolvedCb("task_incomplete", "", node.AssignedAgent)
 		}
 	case dag.StatusFailed:
 		kind = "task_failed"

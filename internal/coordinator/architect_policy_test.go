@@ -1,11 +1,67 @@
 package coordinator
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"aion-kernel/internal/session"
 )
+
+func TestStartArchitectLoadsInstructionsWithoutBootstrapTurn(t *testing.T) {
+	root := t.TempDir()
+	script := filepath.Join(root, "dummy-pi.sh")
+	if err := os.WriteFile(script, []byte(`#!/usr/bin/env bash
+session=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --session-dir)
+      session="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+mkdir -p "$session"
+while IFS= read -r line; do
+  echo "$line" >> "$session/received.jsonl"
+done
+`), 0o755); err != nil {
+		t.Fatalf("write dummy Pi: %v", err)
+	}
+
+	coordinator := NewPiCoordinator(root, PiCoordinatorConfig{
+		Binary:          script,
+		SessionDir:      ".aion/pi_sessions",
+		SessionStoreDir: ".aion/agent_sessions",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := coordinator.StartArchitect(ctx); err != nil {
+		t.Fatalf("StartArchitect: %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.StopArchitect() })
+
+	agentDir := filepath.Join(root, ".aion", "pi_sessions", "orchestrator")
+	contextData, err := os.ReadFile(filepath.Join(agentDir, "config", "AGENTS.md"))
+	if err != nil {
+		t.Fatalf("read architect instructions: %v", err)
+	}
+	if !strings.Contains(string(contextData), "SOLUTION ARCHITECT MODE") {
+		t.Fatalf("architect instructions missing expected role:\n%s", contextData)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if received, err := os.ReadFile(filepath.Join(agentDir, "received.jsonl")); err == nil && len(received) > 0 {
+		t.Fatalf("architect received unsolicited bootstrap turn:\n%s", received)
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read architect RPC input: %v", err)
+	}
+}
 
 func TestSolutionArchitectPolicyResumePromptIncludesMetadata(t *testing.T) {
 	policy := solutionArchitectPolicy{bootstrap: "bootstrap"}

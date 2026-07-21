@@ -553,10 +553,13 @@ func (d *Daemon) resetBuildSpecArtifactsLocked() error {
 	}
 	d.dagManager = dagMgr
 	d.coordinationManager = coordinationManager
+	d.workInbox = NewWorkInboxService(dagMgr, coordinationManager, filepath.Join(d.runState.Root, "work_checkpoints.json"))
 	d.allocator = NewAllocator(d.config, d.projectRoot, d.hubRouter, dagMgr)
+	d.allocator.SetWorkInboxService(d.workInbox)
 	d.server.ClearAgentCapabilities()
 	d.configureAllocatorCallbacks()
 	d.server.SetRuntimeSubsystems(dagMgr, d.lockManager, d.coordinationManager, d.memoryStore)
+	d.server.SetWorkInboxService(d.workInbox)
 	d.server.ClearHubHistory()
 	return nil
 }

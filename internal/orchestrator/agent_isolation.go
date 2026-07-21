@@ -126,13 +126,9 @@ func (a *Allocator) prepareIsolatedAgentRuntime(agentID string, domain coordinat
 	policy.ReadOnly = append(policy.ReadOnly, skillMounts...)
 	policy.ReadOnly = append(policy.ReadOnly, extensionMounts...)
 
-	cliPath, err := exec.LookPath("orchestrator-cli")
+	cliPath, err := resolveOrchestratorCLIPath(projectRoot, a.config.Agents.CLIPath)
 	if err != nil {
-		return isolatedAgentRuntime{}, fmt.Errorf("allocator: locate orchestrator-cli for isolated agent: %w", err)
-	}
-	cliPath, err = filepath.EvalSymlinks(cliPath)
-	if err != nil {
-		return isolatedAgentRuntime{}, fmt.Errorf("allocator: resolve orchestrator-cli: %w", err)
+		return isolatedAgentRuntime{}, err
 	}
 	if !pathCoveredByMount(cliPath, policy.ReadOnly) && !pathWithinRoot(cliPath, "/usr") {
 		policy.ReadOnly = append(policy.ReadOnly, isolation.Mount{
@@ -155,6 +151,51 @@ func (a *Allocator) prepareIsolatedAgentRuntime(agentID string, domain coordinat
 		skillPaths:     skills,
 		extensionPaths: extensions,
 	}, nil
+}
+
+func resolveOrchestratorCLIPath(projectRoot, configured string) (string, error) {
+	configured = strings.TrimSpace(configured)
+	if configured != "" {
+		var path string
+		var err error
+		if filepath.IsAbs(configured) || strings.ContainsRune(configured, filepath.Separator) {
+			path, err = resolveAgentResourcePath(projectRoot, configured)
+		} else {
+			path, err = exec.LookPath(configured)
+		}
+		if err != nil {
+			return "", fmt.Errorf("allocator: locate configured orchestrator-cli: %w", err)
+		}
+		return resolveExecutableFile(path, "configured orchestrator-cli")
+	}
+
+	if executable, err := os.Executable(); err == nil {
+		candidate := filepath.Join(filepath.Dir(executable), "orchestrator-cli")
+		if path, resolveErr := resolveExecutableFile(candidate, "sibling orchestrator-cli"); resolveErr == nil {
+			return path, nil
+		}
+	}
+
+	path, err := exec.LookPath("orchestrator-cli")
+	if err != nil {
+		return "", fmt.Errorf("allocator: locate orchestrator-cli for isolated agent: %w", err)
+	}
+	return resolveExecutableFile(path, "orchestrator-cli")
+}
+
+func resolveExecutableFile(path, label string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("allocator: resolve %s: %w", label, err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("allocator: stat %s: %w", label, err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return "", fmt.Errorf("allocator: %s %q is not an executable file", label, resolved)
+	}
+	return resolved, nil
 }
 
 func resolveAgentBinary(configured string) (string, []isolation.Mount, string, error) {

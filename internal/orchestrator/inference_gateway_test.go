@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -142,6 +143,47 @@ func TestInferenceGatewaySetCapacityValidatesRange(t *testing.T) {
 	}
 	if _, err := gateway.SetCapacity(0); err == nil {
 		t.Fatal("expected invalid capacity error")
+	}
+}
+
+func TestProfileCredentialPrefersTokenOverAccountIdentifier(t *testing.T) {
+	profile := ModelProfile{
+		Provider: "redacted-openai-compatible",
+		Env: map[string]string{
+			"REDACTED_ACCOUNT_ID": "public-account-identifier",
+			"REDACTED_API_TOKEN":  "fixture-cipher",
+		},
+	}
+
+	headers := make(http.Header)
+	applyUpstreamAuth(headers, profile)
+	if got := headers.Get("Authorization"); got != "Bearer fixture-cipher" {
+		t.Fatalf("unexpected upstream auth header: %q", got)
+	}
+}
+
+func TestNormalizeGatewayProviderRequestRewritesNullAssistantContent(t *testing.T) {
+	body := []byte(`{"model":"redacted-model","messages":[{"role":"user","content":"inspect"},{"role":"assistant","content":null,"tool_calls":[{"id":"call-1"}]},{"role":"tool","content":"ok"}]}`)
+	normalized, err := normalizeGatewayProviderRequest(body, "redacted-cloudflare-workers-ai")
+	if err != nil {
+		t.Fatalf("normalize request: %v", err)
+	}
+	var payload struct {
+		Messages []struct {
+			Role    string  `json:"role"`
+			Content *string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatalf("decode normalized request: %v", err)
+	}
+	if payload.Messages[1].Content == nil || *payload.Messages[1].Content != "" {
+		t.Fatalf("assistant content was not normalized: %s", normalized)
+	}
+
+	unchanged, err := normalizeGatewayProviderRequest(body, "redacted-openai-compatible")
+	if err != nil || !bytes.Equal(unchanged, body) {
+		t.Fatalf("unrelated provider request changed: %s err=%v", unchanged, err)
 	}
 }
 

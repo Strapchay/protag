@@ -25,16 +25,18 @@ type hubSnapshotMsg struct {
 	Err      error
 }
 type streamHubClosedMsg struct{}
+type hubReconnectMsg struct{}
 
 type HubModel struct {
-	addr      string
-	viewport  viewport.Model
-	eventCh   chan hubEventMsg
-	lines     []string
-	err       error
-	connected bool
-	Focused   bool
-	verbose   bool
+	addr             string
+	viewport         viewport.Model
+	eventCh          chan hubEventMsg
+	lines            []string
+	err              error
+	connected        bool
+	Focused          bool
+	verbose          bool
+	reconnectAttempt int
 }
 
 func NewHubModel(addr string) *HubModel {
@@ -93,6 +95,7 @@ func (m *HubModel) fetchSnapshotCmd() tea.Cmd {
 }
 
 func (m *HubModel) startLiveStreamCmd(since time.Time) tea.Cmd {
+	eventCh := m.eventCh
 	return func() tea.Msg {
 		go func() {
 			req := map[string]interface{}{
@@ -104,34 +107,40 @@ func (m *HubModel) startLiveStreamCmd(since time.Time) tea.Cmd {
 
 			conn, err := net.Dial("tcp", m.addr)
 			if err != nil {
-				m.eventCh <- hubEventMsg{Text: fmt.Sprintf("Hub stream dial failed: %v", err), Level: "error", Diagnostic: true}
-				close(m.eventCh)
+				eventCh <- hubEventMsg{Text: fmt.Sprintf("Hub stream dial failed: %v", err), Level: "error", Diagnostic: true}
+				close(eventCh)
 				return
 			}
 			defer conn.Close()
 
 			if _, err := conn.Write(reqBytes); err != nil {
-				m.eventCh <- hubEventMsg{Text: fmt.Sprintf("Hub stream request failed: %v", err), Level: "error", Diagnostic: true}
-				close(m.eventCh)
+				eventCh <- hubEventMsg{Text: fmt.Sprintf("Hub stream request failed: %v", err), Level: "error", Diagnostic: true}
+				close(eventCh)
 				return
 			}
 			if m.verbose {
-				m.eventCh <- hubEventMsg{Text: "Hub live stream connected", Level: "ok", Diagnostic: true}
+				eventCh <- hubEventMsg{Text: "Hub live stream connected", Level: "ok", Diagnostic: true}
 			}
 
 			decoder := json.NewDecoder(conn)
 			for {
 				var raw map[string]interface{}
 				if err := decoder.Decode(&raw); err != nil {
-					close(m.eventCh)
+					close(eventCh)
 					break
 				}
 				b, _ := json.Marshal(raw)
-				m.eventCh <- hubEventMsg{Text: string(b)}
+				eventCh <- hubEventMsg{Text: string(b)}
 			}
 		}()
 		return nil
 	}
+}
+
+func (m *HubModel) reconnectCmd() tea.Cmd {
+	m.reconnectAttempt++
+	delay := dashboardReconnectDelay(m.reconnectAttempt)
+	return tea.Tick(delay, func(time.Time) tea.Msg { return hubReconnectMsg{} })
 }
 
 func (m *HubModel) readNextCmd() tea.Cmd {
@@ -163,10 +172,17 @@ func (m *HubModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case hubSnapshotMsg:
 		if msg.Err != nil {
-			m.lines = append(m.lines, "Error loading hub snapshot: "+msg.Err.Error())
+			m.connected = false
+			if m.verbose {
+				m.lines = append(m.lines, "Hub snapshot unavailable; retrying: "+msg.Err.Error())
+			}
 			m.renderLines()
-			return m, func() tea.Msg { return StatusMsg{Text: "Hub snapshot failed: " + msg.Err.Error(), Level: "error"} }
+			return m, tea.Batch(
+				func() tea.Msg { return StatusMsg{Text: "Waiting for orchestrator hub stream...", Level: "warn"} },
+				m.reconnectCmd(),
+			)
 		}
+		m.reconnectAttempt = 0
 		if m.verbose {
 			m.lines = append(m.lines, fmt.Sprintf("[diagnostic] Hub snapshot loaded: %d event(s)", len(msg.Messages)))
 			cmds = append(cmds, func() tea.Msg {
@@ -238,9 +254,19 @@ func (m *HubModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.GotoBottom()
 		cmds = append(cmds, m.readNextCmd())
 	case streamHubClosedMsg:
-		m.lines = append(m.lines, "[HUB STREAM DISCONNECTED]")
+		m.connected = false
+		m.eventCh = make(chan hubEventMsg, 100)
+		if m.verbose {
+			m.lines = append(m.lines, "[HUB STREAM DISCONNECTED; RECONNECTING]")
+		}
 		m.viewport.SetContent(strings.Join(m.lines, "\n"))
 		m.viewport.GotoBottom()
+		cmds = append(cmds,
+			func() tea.Msg { return StatusMsg{Text: "Hub stream disconnected; reconnecting...", Level: "warn"} },
+			m.reconnectCmd(),
+		)
+	case hubReconnectMsg:
+		cmds = append(cmds, m.fetchSnapshotCmd())
 	}
 
 	vp, cmd := m.viewport.Update(msg)
