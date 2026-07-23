@@ -13,7 +13,7 @@ import (
 
 func TestArchitectCommandHelpIncludesResilienceCommands(t *testing.T) {
 	help := architectCommandHelp()
-	for _, want := range []string{"/resume", "/retry", "/continue", "/continue-agents", "/stop-agents", "/gateway-capacity", "/show-spec", "/show-plan", "/show-build-spec-trace", "/coordinator-status", "/progress", "/clear", "/reset-session"} {
+	for _, want := range []string{"/resume", "/retry", "/continue", "/continue-agents", "/stop-agents", "/gateway-capacity", "/show-spec", "/show-plan", "/show-build-spec-trace", "/coordinator-status", "/progress", "/integration-status", "/integration-run", "/clear", "/reset-session", "/reset-agent"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %s:\n%s", want, help)
 		}
@@ -91,6 +91,14 @@ func TestChatMessageWrapsWithinViewport(t *testing.T) {
 		if got := lipgloss.Width(line); got > 34 {
 			t.Fatalf("line width %d exceeds viewport budget: %q", got, line)
 		}
+	}
+}
+
+func TestThinkingEventKeepsDomainAgentAttribution(t *testing.T) {
+	m := NewChatModel("127.0.0.1:0")
+	m.addTUIEvent(tuiEventMsg{AgentID: "agent-intake", Author: "agent-intake", Kind: tuiKindThinking, Content: "checking integration"})
+	if len(m.history) != 1 || m.history[0].Author != "agent-intake Thinking" {
+		t.Fatalf("domain thinking attribution = %#v", m.history)
 	}
 }
 
@@ -179,6 +187,16 @@ func TestResponseTextFormatsBuildProgress(t *testing.T) {
 	for _, want := range []string{"Overall build progress", "API: 50% active", "fallback used", "API task failed", "Task API started"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("formatted progress missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestResponseTextFormatsIntegrationStatus(t *testing.T) {
+	raw := json.RawMessage(`{"enabled":true,"status":"failed","directive_count":2,"contract_count":1,"error":"acceptance failed","results":[{"directive_id":"api-smoke","status":"failed","error":"exit status 1"}]}`)
+	text := responseText(raw)
+	for _, want := range []string{"Integration validation: failed", "2 directive(s)", "1 contract(s)", "acceptance failed", "api-smoke"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("formatted integration status missing %q:\n%s", want, text)
 		}
 	}
 }

@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -192,6 +193,96 @@ func TestReadPlanArtifact(t *testing.T) {
 	}
 	if len(plan.Domains) != 1 || len(plan.Nodes) != 1 {
 		t.Fatalf("unexpected plan: %#v", plan)
+	}
+}
+
+func TestPiCoordinator_WaitForPlanArtifactReturnsAfterCompletedTurnWithoutArtifact(t *testing.T) {
+	tmpDir := t.TempDir()
+	coord := NewPiCoordinator(tmpDir, PiCoordinatorConfig{
+		PlannerArtifactTimeout: 10 * time.Second,
+	})
+	capture := newPlanCapture()
+	coord.plannerCapture = capture
+	coord.plannerTurnErrors = make(chan error, 1)
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		capture.setText(`{"domains":[],"nodes":[]}`)
+		capture.close()
+	}()
+
+	started := time.Now()
+	_, err := coord.waitForPlanArtifact(context.Background(), filepath.Join(tmpDir, "missing-plan.json"))
+	if err == nil {
+		t.Fatal("expected missing artifact error")
+	}
+	if !isPlannerArtifactTurnError(err) {
+		t.Fatalf("expected plannerArtifactTurnError, got %T: %v", err, err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("completed turn should fail promptly, took %s", elapsed)
+	}
+	if got := err.Error(); !strings.Contains(got, "chat response preview") || !strings.Contains(got, `"domains"`) {
+		t.Fatalf("missing response context: %s", got)
+	}
+}
+
+func TestPiCoordinator_WaitForPlanArtifactUsesGatewayQuiescenceWhenLifecycleStops(t *testing.T) {
+	tmpDir := t.TempDir()
+	coord := NewPiCoordinator(tmpDir, PiCoordinatorConfig{
+		PlannerArtifactTimeout:   10 * time.Second,
+		PlannerTurnSettleTimeout: 20 * time.Millisecond,
+	})
+	coord.plannerCapture = newPlanCapture()
+	coord.plannerTurnErrors = make(chan error, 1)
+	coord.beginPlannerGatewayWatch()
+	coord.RecordCoordinatorGatewayActivity("coordinator", "coordinator", "completed")
+
+	started := time.Now()
+	_, err := coord.waitForPlanArtifact(context.Background(), filepath.Join(tmpDir, "missing-plan.json"))
+	if err == nil || !isPlannerArtifactTurnError(err) {
+		t.Fatalf("expected plannerArtifactTurnError, got %T: %v", err, err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("gateway quiescence should fail promptly, took %s", elapsed)
+	}
+}
+
+func TestCoordinatorArtifactCorrectionPromptRequiresWriteAndExactSchema(t *testing.T) {
+	paths := planningArtifactPaths{
+		InputPath:  "/project/docs/aion/planning/attempt/planning_input.json",
+		OutputPath: "/project/docs/aion/planning/attempt/plan_response.json",
+	}
+	prompt := coordinatorArtifactCorrectionPrompt(paths, fmt.Errorf("missing artifact"))
+	for _, required := range []string{
+		"Use the write tool now",
+		paths.InputPath,
+		paths.OutputPath,
+		`"domain_id"`,
+		`"target_files"`,
+		`"from_node"`,
+		`"to_node"`,
+		`"public_entrypoint"`,
+		`Do not return or restate the plan in chat`,
+	} {
+		if !strings.Contains(prompt, required) {
+			t.Fatalf("correction prompt missing %q:\n%s", required, prompt)
+		}
+	}
+}
+
+func TestTransientPlannerTurnErrorClassification(t *testing.T) {
+	for _, message := range []string{
+		"planner inference turn failed: ResourceExhausted: request limit reached",
+		"too many requests (429)",
+		"temporarily unavailable",
+	} {
+		if !transientPlannerTurnError(fmt.Errorf("%s", message)) {
+			t.Fatalf("expected transient classification for %q", message)
+		}
+	}
+	if transientPlannerTurnError(fmt.Errorf("invalid API key")) {
+		t.Fatal("authentication error must not be retried as transient")
 	}
 }
 

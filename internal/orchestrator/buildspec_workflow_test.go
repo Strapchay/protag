@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	coordination "aion-coordination"
 	"aion-kernel/internal/coordinator"
 	"aion-kernel/internal/dag"
 	"aion-kernel/internal/hub"
@@ -30,6 +32,77 @@ func TestBuildSpecAttemptSaveLoad(t *testing.T) {
 	}
 	if loaded.AgentStates["agent-a"].State != "Running" {
 		t.Fatalf("expected persisted agent state, got %#v", loaded.AgentStates)
+	}
+}
+
+func TestFinalizeBuildSpecAttemptConvergencePersistsCompletedState(t *testing.T) {
+	daemon := testBuildSpecDaemon(t)
+	attempt := newBuildSpecAttempt(daemon.runState.RunID, "docs/build_spec.md", []byte("hello world"))
+	attempt.Status = BuildSpecAttemptActive
+	previousCompletion := time.Now().Add(-time.Hour)
+	attempt.CompletedAt = &previousCompletion
+	attempt.Plan = &coordinator.PlanResponse{
+		Domains: []coordinator.Domain{{DomainID: "api"}},
+	}
+	attempt.RecordAgentState("agent-api", "api", "Running", "")
+	if err := saveBuildSpecAttempt(daemon.runState.Root, attempt); err != nil {
+		t.Fatalf("save active attempt: %v", err)
+	}
+
+	if err := daemon.finalizeBuildSpecAttemptConvergence(); err != nil {
+		t.Fatalf("finalize convergence: %v", err)
+	}
+	completed, err := loadBuildSpecAttempt(daemon.runState.Root)
+	if err != nil {
+		t.Fatalf("load completed attempt: %v", err)
+	}
+	if completed == nil || completed.Status != BuildSpecAttemptCompleted || completed.CompletedAt == nil {
+		t.Fatalf("expected completed attempt, got %#v", completed)
+	}
+	state := completed.AgentStates["agent-api"]
+	if state.State != "Stopped" || state.Reason != "execution converged" {
+		t.Fatalf("expected terminal agent state, got %#v", state)
+	}
+}
+
+func TestInitializePlannedContractsMaterializesDurableWork(t *testing.T) {
+	daemon := testBuildSpecDaemon(t)
+	manager, err := coordination.Open(coordinationOptions(daemon.config, daemon.runState.CoordinationDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	daemon.coordinationManager = manager
+	daemon.ctx = context.Background()
+	attempt := newBuildSpecAttempt(daemon.runState.RunID, "docs/build_spec.md", []byte("spec"))
+	plan := &coordinator.PlanResponse{
+		Domains: []coordinator.Domain{{DomainID: "producer"}, {DomainID: "consumer"}},
+		Nodes: []coordinator.TaskNode{
+			{ID: "producer-node", DomainID: "producer"},
+			{ID: "consumer-node", DomainID: "consumer"},
+		},
+		Edges: []coordinator.TaskEdge{{FromNode: "producer-node", ToNode: "consumer-node"}},
+		Contracts: []coordinator.PlannedContract{{
+			Resource: "public-api", ProducerNode: "producer-node", ConsumerNode: "consumer-node",
+			Kind: "interface", PublicEntrypoint: "producer.api", Acceptance: []string{"call succeeds"}, HardWait: true,
+		}},
+	}
+	if err := daemon.initializePlannedContracts(context.Background(), plan, attempt); err != nil {
+		t.Fatal(err)
+	}
+	contracts, err := manager.List(context.Background(), coordination.Principal{Role: coordination.RoleAdmin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(contracts) != 1 || len(attempt.CreatedContractIDs) != 1 {
+		t.Fatalf("contracts = %+v, attempt = %+v", contracts, attempt.CreatedContractIDs)
+	}
+	contract := contracts[0]
+	if contract.ID != attempt.CreatedContractIDs[0] || contract.ProducerAgentID != "agent-producer" || contract.ConsumerAgentID != "agent-consumer" {
+		t.Fatalf("unexpected contract identity: %+v", contract)
+	}
+	if contract.Details.PublicEntrypoint != "producer.api" || !contract.HardWait {
+		t.Fatalf("unexpected contract details: %+v", contract)
 	}
 }
 
@@ -138,6 +211,37 @@ func TestPrepareBuildSpecAttemptRetriesStaleAttempt(t *testing.T) {
 	}
 	if snapshot := daemon.dagManager.Snapshot(); len(snapshot.Nodes) != 0 || len(snapshot.Edges) != 0 {
 		t.Fatalf("expected cleared dag snapshot, got %#v", snapshot)
+	}
+}
+
+func TestReconcileInterruptedBuildSpecPlanningAllowsImmediateRetry(t *testing.T) {
+	daemon := testBuildSpecDaemon(t)
+	attempt := newBuildSpecAttempt(daemon.runState.RunID, "docs/build_spec.md", []byte("hello"))
+	attempt.Status = BuildSpecAttemptPlanning
+	if err := saveBuildSpecAttempt(daemon.runState.Root, attempt); err != nil {
+		t.Fatalf("saveBuildSpecAttempt: %v", err)
+	}
+
+	if err := daemon.reconcileInterruptedBuildSpecAttempt(); err != nil {
+		t.Fatalf("reconcileInterruptedBuildSpecAttempt: %v", err)
+	}
+	reconciled, err := loadBuildSpecAttempt(daemon.runState.Root)
+	if err != nil {
+		t.Fatalf("loadBuildSpecAttempt: %v", err)
+	}
+	if reconciled == nil || reconciled.Status != BuildSpecAttemptCanceled || reconciled.CompletedAt == nil {
+		t.Fatalf("expected canceled interrupted attempt, got %#v", reconciled)
+	}
+	if !strings.Contains(reconciled.FailureReason, "daemon restarted") {
+		t.Fatalf("unexpected reconciliation reason: %q", reconciled.FailureReason)
+	}
+
+	fresh, err := daemon.prepareBuildSpecAttempt("docs/build_spec.md", []byte("hello"))
+	if err != nil {
+		t.Fatalf("prepareBuildSpecAttempt after reconciliation: %v", err)
+	}
+	if fresh == nil || fresh.AttemptID == attempt.AttemptID {
+		t.Fatalf("expected a fresh attempt, got %#v", fresh)
 	}
 }
 

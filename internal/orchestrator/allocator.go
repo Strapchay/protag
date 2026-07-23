@@ -28,6 +28,7 @@ type Allocator struct {
 	dagManager          *dag.Manager
 	activeAgents        map[string]*supervisor.AgentSupervisor
 	pendingIncomplete   map[string]string
+	incompleteRetries   map[string]int
 	mu                  sync.Mutex
 	statusFn            func(text, level string) // optional: broadcasts to TUI status bar
 	agentStatusFn       func(agentID, text, level string)
@@ -41,6 +42,9 @@ type Allocator struct {
 	isolationErr        error
 	workInbox           *WorkInboxService
 	dispatchedWork      map[string]string
+	nodeRecoveryMu      sync.Mutex
+	nodeRecoveryContext map[string]string
+	integrationGateFn   func(context.Context, *dag.DagData) (bool, error)
 }
 
 type AllocationMode string
@@ -63,16 +67,18 @@ func NewAllocator(config *Config, projectRoot string, hubRouter *hub.Router, dag
 		isolationErr = fmt.Errorf("allocator: prepare IPC: %w", ipcErr)
 	}
 	return &Allocator{
-		config:            config,
-		projectRoot:       projectRoot,
-		hubRouter:         hubRouter,
-		dagManager:        dagManager,
-		activeAgents:      make(map[string]*supervisor.AgentSupervisor),
-		pendingIncomplete: make(map[string]string),
-		isolationEngine:   engine,
-		isolationErr:      isolationErr,
-		ipcDir:            ipcPaths.Dir,
-		dispatchedWork:    make(map[string]string),
+		config:              config,
+		projectRoot:         projectRoot,
+		hubRouter:           hubRouter,
+		dagManager:          dagManager,
+		activeAgents:        make(map[string]*supervisor.AgentSupervisor),
+		pendingIncomplete:   make(map[string]string),
+		incompleteRetries:   make(map[string]int),
+		isolationEngine:     engine,
+		isolationErr:        isolationErr,
+		ipcDir:              ipcPaths.Dir,
+		dispatchedWork:      make(map[string]string),
+		nodeRecoveryContext: make(map[string]string),
 	}
 }
 
@@ -82,6 +88,12 @@ func (a *Allocator) SetWorkInboxService(service *WorkInboxService) {
 	if a.dispatchedWork == nil {
 		a.dispatchedWork = make(map[string]string)
 	}
+	a.mu.Unlock()
+}
+
+func (a *Allocator) SetIntegrationGateFunc(fn func(context.Context, *dag.DagData) (bool, error)) {
+	a.mu.Lock()
+	a.integrationGateFn = fn
 	a.mu.Unlock()
 }
 
@@ -159,8 +171,13 @@ func (a *Allocator) AllocateWithOptions(ctx context.Context, domains []coordinat
 		return fmt.Errorf("allocator: create session dir: %w", err)
 	}
 
+	allocatedCount := 0
 	for _, domain := range domains {
 		agentID := fmt.Sprintf("agent-%s", domain.DomainID)
+		if options.Mode == AllocationModeResume && !a.domainNeedsResume(domain.DomainID, agentID) {
+			log.Printf("allocator: skipping completed domain agent %s during resume", agentID)
+			continue
+		}
 		prompt, ok := prompts[domain.DomainID]
 		if !ok {
 			log.Printf("allocator: warning: no prompt generated for domain %s", domain.DomainID)
@@ -253,9 +270,13 @@ func (a *Allocator) AllocateWithOptions(ctx context.Context, domains []coordinat
 		// idle avoids spending an inference turn on orientation before a node is
 		// actually ready for this domain.
 		initialPrompt := ""
+		resumedWorkItemID := ""
 		resumeAgent := options.Mode == AllocationModeResume && hasReusablePiSession(agentDir)
 		if resumeAgent {
-			initialPrompt = a.resumeLaunchPrompt(agentID, domain.DomainID, options.ResumeMessage)
+			initialPrompt, resumedWorkItemID = a.resumeLaunchDispatch(agentID, domain.DomainID, options.ResumeMessage)
+			if resumedWorkItemID != "" {
+				a.dispatchedWork[agentID] = resumedWorkItemID
+			}
 		}
 
 		agentConfig := supervisor.AgentConfig{
@@ -352,10 +373,26 @@ func (a *Allocator) AllocateWithOptions(ctx context.Context, domains []coordinat
 
 		a.emitStatus(fmt.Sprintf("Agent %s spawned (domain: %s)", agentID, domain.DomainID), "info")
 		log.Printf("allocator: spawned agent %s (domain: %s)", agentID, domain.DomainID)
+		allocatedCount++
 	}
 
-	a.emitStatus(fmt.Sprintf("%d agent(s) allocated — awaiting task dispatch", len(domains)), "ok")
+	a.emitStatus(fmt.Sprintf("%d agent(s) allocated — awaiting task dispatch", allocatedCount), "ok")
 	return nil
+}
+
+func (a *Allocator) domainNeedsResume(domainID, agentID string) bool {
+	if _, ok := a.actionableContractWorkForAgent(context.Background(), agentID); ok {
+		return true
+	}
+	if a.dagManager == nil {
+		return true
+	}
+	for _, node := range a.dagManager.Snapshot().Nodes {
+		if node.DomainID == domainID && !node.Status.IsTerminal() {
+			return true
+		}
+	}
+	return false
 }
 
 func defaultDomainAgentResumeMessage(agentID, domainID string) string {
@@ -382,17 +419,27 @@ func (a *Allocator) handleAgentLifecycle(agentID, domainID string, event supervi
 	}
 	if event.Kind == "agent_end" {
 		node, ok := a.inProgressNodeForAgent(agentID)
-		if !ok {
+		if ok {
+			a.mu.Lock()
+			if a.pendingIncomplete[agentID] == node.ID {
+				a.mu.Unlock()
+				return
+			}
+			a.pendingIncomplete[agentID] = node.ID
+			a.mu.Unlock()
+			go a.stopAgentWithIncompleteTask(agentID, domainID, node.ID)
 			return
 		}
+
 		a.mu.Lock()
-		if a.pendingIncomplete[agentID] == node.ID {
+		workItemID := a.dispatchedWork[agentID]
+		if workItemID == "" || a.pendingIncomplete[agentID] == workItemID {
 			a.mu.Unlock()
 			return
 		}
-		a.pendingIncomplete[agentID] = node.ID
+		a.pendingIncomplete[agentID] = workItemID
 		a.mu.Unlock()
-		go a.stopAgentWithIncompleteTask(agentID, domainID, node.ID)
+		go a.stopAgentWithIncompleteWork(agentID, domainID, workItemID)
 	}
 }
 
@@ -417,7 +464,22 @@ func (a *Allocator) stopAgentWithIncompleteTask(agentID, domainID, nodeID string
 	if !live || agent.State() != supervisor.StateRunning {
 		return
 	}
+	if agent.TurnRetryPending() {
+		log.Printf("allocator: deferring incomplete work handling for %s while Pi retries inference", agentID)
+		return
+	}
 	reason := fmt.Sprintf("agent loop ended before node %s reported a terminal status", nodeID)
+	var checkpoint *WorkCheckpoint
+	if a.workInbox != nil {
+		if inbox, inboxErr := a.workInbox.Inbox(context.Background(), a.workPrincipal(agentID)); inboxErr == nil {
+			if item, ok := findInboxItem(inbox, nodeID); ok {
+				checkpoint = item.Checkpoint
+			}
+		}
+	}
+	if a.retryIncompleteTurn(agent, agentID, domainID, nodeID, checkpoint, reason) {
+		return
+	}
 	log.Printf("allocator: stopping incomplete agent %s: %s", agentID, reason)
 	a.emitStatus(fmt.Sprintf("Agent %s stopped with incomplete node %s; use /continue-agents to resume", agentID, nodeID), "warn")
 	if a.lifecycleFn != nil {
@@ -430,6 +492,97 @@ func (a *Allocator) stopAgentWithIncompleteTask(agentID, domainID, nodeID string
 	if err := agent.Stop(); err != nil {
 		log.Printf("allocator: stop incomplete agent %s: %v", agentID, err)
 	}
+}
+
+func (a *Allocator) stopAgentWithIncompleteWork(agentID, domainID, workItemID string) {
+	defer func() {
+		a.mu.Lock()
+		if a.pendingIncomplete[agentID] == workItemID {
+			delete(a.pendingIncomplete, agentID)
+		}
+		a.mu.Unlock()
+	}()
+	// Coordination effects and terminal commands are persisted asynchronously
+	// relative to Pi's agent_end event. Let those commits settle first.
+	time.Sleep(250 * time.Millisecond)
+
+	a.mu.Lock()
+	service := a.workInbox
+	agent, live := a.activeAgents[agentID]
+	a.mu.Unlock()
+	if service == nil || !live || agent.State() != supervisor.StateRunning {
+		return
+	}
+	if agent.TurnRetryPending() {
+		log.Printf("allocator: deferring incomplete work handling for %s while Pi retries inference", agentID)
+		return
+	}
+	inbox, err := service.Inbox(context.Background(), a.workPrincipal(agentID))
+	if err != nil {
+		log.Printf("allocator: inspect unfinished work %s for %s: %v", workItemID, agentID, err)
+		return
+	}
+	item, incomplete := actionableInboxItem(inbox, workItemID)
+	if !incomplete {
+		a.clearDispatchedWork(agentID, workItemID)
+		return
+	}
+
+	reason := fmt.Sprintf("agent loop ended before work item %s reached a terminal or waiting state", workItemID)
+	if a.retryIncompleteTurn(agent, agentID, domainID, workItemID, item.Checkpoint, reason) {
+		return
+	}
+	log.Printf("allocator: stopping incomplete agent %s: %s", agentID, reason)
+	a.emitStatus(fmt.Sprintf("Agent %s stopped with incomplete %s; use /continue-agents to resume", agentID, item.Kind), "warn")
+	if a.lifecycleFn != nil {
+		a.lifecycleFn(agentID, domainID, supervisor.AgentLifecycleEvent{
+			Kind:    "task_incomplete",
+			IsError: true,
+			Error:   reason,
+		})
+	}
+	if err := agent.Stop(); err != nil {
+		log.Printf("allocator: stop incomplete agent %s: %v", agentID, err)
+	}
+}
+
+func (a *Allocator) retryIncompleteTurn(agent *supervisor.AgentSupervisor, agentID, domainID, workItemID string, checkpoint *WorkCheckpoint, reason string) bool {
+	if agent == nil || checkpoint != nil || a.config == nil || a.config.Agents.IncompleteTurnRetries <= 0 {
+		return false
+	}
+	key := agentID + "\x00" + workItemID
+	a.mu.Lock()
+	if a.incompleteRetries == nil {
+		a.incompleteRetries = make(map[string]int)
+	}
+	attempt := a.incompleteRetries[key] + 1
+	if attempt > a.config.Agents.IncompleteTurnRetries {
+		a.mu.Unlock()
+		return false
+	}
+	a.incompleteRetries[key] = attempt
+	a.mu.Unlock()
+
+	prompt := fmt.Sprintf("AUTOMATIC INCOMPLETE-TURN RETRY %d/%d\nThe prior Pi loop ended without a terminal update or durable checkpoint. Do not restart or re-plan the task. Inspect the authoritative work inbox, validate work already written, correct failures, then checkpoint or report a terminal node/contract state.\n\n%s",
+		attempt, a.config.Agents.IncompleteTurnRetries, a.resumePromptForAgent(agentID, domainID, reason))
+	if err := agent.DeliverTurn(prompt); err != nil {
+		log.Printf("allocator: incomplete-turn retry delivery failed for %s: %v", agentID, err)
+		return false
+	}
+	log.Printf("allocator: retrying incomplete work item %s for %s (%d/%d)", workItemID, agentID, attempt, a.config.Agents.IncompleteTurnRetries)
+	a.emitStatus(fmt.Sprintf("Retrying incomplete work for %s (%d/%d)", agentID, attempt, a.config.Agents.IncompleteTurnRetries), "warn")
+	if a.lifecycleFn != nil {
+		a.lifecycleFn(agentID, domainID, supervisor.AgentLifecycleEvent{Kind: "task_retry", Error: reason})
+	}
+	return true
+}
+
+func actionableInboxItem(inbox *WorkInbox, workItemID string) (WorkItem, bool) {
+	item, ok := findInboxItem(inbox, workItemID)
+	if !ok {
+		return WorkItem{}, false
+	}
+	return item, item.State == WorkItemReady || item.State == WorkItemActive
 }
 
 func (a *Allocator) inProgressNodeForAgent(agentID string) (dag.DagNode, bool) {
@@ -508,6 +661,7 @@ func (a *Allocator) StopAll() {
 	agents := a.activeAgents
 	a.activeAgents = make(map[string]*supervisor.AgentSupervisor)
 	a.pendingIncomplete = make(map[string]string)
+	a.incompleteRetries = make(map[string]int)
 	a.mu.Unlock()
 
 	log.Printf("allocator: stopping all agents...")
@@ -544,18 +698,63 @@ func (a *Allocator) ReviveAgent(ctx context.Context, agentID string) error {
 	return nil
 }
 
+// ResetAgentSession preserves prior Pi transcripts but starts a new
+// conversation with the current authoritative work item. Use this when a
+// persisted model context is looping or otherwise no longer recoverable by a
+// normal resumed prompt.
+func (a *Allocator) ResetAgentSession(ctx context.Context, agentID string) error {
+	return a.ResetAgentSessionWithPrompt(ctx, agentID, "")
+}
+
+// ResetAgentSessionWithPrompt starts a clean conversation with an optional
+// operator correction followed by the authoritative current work item.
+func (a *Allocator) ResetAgentSessionWithPrompt(ctx context.Context, agentID, operatorPrompt string) error {
+	a.mu.Lock()
+	agent, ok := a.activeAgents[agentID]
+	a.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("allocator: agent %s not found; run /continue-agents first", agentID)
+	}
+	prompt := a.resumePromptForAgent(agentID, agent.DomainID(), "")
+	if operatorPrompt = strings.TrimSpace(operatorPrompt); operatorPrompt != "" {
+		prompt += "\n\nAUTHORITATIVE OPERATOR CORRECTION:\n" + operatorPrompt +
+			"\nApply this correction before any other action. It overrides conflicting assumptions in prior session history, while node ownership and isolation policy remain unchanged."
+	}
+	a.mu.Lock()
+	delete(a.pendingIncomplete, agentID)
+	delete(a.incompleteRetries, agentID)
+	a.mu.Unlock()
+	log.Printf("allocator: starting fresh Pi session for agent %s", agentID)
+	if err := agent.RestartFreshWithPrompt(ctx, prompt); err != nil {
+		return fmt.Errorf("allocator: reset session for %s: %w", agentID, err)
+	}
+	a.emitStatus(fmt.Sprintf("Agent %s started a fresh recovery session; prior transcripts were preserved", agentID), "info")
+	return nil
+}
+
 func (a *Allocator) recoveryPromptForAgent(agentID, domainID string) string {
 	return a.resumePromptForAgent(agentID, domainID, "")
 }
 
 func (a *Allocator) resumeLaunchPrompt(agentID, domainID, base string) string {
-	if _, ok := a.inProgressNodeForAgent(agentID); !ok {
-		return ""
+	prompt, _ := a.resumeLaunchDispatch(agentID, domainID, base)
+	return prompt
+}
+
+func (a *Allocator) resumeLaunchDispatch(agentID, domainID, base string) (string, string) {
+	if item, ok := a.actionableContractWorkForAgent(context.Background(), agentID); ok {
+		return a.resumePromptForWorkItem(agentID, domainID, base, item), item.ID
 	}
-	return a.resumePromptForAgent(agentID, domainID, base)
+	if _, ok := a.inProgressNodeForAgent(agentID); !ok {
+		return "", ""
+	}
+	return a.resumePromptForAgent(agentID, domainID, base), ""
 }
 
 func (a *Allocator) resumePromptForAgent(agentID, domainID, base string) string {
+	if item, ok := a.actionableContractWorkForAgent(context.Background(), agentID); ok {
+		return a.resumePromptForWorkItem(agentID, domainID, base, item)
+	}
 	var b strings.Builder
 	base = strings.TrimSpace(base)
 	if base == "" {
@@ -564,6 +763,11 @@ func (a *Allocator) resumePromptForAgent(agentID, domainID, base string) string 
 	b.WriteString(base)
 	if node, ok := a.inProgressNodeForAgent(agentID); ok {
 		b.WriteString("\n\nThe previous agent loop ended before reporting completion. Resume this assigned node now:\n")
+		if item, found := a.currentNodeWorkForAgent(context.Background(), agentID); found {
+			b.WriteString(formatWorkItemPrompt(item))
+			a.appendNodeRecoveryContext(&b, node.ID)
+			return b.String()
+		}
 		b.WriteString(fmt.Sprintf("Node: %s\nSpec: %s\n", node.ID, node.TaskSpec))
 		if len(node.TargetFiles) > 0 {
 			b.WriteString("Target files: ")
@@ -573,10 +777,141 @@ func (a *Allocator) resumePromptForAgent(agentID, domainID, base string) string 
 		b.WriteString("Workspace root is /workspace. Resolve every target from /workspace and do not duplicate its first path component after changing directories.\n")
 		b.WriteString("Persist every new implementation, fixture, and test beneath an owned target path. Do not create /workspace/tests or another shared root unless it is explicitly listed in your assigned targets; place focused tests under the owned domain path instead.\n")
 		b.WriteString("Run `orchestrator-cli work-inbox --current` before acting and confirm this node is the authoritative active item. Work only this assigned node. Do not claim or update another pending or unassigned node. If you need a cross-domain artifact, use `contract-ensure --wait` and end the turn instead of polling. Record a `work-checkpoint` before yielding incomplete work. Finish or explicitly fail/block this node through the loaded orchestrator-cli workflow, then end the agent loop so the allocator can dispatch later work.")
+		a.appendNodeRecoveryContext(&b, node.ID)
 	} else {
 		b.WriteString("\n\nYou do not currently have an assigned InProgress node. Do not claim, start, or update a pending or unassigned node. End this agent loop now and wait for the allocator to send a direct task dispatch.")
 	}
 	return b.String()
+}
+
+func (a *Allocator) appendNodeRecoveryContext(b *strings.Builder, nodeID string) {
+	recovery := a.nodeRecoveryContextFor(nodeID)
+	if recovery == "" {
+		return
+	}
+	b.WriteString("\n\nAUTHORITATIVE RECOVERY CONTEXT:\n")
+	b.WriteString(recovery)
+	b.WriteString("\nTreat this diagnostic as the acceptance failure for the current node. Repair only files in your owned workspace, rerun the relevant checks, and report the node terminal only after the failure is resolved.")
+}
+
+func (a *Allocator) SetNodeRecoveryContext(nodeID, recovery string) {
+	nodeID = strings.TrimSpace(nodeID)
+	recovery = strings.TrimSpace(recovery)
+	if nodeID == "" {
+		return
+	}
+	a.nodeRecoveryMu.Lock()
+	defer a.nodeRecoveryMu.Unlock()
+	if recovery == "" {
+		delete(a.nodeRecoveryContext, nodeID)
+		return
+	}
+	if a.nodeRecoveryContext == nil {
+		a.nodeRecoveryContext = make(map[string]string)
+	}
+	a.nodeRecoveryContext[nodeID] = recovery
+}
+
+func (a *Allocator) ClearNodeRecoveryContext(nodeID string) {
+	a.SetNodeRecoveryContext(nodeID, "")
+}
+
+func (a *Allocator) nodeRecoveryContextFor(nodeID string) string {
+	a.nodeRecoveryMu.Lock()
+	defer a.nodeRecoveryMu.Unlock()
+	return a.nodeRecoveryContext[strings.TrimSpace(nodeID)]
+}
+
+// DeliverNodeRecovery records a node-scoped diagnostic and delivers it to the
+// assigned agent when that runtime is already available. A missing runtime is
+// not an error: AllocateWithOptions reconstructs the prompt from this context
+// after an explicit /continue-agents.
+func (a *Allocator) DeliverNodeRecovery(ctx context.Context, nodeID, recovery string) (bool, error) {
+	if a == nil || a.dagManager == nil {
+		return false, fmt.Errorf("allocator: DAG manager is unavailable")
+	}
+	node, err := a.dagManager.GetNode(strings.TrimSpace(nodeID))
+	if err != nil {
+		return false, err
+	}
+	agentID := expectedAgentForNode(node.DomainID, node.AssignedAgent)
+	if strings.TrimSpace(agentID) == "" {
+		return false, fmt.Errorf("allocator: node %s has no recoverable agent", node.ID)
+	}
+	a.SetNodeRecoveryContext(node.ID, recovery)
+	prompt := a.resumePromptForAgent(agentID, node.DomainID, "")
+
+	a.mu.Lock()
+	agent := a.activeAgents[agentID]
+	a.mu.Unlock()
+	if agent == nil {
+		return false, nil
+	}
+	if agent.State() == supervisor.StateRunning {
+		if err := agent.DeliverTurn(prompt); err != nil {
+			return false, fmt.Errorf("allocator: deliver node recovery to %s: %w", agentID, err)
+		}
+		return true, nil
+	}
+	if err := agent.RestartWithPrompt(ctx, prompt); err != nil {
+		return false, fmt.Errorf("allocator: restart %s for node recovery: %w", agentID, err)
+	}
+	return true, nil
+}
+
+func (a *Allocator) resumePromptForWorkItem(agentID, domainID, base string, item WorkItem) string {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		base = defaultDomainAgentResumeMessage(agentID, domainID)
+	}
+	return base +
+		"\n\nThe previous agent loop ended before completing durable coordination work. Resume the authoritative contract item below now:\n" +
+		formatWorkItemPrompt(item)
+}
+
+func (a *Allocator) currentNodeWorkForAgent(ctx context.Context, agentID string) (WorkItem, bool) {
+	service := a.workInbox
+	if service == nil {
+		return WorkItem{}, false
+	}
+	inbox, err := service.Inbox(ctx, a.workPrincipal(agentID))
+	if err != nil {
+		log.Printf("allocator: build node recovery inbox for %s: %v", agentID, err)
+		return WorkItem{}, false
+	}
+	if inbox.Active != nil && inbox.Active.Kind == WorkItemNode {
+		return *inbox.Active, true
+	}
+	for _, item := range inbox.Ready {
+		if item.Kind == WorkItemNode {
+			return item, true
+		}
+	}
+	return WorkItem{}, false
+}
+
+func (a *Allocator) actionableContractWorkForAgent(ctx context.Context, agentID string) (WorkItem, bool) {
+	// The inbox service is installed before allocation starts and remains stable
+	// for the run. This helper is also called while AllocateWithOptions holds the
+	// allocator mutex, so it must not attempt to reacquire that lock.
+	service := a.workInbox
+	if service == nil {
+		return WorkItem{}, false
+	}
+	inbox, err := service.Inbox(ctx, a.workPrincipal(agentID))
+	if err != nil {
+		log.Printf("allocator: build recovery inbox for %s: %v", agentID, err)
+		return WorkItem{}, false
+	}
+	if inbox.Active != nil && inbox.Active.Kind != WorkItemNode {
+		return *inbox.Active, true
+	}
+	for _, item := range inbox.Ready {
+		if item.Kind != WorkItemNode {
+			return item, true
+		}
+	}
+	return WorkItem{}, false
 }
 
 // MonitorExecution blocks until the DAG is fully converged or a timeout occurs.
@@ -593,15 +928,15 @@ func (a *Allocator) MonitorExecution(ctx context.Context, checkInterval time.Dur
 			return ctx.Err()
 		case <-ticker.C:
 			a.dispatchReadyTasks(ctx)
-			converged, err := a.checkConvergence()
+			converged, err := a.checkConvergenceContext(ctx)
 			if err != nil {
 				log.Printf("allocator: monitor error: %v", err)
 				a.emitStatus(fmt.Sprintf("Monitor error: %v", err), "error")
 				continue
 			}
 			if converged {
-				log.Printf("allocator: DAG execution converged (all nodes in terminal states)")
-				a.emitStatus("✅ System converged — all nodes in terminal states", "ok")
+				log.Printf("allocator: execution converged (DAG, coordination, and integration terminal)")
+				a.emitStatus("System converged — implementation and integration validation complete", "ok")
 				return nil
 			}
 		}
@@ -609,6 +944,10 @@ func (a *Allocator) MonitorExecution(ctx context.Context, checkInterval time.Dur
 }
 
 func (a *Allocator) checkConvergence() (bool, error) {
+	return a.checkConvergenceContext(context.Background())
+}
+
+func (a *Allocator) checkConvergenceContext(ctx context.Context) (bool, error) {
 	snap := a.dagManager.Snapshot()
 
 	if len(snap.Nodes) == 0 {
@@ -629,6 +968,12 @@ func (a *Allocator) checkConvergence() (bool, error) {
 			return false, nil
 		}
 	}
+	a.mu.Lock()
+	integrationGate := a.integrationGateFn
+	a.mu.Unlock()
+	if integrationGate != nil {
+		return integrationGate(ctx, snap)
+	}
 
 	return true, nil
 }
@@ -637,6 +982,13 @@ func (a *Allocator) checkConvergence() (bool, error) {
 func (a *Allocator) dispatchReadyTasks(ctx context.Context) {
 	snap := a.dagManager.Snapshot()
 	readyNodes := a.dagManager.GetReadyNodes()
+	if len(readyNodes) > 0 {
+		ids := make([]string, 0, len(readyNodes))
+		for _, node := range readyNodes {
+			ids = append(ids, node.ID)
+		}
+		log.Printf("allocator: ready task scan found %d node(s): %s", len(ids), strings.Join(ids, ","))
+	}
 	a.dispatchReadyContractWork(ctx, snap)
 
 	// Track which agents are currently busy
@@ -670,17 +1022,10 @@ func (a *Allocator) dispatchReadyTasks(ctx context.Context) {
 			continue // agent offline or busy
 		}
 
-		// Pi's follow_up command can remain queued when a turn ends near the
-		// delivery boundary. A task must start a fresh prompt after the agent is
-		// observably idle; otherwise the DAG can be marked InProgress without the
-		// task ever entering the agent transcript.
-		log.Printf("allocator: waiting for agent %s to become idle before dispatching node %s", agentID, node.ID)
-		if err := agent.WaitForTurnIdle(ctx); err != nil {
-			log.Printf("allocator: idle wait failed for agent %s node %s: %v", agentID, node.ID, err)
-			a.emitStatus(fmt.Sprintf("Dispatch wait failed for agent %s: %v", agentID, err), "warn")
-			return
-		}
-		if agent.State() != supervisor.StateRunning {
+		// A busy agent must not block this global scan. Retry its work on the
+		// next monitor tick while allowing unrelated domains to dispatch now.
+		if !agent.TurnIdle() {
+			log.Printf("allocator: deferring node %s because agent %s is still active", node.ID, agentID)
 			continue
 		}
 
@@ -712,6 +1057,7 @@ func (a *Allocator) dispatchReadyTasks(ctx context.Context) {
 		b.WriteString("Run `orchestrator-cli work-inbox --current` first and confirm this node is the authoritative active item. Work only this dispatched node. Do not claim or update another pending or unassigned node. If you discover a missing cross-domain resource, use `contract-ensure --wait` and end the turn instead of polling or guessing. Record a concise `work-checkpoint` before yielding incomplete work. After the terminal update, end the agent loop so the allocator can dispatch later work.\n")
 		b.WriteString("\nWorkspace root is /workspace. Resolve every target file from /workspace and write each exact target path once; do not duplicate its first path component after changing directories.\n")
 		b.WriteString("Persist every new implementation, fixture, and test beneath an owned target path. Do not create /workspace/tests or another shared root unless it is explicitly listed in this node's targets; place focused tests under the owned domain path instead.\n")
+		b.WriteString("When this work establishes or changes domain-level acceptance behavior, update the domain's schema-v1 JSON directive under `<assigned-path>/integration/directives/`; the kernel integration runner will execute it after all implementation and contract work is terminal.\n")
 		b.WriteString("Your current working directory contains only your isolated writable domain mounts. Use contracts and orchestrator messages for cross-domain requirements.\n")
 
 		if err := agent.SendPrompt(b.String()); err != nil {
@@ -763,9 +1109,11 @@ func (a *Allocator) dispatchReadyContractWork(ctx context.Context, snapshot *dag
 		prompt := formatWorkItemPrompt(item)
 		var err error
 		if agent.State() == supervisor.StateRunning {
-			if err = agent.WaitForTurnIdle(ctx); err == nil {
-				err = agent.SendPrompt(prompt)
+			if !agent.TurnIdle() {
+				log.Printf("allocator: deferring work item %s because agent %s is still active", item.ID, agentID)
+				continue
 			}
+			err = agent.SendPrompt(prompt)
 		} else {
 			err = agent.RestartWithPrompt(ctx, prompt)
 		}
@@ -841,20 +1189,20 @@ func (a *Allocator) DeliverOrWakeContext(ctx context.Context, message hub.Messag
 	if agent == nil {
 		return fmt.Errorf("allocator: agent %s not found", message.ToAgent)
 	}
+	prompt := formatContextWakePrompt(message)
+	if workItemID != "" && a.workInbox != nil {
+		inbox, err := a.workInbox.Inbox(ctx, a.workPrincipal(message.ToAgent))
+		if err == nil {
+			if item, ok := findInboxItem(inbox, workItemID); ok {
+				prompt = formatWorkItemPrompt(item) + "\n\n" + prompt
+			}
+		}
+	}
 	if agent.State() == supervisor.StateRunning {
-		if err := a.hubRouter.Route(message); err != nil {
+		if err := agent.DeliverTurn(prompt); err != nil {
 			return err
 		}
 	} else {
-		prompt := formatContextWakePrompt(message)
-		if workItemID != "" && a.workInbox != nil {
-			inbox, err := a.workInbox.Inbox(ctx, a.workPrincipal(message.ToAgent))
-			if err == nil {
-				if item, ok := findInboxItem(inbox, workItemID); ok {
-					prompt = formatWorkItemPrompt(item) + "\n\n" + prompt
-				}
-			}
-		}
 		if err := agent.RestartWithPrompt(ctx, prompt); err != nil {
 			return err
 		}
@@ -863,6 +1211,22 @@ func (a *Allocator) DeliverOrWakeContext(ctx context.Context, message hub.Messag
 		a.MarkWorkDispatched(message.ToAgent, workItemID)
 	}
 	return nil
+}
+
+// SteerOrWakeContext gives operator interventions precedence over an active
+// agent loop while still using a direct prompt for an idle Pi session.
+func (a *Allocator) SteerOrWakeContext(ctx context.Context, message hub.Message) error {
+	a.mu.Lock()
+	agent := a.activeAgents[message.ToAgent]
+	a.mu.Unlock()
+	if agent == nil {
+		return fmt.Errorf("allocator: agent %s not found", message.ToAgent)
+	}
+	prompt := formatContextWakePrompt(message)
+	if agent.State() == supervisor.StateRunning {
+		return agent.SendSteer(prompt)
+	}
+	return agent.RestartWithPrompt(ctx, prompt)
 }
 
 func (a *Allocator) clearDispatchedWork(agentID, completedWorkItemID string) {
@@ -882,9 +1246,18 @@ func formatWorkItemPrompt(item WorkItem) string {
 	}
 	if item.ContractID != "" {
 		b.WriteString("Contract: " + item.ContractID + "\n")
+		b.WriteString(fmt.Sprintf("Current revision: %d\n", item.Revision))
 	}
 	if item.Objective != "" {
 		b.WriteString("Objective: " + item.Objective + "\n")
+	}
+	if item.Contract != nil {
+		if language := strings.TrimSpace(item.Contract.Language); language != "" {
+			b.WriteString("Contract language: " + language + "\n")
+		}
+		if entrypoint := strings.TrimSpace(item.Contract.PublicEntrypoint); entrypoint != "" {
+			b.WriteString("Required public entrypoint: " + entrypoint + "\n")
+		}
 	}
 	if item.Checkpoint != nil {
 		b.WriteString("Last checkpoint: " + item.Checkpoint.Summary + "\n")
@@ -892,7 +1265,19 @@ func formatWorkItemPrompt(item WorkItem) string {
 			b.WriteString("Checkpoint next action: " + item.Checkpoint.Next + "\n")
 		}
 	}
-	b.WriteString("\nRun `orchestrator-cli work-inbox --current` first and confirm this is the current ready item. Process only this item. Do not poll or inspect another domain's workspace.\n")
+	for _, dependency := range item.RequiredContracts {
+		b.WriteString(fmt.Sprintf("Required contract: %s status=%s revision=%d resource=%s public_entrypoint=%s\n",
+			dependency.ID,
+			dependency.Status,
+			dependency.Revision,
+			dependency.Details.Name,
+			dependency.Details.PublicEntrypoint,
+		))
+	}
+	for _, requirement := range item.RuntimeRequirements {
+		b.WriteString("Authoritative runtime requirement: " + requirement + "\n")
+	}
+	b.WriteString("\nRun `orchestrator-cli work-inbox --current` first and confirm this is the current dispatched item. Process only this item. Do not poll or inspect another domain's workspace.\n")
 	if item.Kind == WorkItemNode {
 		b.WriteString("For DAG work, pass the exact `node_id` field to `update-node`; the inbox item ID is also that raw DAG node ID.\n")
 	} else {
@@ -900,12 +1285,35 @@ func formatWorkItemPrompt(item WorkItem) string {
 	}
 	switch item.Kind {
 	case WorkItemContractPublish, WorkItemContractCorrection:
-		b.WriteString("Create the requested public contract artifact under /tmp or an owned domain path, then publish it with `orchestrator-cli contract-publish`. Do not expose private implementation source.\n")
+		b.WriteString(fmt.Sprintf("Create the requested public contract artifact as a concise JSON file under /tmp or an owned domain path. It must repeat the declared language and exact public entrypoint, define the callable/schema surface needed by the consumer, and include enough usage detail for an isolated consumer to integrate without inspecting your workspace. Publish it with `orchestrator-cli contract-publish --contract-id %s --artifact-file <path> --expected-revision %d`. Do not expose private implementation source.\n", item.ContractID, item.Revision))
 	case WorkItemContractValidate:
-		b.WriteString("Fetch the immutable artifact into /tmp or an owned domain path, validate it against the acceptance criteria, then use `contract-validate` or `contract-correct`.\n")
+		artifactPath := contractValidationArtifactPath(item.ContractID, item.Revision)
+		b.WriteString(fmt.Sprintf("Fetch the immutable public descriptor with `orchestrator-cli contract-fetch --contract-id %s --revision %d --output %s`. The `--output` value is a regular file path, not a directory. Read that descriptor and confirm that its declared language, exact public entrypoint, signatures/schema, and usage details are sufficient for isolated implementation. Do not expect producer source or execute producer behavior in this workspace; behavioral acceptance runs later in the assembled integration workspace. Never guess a missing integration locator. If the descriptor is actionable and consistent with the stated acceptance criteria, run `orchestrator-cli contract-validate --contract-id %s --revision %d --evidence '<json>'`; otherwise request a concrete correction.\n", item.ContractID, item.Revision, artifactPath, item.ContractID, item.Revision))
 	}
 	b.WriteString("If you must yield before completing it, record a concise `work-checkpoint`. End the turn when the item is completed or waiting so the kernel can schedule the next ready item.")
 	return b.String()
+}
+
+func contractValidationArtifactPath(contractID string, revision int64) string {
+	contractID = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		case r == '-', r == '_':
+			return r
+		default:
+			return '-'
+		}
+	}, strings.TrimSpace(contractID))
+	contractID = strings.Trim(contractID, "-")
+	if contractID == "" {
+		contractID = "artifact"
+	}
+	return fmt.Sprintf("/tmp/aion-contract-%s-r%d.json", contractID, revision)
 }
 
 func formatContextWakePrompt(message hub.Message) string {

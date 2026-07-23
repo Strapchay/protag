@@ -20,6 +20,7 @@ type BuildProgressSnapshot struct {
 	TotalNodes     int                     `json:"total_nodes"`
 	Milestones     []MilestoneProgress     `json:"milestones"`
 	OpenRecoveries []RecoveryRecord        `json:"open_recoveries,omitempty"`
+	Integration    *IntegrationRunStatus   `json:"integration,omitempty"`
 	RecentEvents   []ExecutionJournalEvent `json:"recent_events,omitempty"`
 	Warnings       []string                `json:"warnings,omitempty"`
 	ClientSummary  string                  `json:"client_summary"`
@@ -58,6 +59,10 @@ func (d *Daemon) buildProgressSnapshot() (*BuildProgressSnapshot, error) {
 	attempt, _ := loadBuildSpecAttempt(d.runState.Root)
 	snapshot := computeBuildProgress(attempt, d.dagManager.Snapshot())
 	snapshot.OpenRecoveries = d.openRecoveryRecords()
+	if d.integrationRunner != nil {
+		integration := d.integrationRunner.Status()
+		snapshot.Integration = &integration
+	}
 	snapshot.RecentEvents = d.recentExecutionEvents(10)
 	applyRecoveryFacts(snapshot)
 	snapshot.ClientSummary = buildProgressSummary(*snapshot)
@@ -345,6 +350,9 @@ func buildProgressSummary(snapshot BuildProgressSnapshot) string {
 	if len(snapshot.OpenRecoveries) > 0 {
 		parts = append(parts, fmt.Sprintf("Needs attention: %d open recovery item(s).", len(snapshot.OpenRecoveries)))
 	}
+	if snapshot.Integration != nil && snapshot.Integration.Enabled {
+		parts = append(parts, "Integration validation is "+string(snapshot.Integration.Status)+".")
+	}
 	return strings.Join(parts, " ")
 }
 
@@ -448,6 +456,10 @@ func progressEventSignature(snapshot *BuildProgressSnapshot) string {
 			b.WriteString(strings.Join(milestone.BlockedNodes, ","))
 		}
 	}
+	if snapshot.Integration != nil {
+		b.WriteString("|integration:")
+		b.WriteString(string(snapshot.Integration.Status))
+	}
 	return b.String()
 }
 
@@ -462,6 +474,14 @@ func progressLevel(snapshot *BuildProgressSnapshot) string {
 	}
 	if len(snapshot.OpenRecoveries) > 0 {
 		return "warn"
+	}
+	if snapshot.Integration != nil {
+		switch snapshot.Integration.Status {
+		case IntegrationFailed:
+			return "error"
+		case IntegrationRunning, IntegrationPending:
+			return "info"
+		}
 	}
 	hasActive := false
 	for _, milestone := range snapshot.Milestones {

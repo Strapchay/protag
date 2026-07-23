@@ -19,6 +19,7 @@ type Config struct {
 	InferenceGateway InferenceGatewayConfig `yaml:"inference_gateway"`
 	Coordination     CoordinationConfig     `yaml:"coordination"`
 	Isolation        IsolationConfig        `yaml:"isolation"`
+	Integration      IntegrationConfig      `yaml:"integration"`
 	Cgroups          CgroupsConfig          `yaml:"cgroups"`
 	Inference        InferenceConfig        `yaml:"inference"`
 	Memory           MemoryConfig           `yaml:"memory"`
@@ -44,6 +45,16 @@ type IsolationConfig struct {
 	Network     string `yaml:"network"`
 }
 
+// IntegrationConfig controls the kernel-owned validation phase that runs
+// after implementation nodes and coordination contracts reach terminal state.
+type IntegrationConfig struct {
+	Enabled        bool   `yaml:"enabled"`
+	DirectiveDir   string `yaml:"directive_dir"`
+	TimeoutSec     int    `yaml:"timeout_sec"`
+	MaxOutputBytes int    `yaml:"max_output_bytes"`
+	MaxDirectives  int    `yaml:"max_directives"`
+}
+
 // MemoryConfig configures the semantic memory store.
 type MemoryConfig struct {
 	Enabled            bool    `yaml:"enabled"`
@@ -67,14 +78,15 @@ type OrchestratorConfig struct {
 
 // AgentsConfig configures agent management.
 type AgentsConfig struct {
-	SessionDir     string   `yaml:"session_dir"`
-	MaxAgents      int      `yaml:"max_agents"`
-	SharedFiles    []string `yaml:"shared_files"`
-	CommandPath    string   `yaml:"command_path"`
-	CLIPath        string   `yaml:"orchestrator_cli_path,omitempty"`
-	CommandArgs    []string `yaml:"command_args"`
-	SkillPaths     []string `yaml:"skill_paths,omitempty"`
-	ExtensionPaths []string `yaml:"extension_paths,omitempty"`
+	SessionDir            string   `yaml:"session_dir"`
+	MaxAgents             int      `yaml:"max_agents"`
+	IncompleteTurnRetries int      `yaml:"incomplete_turn_retries"`
+	SharedFiles           []string `yaml:"shared_files"`
+	CommandPath           string   `yaml:"command_path"`
+	CLIPath               string   `yaml:"orchestrator_cli_path,omitempty"`
+	CommandArgs           []string `yaml:"command_args"`
+	SkillPaths            []string `yaml:"skill_paths,omitempty"`
+	ExtensionPaths        []string `yaml:"extension_paths,omitempty"`
 }
 
 // HealthConfig configures agent health monitoring.
@@ -86,6 +98,7 @@ type HealthConfig struct {
 	CoordinatorPlannerStartTimeoutSec        int `yaml:"coordinator_planner_start_timeout_sec"`
 	CoordinatorPlannerFirstRequestTimeoutSec int `yaml:"coordinator_planner_first_request_timeout_sec"`
 	CoordinatorPlannerArtifactTimeoutSec     int `yaml:"coordinator_planner_artifact_timeout_sec"`
+	CoordinatorPlannerTurnSettleTimeoutSec   int `yaml:"coordinator_planner_turn_settle_timeout_sec"`
 }
 
 type ExecutionConfig struct {
@@ -224,6 +237,7 @@ health:
   coordinator_planner_start_timeout_sec: 30
   coordinator_planner_first_request_timeout_sec: 60
   coordinator_planner_artifact_timeout_sec: 300
+  coordinator_planner_turn_settle_timeout_sec: 5
 
 execution:
   mode: "${AION_EXECUTION_MODE}"
@@ -253,6 +267,13 @@ isolation:
   backend: "${AION_ISOLATION_BACKEND}"
   runtime_base: "${AION_ISOLATION_RUNTIME_BASE}"
   network: "${AION_ISOLATION_NETWORK}"
+
+integration:
+  enabled: ${AION_INTEGRATION_ENABLED}
+  directive_dir: "${AION_INTEGRATION_DIRECTIVE_DIR}"
+  timeout_sec: ${AION_INTEGRATION_TIMEOUT_SEC}
+  max_output_bytes: ${AION_INTEGRATION_MAX_OUTPUT_BYTES}
+  max_directives: ${AION_INTEGRATION_MAX_DIRECTIVES}
 
 cgroups:
   enabled: true
@@ -312,6 +333,7 @@ inference:
 agents:
   session_dir: "${AION_AGENT_SESSION_DIR}"
   max_agents: ${AION_MAX_AGENTS}
+  incomplete_turn_retries: ${AION_AGENT_INCOMPLETE_TURN_RETRIES}
   command_path: "${AION_AGENT_COMMAND_PATH}"
   skill_paths:
     - "${AION_AGENT_SKILL_PATH}"
@@ -379,6 +401,9 @@ func applyDefaults(c *Config) {
 	if c.Health.CoordinatorPlannerArtifactTimeoutSec == 0 {
 		c.Health.CoordinatorPlannerArtifactTimeoutSec = 300
 	}
+	if c.Health.CoordinatorPlannerTurnSettleTimeoutSec == 0 {
+		c.Health.CoordinatorPlannerTurnSettleTimeoutSec = 5
+	}
 	if c.Execution.MaxConcurrentRequests == 0 {
 		c.Execution.MaxConcurrentRequests = 1
 	}
@@ -436,6 +461,18 @@ func applyDefaults(c *Config) {
 	if strings.TrimSpace(c.Isolation.Network) == "" {
 		c.Isolation.Network = "isolated"
 	}
+	if strings.TrimSpace(c.Integration.DirectiveDir) == "" {
+		c.Integration.DirectiveDir = "integration/directives"
+	}
+	if c.Integration.TimeoutSec == 0 {
+		c.Integration.TimeoutSec = 300
+	}
+	if c.Integration.MaxOutputBytes == 0 {
+		c.Integration.MaxOutputBytes = 1024 * 1024
+	}
+	if c.Integration.MaxDirectives == 0 {
+		c.Integration.MaxDirectives = 128
+	}
 	if c.Cgroups.MemoryMaxMB == 0 {
 		c.Cgroups.MemoryMaxMB = 2048
 	}
@@ -474,6 +511,9 @@ func validateConfig(c *Config) error {
 	if c.Agents.MaxAgents > 32 {
 		return fmt.Errorf("max_agents %d exceeds reasonable limit", c.Agents.MaxAgents)
 	}
+	if c.Agents.IncompleteTurnRetries < 0 || c.Agents.IncompleteTurnRetries > 3 {
+		return fmt.Errorf("agents.incomplete_turn_retries must be between 0 and 3")
+	}
 	if c.Execution.MaxConcurrentRequests < 1 {
 		return fmt.Errorf("execution.max_concurrent_requests must be >= 1")
 	}
@@ -497,6 +537,9 @@ func validateConfig(c *Config) error {
 	}
 	if c.Health.CoordinatorPlannerArtifactTimeoutSec < 1 {
 		return fmt.Errorf("health.coordinator_planner_artifact_timeout_sec must be >= 1")
+	}
+	if c.Health.CoordinatorPlannerTurnSettleTimeoutSec < 1 {
+		return fmt.Errorf("health.coordinator_planner_turn_settle_timeout_sec must be >= 1")
 	}
 	if c.Execution.MaxConcurrentRequests > 16 {
 		return fmt.Errorf("execution.max_concurrent_requests %d exceeds reasonable limit", c.Execution.MaxConcurrentRequests)
@@ -551,6 +594,19 @@ func validateConfig(c *Config) error {
 	case "shared", "isolated":
 	default:
 		return fmt.Errorf("invalid isolation.network %q", c.Isolation.Network)
+	}
+	if c.Integration.TimeoutSec < 1 {
+		return fmt.Errorf("integration.timeout_sec must be >= 1")
+	}
+	if c.Integration.MaxOutputBytes < 1024 || c.Integration.MaxOutputBytes > 16*1024*1024 {
+		return fmt.Errorf("integration.max_output_bytes must be between 1024 and 16777216")
+	}
+	if c.Integration.MaxDirectives < 1 || c.Integration.MaxDirectives > 1024 {
+		return fmt.Errorf("integration.max_directives must be between 1 and 1024")
+	}
+	directiveDir := filepath.Clean(strings.TrimSpace(c.Integration.DirectiveDir))
+	if filepath.IsAbs(directiveDir) || directiveDir == "." || directiveDir == ".." || strings.HasPrefix(directiveDir, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("integration.directive_dir must be a non-root project-relative path")
 	}
 	switch strings.ToLower(strings.TrimSpace(c.Cgroups.Mode)) {
 	case "", "direct", "systemd", "disabled":

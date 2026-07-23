@@ -41,24 +41,40 @@ type WorkCheckpoint struct {
 	UpdatedAt  time.Time `json:"updated_at"`
 }
 
+// WorkContractDependency gives an isolated consumer the durable contract
+// identity and public surface it needs without exposing producer source.
+type WorkContractDependency struct {
+	ID                string                       `json:"id"`
+	Status            coordination.Status          `json:"status"`
+	Revision          int64                        `json:"revision"`
+	ProducerNodeID    string                       `json:"producer_node_id"`
+	ConsumerNodeID    string                       `json:"consumer_node_id"`
+	Details           coordination.ContractDetails `json:"details"`
+	ArtifactAvailable bool                         `json:"artifact_available"`
+}
+
 type WorkItem struct {
-	ID            string          `json:"id"`
-	Kind          WorkItemKind    `json:"kind"`
-	State         WorkItemState   `json:"state"`
-	AgentID       string          `json:"agent_id"`
-	DomainID      string          `json:"domain_id,omitempty"`
-	NodeID        string          `json:"node_id,omitempty"`
-	ContractID    string          `json:"contract_id,omitempty"`
-	Title         string          `json:"title"`
-	Objective     string          `json:"objective,omitempty"`
-	Priority      int32           `json:"priority"`
-	ReadyRank     int             `json:"ready_rank,omitempty"`
-	Dependencies  []string        `json:"dependencies,omitempty"`
-	WaitingReason string          `json:"waiting_reason,omitempty"`
-	TargetFiles   []string        `json:"target_files,omitempty"`
-	Checkpoint    *WorkCheckpoint `json:"checkpoint,omitempty"`
-	CreatedAt     time.Time       `json:"created_at,omitempty"`
-	UpdatedAt     time.Time       `json:"updated_at,omitempty"`
+	ID                  string                        `json:"id"`
+	Kind                WorkItemKind                  `json:"kind"`
+	State               WorkItemState                 `json:"state"`
+	AgentID             string                        `json:"agent_id"`
+	DomainID            string                        `json:"domain_id,omitempty"`
+	NodeID              string                        `json:"node_id,omitempty"`
+	ContractID          string                        `json:"contract_id,omitempty"`
+	Revision            int64                         `json:"revision,omitempty"`
+	Title               string                        `json:"title"`
+	Objective           string                        `json:"objective,omitempty"`
+	Priority            int32                         `json:"priority"`
+	ReadyRank           int                           `json:"ready_rank,omitempty"`
+	Dependencies        []string                      `json:"dependencies,omitempty"`
+	WaitingReason       string                        `json:"waiting_reason,omitempty"`
+	TargetFiles         []string                      `json:"target_files,omitempty"`
+	RequiredContracts   []WorkContractDependency      `json:"required_contracts,omitempty"`
+	RuntimeRequirements []string                      `json:"runtime_requirements,omitempty"`
+	Checkpoint          *WorkCheckpoint               `json:"checkpoint,omitempty"`
+	Contract            *coordination.ContractDetails `json:"contract,omitempty"`
+	CreatedAt           time.Time                     `json:"created_at,omitempty"`
+	UpdatedAt           time.Time                     `json:"updated_at,omitempty"`
 }
 
 type WorkInbox struct {
@@ -143,6 +159,11 @@ func (s *WorkInboxService) Inbox(ctx context.Context, principal coordination.Pri
 			continue
 		}
 		item := workItemForNode(node, dependencies[node.ID], nodes)
+		if node.Status == dag.StatusPending && strings.TrimSpace(node.AssignedAgent) == "" && item.State == WorkItemReady {
+			item.State = WorkItemWaiting
+			item.WaitingReason = "awaiting allocator dispatch"
+		}
+		attachNodeRuntimeContext(&item, contracts)
 		attachCheckpoint(&item, checkpoints)
 		switch item.State {
 		case WorkItemActive:
@@ -316,11 +337,73 @@ func workItemForNode(node dag.DagNode, dependencyIDs []string, nodes map[string]
 	return item
 }
 
+func attachNodeRuntimeContext(item *WorkItem, contracts []coordination.Contract) {
+	if item == nil || item.Kind != WorkItemNode {
+		return
+	}
+	for _, contract := range contracts {
+		if contract.ConsumerNodeID != item.NodeID {
+			continue
+		}
+		item.RequiredContracts = append(item.RequiredContracts, WorkContractDependency{
+			ID:                contract.ID,
+			Status:            contract.Status,
+			Revision:          contract.Revision,
+			ProducerNodeID:    contract.ProducerNodeID,
+			ConsumerNodeID:    contract.ConsumerNodeID,
+			Details:           contract.Details,
+			ArtifactAvailable: contract.Artifact != nil,
+		})
+	}
+	sort.SliceStable(item.RequiredContracts, func(i, j int) bool {
+		return item.RequiredContracts[i].ID < item.RequiredContracts[j].ID
+	})
+
+	contractIDs := make([]string, 0, len(item.RequiredContracts))
+	for _, dependency := range item.RequiredContracts {
+		contractIDs = append(contractIDs, dependency.ID)
+		entrypoint := strings.TrimSpace(dependency.Details.PublicEntrypoint)
+		if dependency.Status == coordination.StatusFulfilled {
+			item.RuntimeRequirements = append(item.RuntimeRequirements, fmt.Sprintf(
+				"Contract %s is Fulfilled at revision %d; use public entrypoint %q. Producer source is intentionally absent from this isolated workspace. Do not call contract-ensure again or search for peer files; use a test-local import mock for unit tests and the assembled integration run for the real artifact.",
+				dependency.ID, dependency.Revision, entrypoint,
+			))
+		} else {
+			item.RuntimeRequirements = append(item.RuntimeRequirements, fmt.Sprintf(
+				"Contract %s is currently %s; follow its lifecycle through the work inbox and do not invent or inspect the producer implementation.",
+				dependency.ID, dependency.Status,
+			))
+		}
+	}
+
+	for _, target := range item.TargetFiles {
+		if !isIntegrationDirectiveTarget(target) {
+			continue
+		}
+		required := "[]"
+		if data, err := json.Marshal(contractIDs); err == nil {
+			required = string(data)
+		}
+		item.RuntimeRequirements = append(item.RuntimeRequirements, fmt.Sprintf(
+			"%s is a reserved schema-v1 kernel execution manifest, not application input or configuration. Write exactly one JSON object with schema_version, id, command (absolute executable array), required_contracts=%s, owner_node_ids=[%q], and timeout_sec. Omit working_directory for the assembled workspace root. The command must verify this node against the real assembled contract artifacts.",
+			target, required, item.NodeID,
+		))
+	}
+}
+
+func isIntegrationDirectiveTarget(path string) bool {
+	path = strings.ReplaceAll(strings.TrimSpace(path), "\\", "/")
+	return strings.HasSuffix(path, ".json") && strings.Contains("/"+strings.TrimPrefix(path, "/"), "/integration/directives/")
+}
+
 func workItemForContract(contract coordination.Contract, agentID string, nodes map[string]dag.DagNode) (WorkItem, bool) {
+	details := contract.Details
 	item := WorkItem{
 		ContractID: contract.ID,
+		Revision:   contract.Revision,
 		Title:      contract.Details.Name,
 		Objective:  strings.Join(contract.Details.Acceptance, "; "),
+		Contract:   &details,
 		CreatedAt:  contract.CreatedAt,
 		UpdatedAt:  contract.UpdatedAt,
 	}

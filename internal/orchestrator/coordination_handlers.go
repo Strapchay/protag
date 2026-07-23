@@ -15,7 +15,7 @@ func (s *Server) coordinationPrincipal(agentID string) coordination.Principal {
 		return principal
 	}
 	for _, node := range s.dagManager.Snapshot().Nodes {
-		if strings.TrimSpace(node.AssignedAgent) == principal.AgentID {
+		if expectedAgentForNode(node.DomainID, node.AssignedAgent) == principal.AgentID {
 			principal.NodeIDs = append(principal.NodeIDs, node.ID)
 		}
 	}

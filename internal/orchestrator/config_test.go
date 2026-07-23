@@ -14,6 +14,11 @@ func setDefaultConfigEnv(t *testing.T) {
 	if err := godotenv.Overload(envPath); err != nil {
 		t.Fatalf("load test env %s: %v", envPath, err)
 	}
+	t.Setenv("AION_INTEGRATION_ENABLED", "true")
+	t.Setenv("AION_INTEGRATION_DIRECTIVE_DIR", "integration/directives")
+	t.Setenv("AION_INTEGRATION_TIMEOUT_SEC", "300")
+	t.Setenv("AION_INTEGRATION_MAX_OUTPUT_BYTES", "1048576")
+	t.Setenv("AION_INTEGRATION_MAX_DIRECTIVES", "128")
 }
 
 func TestLoadConfig(t *testing.T) {
@@ -33,6 +38,9 @@ func TestLoadConfig(t *testing.T) {
 	if config.Agents.MaxAgents != 4 {
 		t.Fatalf("expected 4 max agents, got %d", config.Agents.MaxAgents)
 	}
+	if config.Agents.IncompleteTurnRetries != 1 {
+		t.Fatalf("expected one incomplete-turn retry, got %d", config.Agents.IncompleteTurnRetries)
+	}
 	if !config.GatewayEnabled() {
 		t.Fatal("expected inference gateway to be enabled from test config")
 	}
@@ -47,6 +55,9 @@ func TestLoadConfig(t *testing.T) {
 	}
 	if config.Coordination.MaxNegotiationRounds != 3 || config.Coordination.MaxProcessAttempts != 2 {
 		t.Fatalf("unexpected coordination limits: %#v", config.Coordination)
+	}
+	if !config.Integration.Enabled || config.Integration.DirectiveDir != "integration/directives" {
+		t.Fatalf("unexpected integration config: %#v", config.Integration)
 	}
 }
 
@@ -66,11 +77,17 @@ func TestEnvExampleLoadsConfig(t *testing.T) {
 	if !config.GatewayEnabled() {
 		t.Fatal("expected env example to enable gateway mode")
 	}
-	if config.Inference.Coordinator.UseProfile != "oracle" {
+	if config.Inference.Coordinator.UseProfile != "forge" {
 		t.Fatalf("unexpected coordinator profile: %s", config.Inference.Coordinator.UseProfile)
+	}
+	if config.Inference.DomainAgents.UseProfile != "oracle" {
+		t.Fatalf("unexpected domain-agent profile: %s", config.Inference.DomainAgents.UseProfile)
 	}
 	if config.Inference.Models["forge"].Provider != "provider-beta" {
 		t.Fatalf("env example should use neutral provider labels, got %q", config.Inference.Models["forge"].Provider)
+	}
+	if !config.Integration.Enabled {
+		t.Fatal("expected env example to enable integration validation")
 	}
 }
 
@@ -107,6 +124,9 @@ func TestConfigDefaults(t *testing.T) {
 	}
 	if config.Health.CoordinatorPlannerArtifactTimeoutSec != 300 {
 		t.Fatalf("expected default coordinator artifact timeout 300s, got %d", config.Health.CoordinatorPlannerArtifactTimeoutSec)
+	}
+	if config.Health.CoordinatorPlannerTurnSettleTimeoutSec != 5 {
+		t.Fatalf("expected default coordinator turn settle timeout 5s, got %d", config.Health.CoordinatorPlannerTurnSettleTimeoutSec)
 	}
 	if config.Cgroups.Mode != "direct" {
 		t.Fatalf("expected default cgroup mode direct, got %q", config.Cgroups.Mode)

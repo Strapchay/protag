@@ -98,6 +98,7 @@ type AgentSupervisor struct {
 	lastThinking     string
 	lastText         string
 	isThinking       bool
+	autoRetryPending bool
 	recoveryPrompt   string
 	workspace        isolation.Workspace
 	workspaceGen     uint64
@@ -242,10 +243,9 @@ func (s *AgentSupervisor) spawnAgent(ctx context.Context) error {
 	s.mu.Unlock()
 
 	piConfig := s.config.PiAgent
-	resumeSession := piConfig.ResumeSession
 	s.mu.Lock()
 	launchPrompt := s.config.InitialPrompt
-	if resumeSession && strings.TrimSpace(s.recoveryPrompt) != "" {
+	if strings.TrimSpace(s.recoveryPrompt) != "" {
 		launchPrompt = s.recoveryPrompt
 	}
 	s.mu.Unlock()
@@ -456,11 +456,30 @@ func (s *AgentSupervisor) RestartWithPrompt(ctx context.Context, prompt string) 
 	return s.Start(ctx)
 }
 
+// RestartFreshWithPrompt starts a new Pi conversation in the existing session
+// directory. Older session files remain available for audit and UI history,
+// while the supplied prompt becomes the first turn of the new conversation.
+func (s *AgentSupervisor) RestartFreshWithPrompt(ctx context.Context, prompt string) error {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return fmt.Errorf("supervisor: fresh restart prompt is required")
+	}
+	s.mu.Lock()
+	s.recoveryPrompt = prompt
+	s.config.PiAgent.ResumeSession = false
+	s.mu.Unlock()
+	if err := s.Stop(); err != nil {
+		return err
+	}
+	return s.Start(ctx)
+}
+
 // SendPrompt sends an initial prompt to the Pi Agent.
 func (s *AgentSupervisor) SendPrompt(message string) error {
 	s.mu.Lock()
 	s.lastThinking = ""
 	s.lastText = ""
+	s.autoRetryPending = false
 	pa := s.piAgent
 	// Treat an accepted prompt command as an active turn immediately. Pi emits
 	// turn_start asynchronously, and leaving this false creates a dispatch race
@@ -495,7 +514,7 @@ func (s *AgentSupervisor) DeliverTurn(message string) error {
 	s.lastThinking = ""
 	s.lastText = ""
 	pa := s.piAgent
-	thinking := s.isThinking
+	thinking := s.isThinking || s.autoRetryPending
 	s.mu.Unlock()
 	if pa == nil {
 		return fmt.Errorf("agent not started")
@@ -524,7 +543,7 @@ func (s *AgentSupervisor) WaitForTurnIdle(ctx context.Context) error {
 	defer ticker.Stop()
 	for {
 		s.mu.Lock()
-		active := s.isThinking
+		active := s.isThinking || s.autoRetryPending
 		s.mu.Unlock()
 		if !active {
 			return nil
@@ -535,6 +554,23 @@ func (s *AgentSupervisor) WaitForTurnIdle(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+// TurnIdle reports whether Pi has completed its current agent loop. It lets a
+// scheduler defer this agent without blocking dispatch for unrelated domains.
+func (s *AgentSupervisor) TurnIdle() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.isThinking && !s.autoRetryPending
+}
+
+// TurnRetryPending reports whether Pi is retrying a failed inference turn
+// internally. The allocator must not inject its own incomplete-work retry while
+// this is true.
+func (s *AgentSupervisor) TurnRetryPending() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.autoRetryPending
 }
 
 // SendSteer sends a steer command to the Pi Agent.
@@ -665,11 +701,21 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 			return
 		}
 
+		if event.Type == "message_end" && strings.TrimSpace(pMsg.ErrorMessage) != "" {
+			s.emitLifecycle(AgentLifecycleEvent{Kind: "model_error", IsError: true, Error: pMsg.ErrorMessage})
+			s.emitStatus(fmt.Sprintf("%s inference turn failed: %s", s.displayLabel(), pMsg.ErrorMessage), "error")
+			if s.healthMonitor != nil {
+				s.healthMonitor.RecordHeartbeat()
+			}
+		}
+
 		// Extract both thinking and text
 		thinking := pMsg.FullThinking()
 		text := pMsg.FullText()
 
-		log.Printf("supervisor: agent %s broadcasting: thinkingLen=%d, textLen=%d", s.config.AgentID, len(thinking), len(text))
+		if event.Type != "message_update" {
+			log.Printf("supervisor: agent %s broadcasting: thinkingLen=%d, textLen=%d", s.config.AgentID, len(thinking), len(text))
+		}
 
 		thinkingEvent := event.Type == "thinking" || event.Type == "message_update" || event.Type == "message_start"
 		s.mu.Lock()
@@ -747,10 +793,19 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 		s.emitLifecycle(AgentLifecycleEvent{Kind: "tool_error", IsError: true, Error: event.ErrorMessage})
 		s.handleNetworkFault(event)
 	case "auto_retry_start":
+		s.mu.Lock()
+		s.autoRetryPending = true
+		s.isThinking = true
+		s.mu.Unlock()
+		if s.healthMonitor != nil {
+			s.healthMonitor.SetMonitoring(true)
+			s.healthMonitor.RecordHeartbeat()
+		}
 		s.emitStatus(fmt.Sprintf("Inference Retry %d/%d: %s", event.Attempt, event.MaxAttempts, event.ErrorMessage), "warn")
 	case "agent_end":
 		s.mu.Lock()
 		s.isThinking = false
+		s.autoRetryPending = false
 		s.mu.Unlock()
 		if s.healthMonitor != nil {
 			s.healthMonitor.SetMonitoring(false)

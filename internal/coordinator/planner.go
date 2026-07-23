@@ -177,6 +177,7 @@ func ValidatePlanResponse(plan *PlanResponse) error {
 		}
 	}
 	nodeIDs := make(map[string]struct{}, len(plan.Nodes))
+	nodeDomains := make(map[string]string, len(plan.Nodes))
 	for _, node := range plan.Nodes {
 		id := strings.TrimSpace(node.ID)
 		if id == "" {
@@ -195,10 +196,15 @@ func ValidatePlanResponse(plan *PlanResponse) error {
 			if IsProjectScanExcluded(path, DefaultProjectScanExcludes()) {
 				return fmt.Errorf("coordinator: node %q targets excluded path %q", id, path)
 			}
+			if isIntegrationDirectiveTarget(path) && strings.ToLower(filepath.Ext(strings.TrimSpace(path))) != ".json" {
+				return fmt.Errorf("coordinator: integration directive target %q must use a .json extension", path)
+			}
 		}
 		nodeIDs[id] = struct{}{}
+		nodeDomains[id] = strings.TrimSpace(node.DomainID)
 	}
 
+	edges := make(map[string]struct{}, len(plan.Edges))
 	for _, edge := range plan.Edges {
 		if edge.FromNode == "" || edge.ToNode == "" {
 			return fmt.Errorf("coordinator: edge endpoints are required")
@@ -212,6 +218,47 @@ func ValidatePlanResponse(plan *PlanResponse) error {
 		if _, ok := nodeIDs[edge.ToNode]; !ok {
 			return fmt.Errorf("coordinator: edge references unknown target node %q", edge.ToNode)
 		}
+		edges[edge.FromNode+"\x00"+edge.ToNode] = struct{}{}
+	}
+
+	contracts := make(map[string]struct{}, len(plan.Contracts))
+	for _, contract := range plan.Contracts {
+		resource := strings.TrimSpace(contract.Resource)
+		producer := strings.TrimSpace(contract.ProducerNode)
+		consumer := strings.TrimSpace(contract.ConsumerNode)
+		kind := strings.ToLower(strings.TrimSpace(contract.Kind))
+		if kind == "" {
+			kind = "interface"
+		}
+		if resource == "" || producer == "" || consumer == "" {
+			return fmt.Errorf("coordinator: planned contract resource and producer/consumer nodes are required")
+		}
+		if len(contract.Acceptance) == 0 {
+			return fmt.Errorf("coordinator: planned contract %q requires acceptance criteria", resource)
+		}
+		if kind == "interface" && strings.TrimSpace(contract.PublicEntrypoint) == "" {
+			return fmt.Errorf("coordinator: planned interface contract %q requires a public_entrypoint", resource)
+		}
+		if producer == consumer {
+			return fmt.Errorf("coordinator: planned contract %q cannot use the same producer and consumer node", resource)
+		}
+		if _, ok := nodeIDs[producer]; !ok {
+			return fmt.Errorf("coordinator: planned contract %q references unknown producer node %q", resource, producer)
+		}
+		if _, ok := nodeIDs[consumer]; !ok {
+			return fmt.Errorf("coordinator: planned contract %q references unknown consumer node %q", resource, consumer)
+		}
+		if nodeDomains[producer] == nodeDomains[consumer] {
+			return fmt.Errorf("coordinator: planned contract %q must cross domain boundaries", resource)
+		}
+		if _, ok := edges[producer+"\x00"+consumer]; !ok {
+			return fmt.Errorf("coordinator: planned contract %q requires dependency edge %s -> %s", resource, producer, consumer)
+		}
+		identity := producer + "\x00" + consumer + "\x00" + strings.ToLower(resource)
+		if _, exists := contracts[identity]; exists {
+			return fmt.Errorf("coordinator: duplicate planned contract %q between %s and %s", resource, producer, consumer)
+		}
+		contracts[identity] = struct{}{}
 	}
 
 	dagNodes := make([]dag.DagNode, 0, len(plan.Nodes))
@@ -234,6 +281,11 @@ func ValidatePlanResponse(plan *PlanResponse) error {
 	}
 
 	return nil
+}
+
+func isIntegrationDirectiveTarget(path string) bool {
+	clean := strings.TrimPrefix(filepath.ToSlash(filepath.Clean(strings.TrimSpace(path))), "./")
+	return strings.Contains("/"+clean, "/integration/directives/")
 }
 
 type narrativeSection struct {

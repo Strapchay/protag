@@ -20,6 +20,7 @@ func TestArchitectCommandHandlers(t *testing.T) {
 	stopAgentsCalled := false
 	capacityCalled := false
 	resetCalled := false
+	resetAgentCalled := false
 	s.SetArchitectStatusCallback(func() string { return "status=awaiting_user" })
 	s.SetArchitectRetryCallback(func() error {
 		retryCalled = true
@@ -50,6 +51,10 @@ func TestArchitectCommandHandlers(t *testing.T) {
 		resetCalled = true
 		return nil
 	})
+	s.SetResetAgentSessionCallback(func(agentID, prompt string) error {
+		resetAgentCalled = agentID == "agent-api" && prompt == "repair the boundary"
+		return nil
+	})
 
 	if resp := s.handleRequest(Request{ID: "1", Method: "architect-status"}); resp.Error != "" {
 		t.Fatalf("architect-status error: %s", resp.Error)
@@ -78,6 +83,10 @@ func TestArchitectCommandHandlers(t *testing.T) {
 	params, _ := json.Marshal(map[string]int{"capacity": 3})
 	if resp := s.handleRequest(Request{ID: "9", Method: "set-gateway-capacity", Params: params}); resp.Error != "" || !capacityCalled {
 		t.Fatalf("set-gateway-capacity resp=%#v called=%v", resp, capacityCalled)
+	}
+	resetAgentParams, _ := json.Marshal(map[string]string{"agent_id": "agent-api", "text": "repair the boundary"})
+	if resp := s.handleRequest(Request{ID: "10", Method: "reset-agent-session", Params: resetAgentParams}); resp.Error != "" || !resetAgentCalled {
+		t.Fatalf("reset-agent-session resp=%#v called=%v", resp, resetAgentCalled)
 	}
 }
 
@@ -116,12 +125,37 @@ func TestCompletedNodeResolvesIncompleteAgentRecovery(t *testing.T) {
 	t.Fatalf("task completion did not resolve agent-level incomplete recovery: %+v", resolutions)
 }
 
+func TestResumedNodeResolvesBlockedTaskRecovery(t *testing.T) {
+	s := NewServer(newTestDagManager(t), locking.NewManager(nil), nil, nil)
+	var resolved []string
+	s.SetRecoveryResolvedCallback(func(kind, nodeID, agentID string) {
+		resolved = append(resolved, kind+":"+nodeID)
+	})
+
+	node := dag.DagNode{ID: "api-node", DomainID: "api"}
+	s.recordNodeProgressFact(node, dag.StatusPending)
+	s.recordNodeProgressFact(node, dag.StatusInProgress)
+
+	blockedResolutions := 0
+	for _, got := range resolved {
+		if got == "task_blocked:api-node" {
+			blockedResolutions++
+		}
+	}
+	if blockedResolutions != 2 {
+		t.Fatalf("blocked recovery resolutions = %v", resolved)
+	}
+}
+
 func TestDebugStatusReportsRuntimeSnapshot(t *testing.T) {
 	s := NewServer(newTestDagManager(t), locking.NewManager(nil), nil, nil)
 	dir := t.TempDir()
 	s.SetLogsDir(dir)
 	s.SetLogLevel("debug")
 	s.SetBuildSpecStatusCallback(func() string { return "active" })
+	s.SetIntegrationStatusCallback(func() IntegrationRunStatus {
+		return IntegrationRunStatus{Enabled: true, Status: IntegrationRunning, DirectiveCount: 2}
+	})
 	s.SetAgentListCallback(func() []AgentInfo {
 		return []AgentInfo{{AgentID: "agent-api", DomainID: "api", State: "Running"}}
 	})
@@ -143,6 +177,31 @@ func TestDebugStatusReportsRuntimeSnapshot(t *testing.T) {
 	}
 	if result["hub_snapshot_count"] != 1 {
 		t.Fatalf("unexpected hub snapshot count: %#v", result["hub_snapshot_count"])
+	}
+	integration, ok := result["integration"].(IntegrationRunStatus)
+	if !ok || integration.Status != IntegrationRunning || integration.DirectiveCount != 2 {
+		t.Fatalf("unexpected integration status: %#v", result["integration"])
+	}
+}
+
+func TestIntegrationCommandHandlers(t *testing.T) {
+	s := NewServer(newTestDagManager(t), locking.NewManager(nil), nil, nil)
+	s.SetIntegrationStatusCallback(func() IntegrationRunStatus {
+		return IntegrationRunStatus{Enabled: true, Status: IntegrationFailed, DirectiveCount: 1}
+	})
+	retried := false
+	s.SetIntegrationRetryCallback(func() error {
+		retried = true
+		return nil
+	})
+	status := s.handleRequest(Request{ID: "integration-status", Method: "integration-status"})
+	got, ok := status.Result.(IntegrationRunStatus)
+	if status.Error != "" || !ok || got.Status != IntegrationFailed {
+		t.Fatalf("integration status response = %#v", status)
+	}
+	retry := s.handleRequest(Request{ID: "integration-run", Method: "integration-run"})
+	if retry.Error != "" || !retried {
+		t.Fatalf("integration retry response = %#v retried=%v", retry, retried)
 	}
 }
 

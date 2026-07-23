@@ -17,11 +17,6 @@ import (
 	isolation "aion-isolation"
 )
 
-type readCloserWrapper struct {
-	io.Reader
-	io.Closer
-}
-
 // PiAgentConfig configures a Pi Agent subprocess.
 type PiAgentConfig struct {
 	// Provider is the LLM provider resolved from a profile codename (e.g., oracle, harbor).
@@ -92,9 +87,11 @@ type PiMessageContent struct {
 
 // PiMessage represents a normalized message from the Pi agent.
 type PiMessage struct {
-	Role       string             `json:"role"`
-	Content    []PiMessageContent `json:"content,omitempty"`
-	RawContent json.RawMessage    `json:"content_raw,omitempty"` // For internal polymorphic unmarshaling
+	Role         string             `json:"role"`
+	Content      []PiMessageContent `json:"content,omitempty"`
+	RawContent   json.RawMessage    `json:"content_raw,omitempty"` // For internal polymorphic unmarshaling
+	StopReason   string             `json:"stopReason,omitempty"`
+	ErrorMessage string             `json:"errorMessage,omitempty"`
 }
 
 // UnmarshalJSON implements custom unmarshaling for PiMessage to handle string or array 'content'.
@@ -198,7 +195,7 @@ func (e *PiAgentEvent) ParseMessage() (*PiMessage, error) {
 	// Waterfall Level 4: Try explicit 'Message' field (standard/final)
 	if len(e.Message) > 0 {
 		var msg PiMessage
-		if err := json.Unmarshal(e.Message, &msg); err == nil && (len(msg.Content) > 0 || msg.Role != "") {
+		if err := json.Unmarshal(e.Message, &msg); err == nil && (len(msg.Content) > 0 || msg.Role != "" || msg.ErrorMessage != "") {
 			return &msg, nil
 		}
 	}
@@ -219,15 +216,18 @@ func (e *PiAgentEvent) ParseMessage() (*PiMessage, error) {
 
 // PiAgentProcess manages a running Pi Agent subprocess.
 type PiAgentProcess struct {
-	mu      sync.Mutex
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	stdout  io.ReadCloser
-	pid     int
-	pgid    int
-	events  chan PiAgentEvent
-	done    chan struct{}
-	running bool
+	mu         sync.Mutex
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	stdout     io.ReadCloser
+	pid        int
+	pgid       int
+	events     chan PiAgentEvent
+	done       chan struct{}
+	readerDone chan struct{}
+	rawLog     *os.File
+	waitErr    error
+	running    bool
 }
 
 // SpawnPiAgent starts a new Pi Agent subprocess in RPC mode.
@@ -323,15 +323,6 @@ func SpawnPiAgent(ctx context.Context, config PiAgentConfig) (*PiAgentProcess, e
 		return nil, fmt.Errorf("piagent: stdout pipe: %w", err)
 	}
 
-	var stdout io.ReadCloser = stdoutPipe
-	if logFile != nil {
-		// Write everything from stdout to the log file too
-		stdout = &readCloserWrapper{
-			Reader: io.TeeReader(stdoutPipe, logFile),
-			Closer: stdoutPipe,
-		}
-	}
-
 	if err := cmd.Start(); err != nil {
 		if logFile != nil {
 			_ = logFile.Close()
@@ -345,14 +336,16 @@ func SpawnPiAgent(ctx context.Context, config PiAgentConfig) (*PiAgentProcess, e
 	}
 
 	p := &PiAgentProcess{
-		cmd:     cmd,
-		stdin:   stdin,
-		stdout:  stdout,
-		pid:     cmd.Process.Pid,
-		pgid:    pgid,
-		events:  make(chan PiAgentEvent, 64),
-		done:    make(chan struct{}),
-		running: true,
+		cmd:        cmd,
+		stdin:      stdin,
+		stdout:     stdoutPipe,
+		pid:        cmd.Process.Pid,
+		pgid:       pgid,
+		events:     make(chan PiAgentEvent, 64),
+		done:       make(chan struct{}),
+		readerDone: make(chan struct{}),
+		rawLog:     logFile,
+		running:    true,
 	}
 
 	// Start event reader goroutine
@@ -499,7 +492,9 @@ func (p *PiAgentProcess) Kill() error {
 // Wait waits for the process to exit and returns the error.
 func (p *PiAgentProcess) Wait() error {
 	<-p.done
-	return p.cmd.Wait()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.waitErr
 }
 
 // IsAlive returns whether the process is still running.
@@ -542,6 +537,7 @@ func (p *PiAgentProcess) writeJSON(data interface{}) error {
 
 func (p *PiAgentProcess) readEvents() {
 	defer close(p.events)
+	defer close(p.readerDone)
 
 	scanner := bufio.NewScanner(p.stdout)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB max line
@@ -554,8 +550,12 @@ func (p *PiAgentProcess) readEvents() {
 
 		var event PiAgentEvent
 		if err := json.Unmarshal(line, &event); err != nil {
+			p.persistRawEvent(line)
 			log.Printf("piagent: malformed event: %v (line: %s)", err, string(line))
 			continue
+		}
+		if shouldPersistRawEvent(event.Type) {
+			p.persistRawEvent(line)
 		}
 
 		p.events <- event
@@ -563,9 +563,33 @@ func (p *PiAgentProcess) readEvents() {
 }
 
 func (p *PiAgentProcess) waitForExit() {
-	p.cmd.Wait()
+	err := p.cmd.Wait()
+	<-p.readerDone
 	p.mu.Lock()
 	p.running = false
+	p.waitErr = err
+	if p.rawLog != nil {
+		_ = p.rawLog.Close()
+		p.rawLog = nil
+	}
 	p.mu.Unlock()
 	close(p.done)
+}
+
+func shouldPersistRawEvent(eventType string) bool {
+	// Pi's message_update payload contains the full partial assistant message on
+	// every token. Persisting each update makes a short turn consume hundreds of
+	// megabytes. message_end retains the complete response, while dedicated tool
+	// and lifecycle events preserve the useful diagnostics.
+	return strings.TrimSpace(eventType) != "message_update"
+}
+
+func (p *PiAgentProcess) persistRawEvent(line []byte) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.rawLog == nil {
+		return
+	}
+	_, _ = p.rawLog.Write(line)
+	_, _ = p.rawLog.Write([]byte{'\n'})
 }

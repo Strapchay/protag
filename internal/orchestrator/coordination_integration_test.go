@@ -243,6 +243,26 @@ func TestKernelCoordinationLifecycleAuthorizesArtifactsAndDefersCompletion(t *te
 	if node, _ := fixture.dag.GetNode("provider-node"); node.Status != dag.StatusDone {
 		t.Fatalf("provider node status = %s, want Done after contract fulfillment", node.Status)
 	}
+	retriedCompletion := callCoordinationServer(t, fixture.server, "update-node", fixture.capabilities[producerAgent], map[string]any{
+		"node_id":  "provider-node",
+		"agent_id": producerAgent,
+		"status":   "Done",
+	})
+	if retriedCompletion.Error != "" {
+		t.Fatalf("retry completed node: %s", retriedCompletion.Error)
+	}
+	if node, _ := fixture.dag.GetNode("provider-node"); node.Status != dag.StatusDone {
+		t.Fatalf("completion retry regressed provider node to %s", node.Status)
+	}
+	if err := fixture.dag.UpdateNode("provider-node", dag.StatusBlocked); err != nil {
+		t.Fatalf("simulate regressed completion projection: %v", err)
+	}
+	if err := recoverAcknowledgedNodeCompletions(fixture.dag, fixture.manager); err != nil {
+		t.Fatalf("recover acknowledged completion: %v", err)
+	}
+	if node, _ := fixture.dag.GetNode("provider-node"); node.Status != dag.StatusDone {
+		t.Fatalf("completion receipt recovery left provider node %s", node.Status)
+	}
 	if fixture.agents[producerAgent].hasMessage(hub.MsgContractFulfilled) {
 		t.Fatal("status-only ContractFulfilled effect started a producer agent turn")
 	}
@@ -257,6 +277,83 @@ func TestKernelCoordinationLifecycleAuthorizesArtifactsAndDefersCompletion(t *te
 	}
 	if !foundFulfilled {
 		t.Fatal("ContractFulfilled effect was not projected to observable Hub history")
+	}
+}
+
+func TestKernelCoordinationAuthorizesExpectedAgentBeforeNodeDispatch(t *testing.T) {
+	fixture := newCoordinationKernelFixture(t,
+		dag.DagNode{ID: "provider-node", DomainID: "provider", Status: dag.StatusPending},
+		dag.DagNode{ID: "consumer-node", DomainID: "consumer", Status: dag.StatusPending},
+	)
+	contract := coordinationContract(
+		"contract-pre-dispatch",
+		"agent-provider", "provider-node",
+		"agent-consumer", "consumer-node",
+	)
+	requested := decodeCoordinationResult[coordination.Contract](t, callCoordinationServer(
+		t, fixture.server, "contract-request", fixture.capabilities["agent-consumer"], map[string]any{
+			"command_id": "request-pre-dispatch", "contract": contract,
+		},
+	))
+	if requested.Status != coordination.StatusRequested {
+		t.Fatalf("contract status = %s, want Requested", requested.Status)
+	}
+	published := decodeCoordinationResult[coordination.Contract](t, callCoordinationServer(
+		t, fixture.server, "contract-publish", fixture.capabilities["agent-provider"], map[string]any{
+			"command_id": "publish-pre-dispatch", "contract_id": contract.ID,
+			"expected_revision": 0, "content": []byte("public boundary"),
+		},
+	))
+	if published.Status != coordination.StatusProduced {
+		t.Fatalf("contract status = %s, want Produced", published.Status)
+	}
+}
+
+func TestResumeCoordinationNodePreservesAllocationBoundary(t *testing.T) {
+	fixture := newCoordinationKernelFixture(t,
+		dag.DagNode{ID: "planned-consumer", DomainID: "consumer", Status: dag.StatusBlocked},
+		dag.DagNode{ID: "paused-consumer", DomainID: "consumer", AssignedAgent: "agent-consumer", Status: dag.StatusBlocked},
+	)
+
+	if err := fixture.daemon.resumeCoordinationNode("planned-consumer"); err != nil {
+		t.Fatalf("resume unassigned consumer: %v", err)
+	}
+	planned, err := fixture.dag.GetNode("planned-consumer")
+	if err != nil {
+		t.Fatalf("read unassigned consumer: %v", err)
+	}
+	if planned.Status != dag.StatusPending || planned.AssignedAgent != "" {
+		t.Fatalf("unassigned consumer = %+v, want Pending without an owner", planned)
+	}
+
+	if err := fixture.daemon.resumeCoordinationNode("paused-consumer"); err != nil {
+		t.Fatalf("resume assigned consumer: %v", err)
+	}
+	paused, err := fixture.dag.GetNode("paused-consumer")
+	if err != nil {
+		t.Fatalf("read assigned consumer: %v", err)
+	}
+	if paused.Status != dag.StatusInProgress || paused.AssignedAgent != "agent-consumer" {
+		t.Fatalf("assigned consumer = %+v, want InProgress with its owner", paused)
+	}
+}
+
+func TestRecoverUnassignedInProgressNodes(t *testing.T) {
+	fixture := newCoordinationKernelFixture(t,
+		dag.DagNode{ID: "orphaned-active", DomainID: "consumer", Status: dag.StatusInProgress},
+		dag.DagNode{ID: "owned-active", DomainID: "provider", AssignedAgent: "agent-provider", Status: dag.StatusInProgress},
+	)
+
+	if err := recoverUnassignedInProgressNodes(fixture.dag); err != nil {
+		t.Fatalf("recover unassigned active nodes: %v", err)
+	}
+	orphaned, _ := fixture.dag.GetNode("orphaned-active")
+	if orphaned.Status != dag.StatusPending {
+		t.Fatalf("orphaned node status = %s, want Pending", orphaned.Status)
+	}
+	owned, _ := fixture.dag.GetNode("owned-active")
+	if owned.Status != dag.StatusInProgress || owned.AssignedAgent != "agent-provider" {
+		t.Fatalf("owned active node changed: %+v", owned)
 	}
 }
 

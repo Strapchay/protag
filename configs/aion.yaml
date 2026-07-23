@@ -28,6 +28,8 @@ health:
   coordinator_planner_first_request_timeout_sec: ${AION_COORDINATOR_PLANNER_FIRST_REQUEST_TIMEOUT_SEC}
   # Seconds allowed after prompt dispatch for Coordinator to write the plan artifact
   coordinator_planner_artifact_timeout_sec: ${AION_COORDINATOR_PLANNER_ARTIFACT_TIMEOUT_SEC}
+  # Quiet period after the last Coordinator gateway request before a missing artifact is corrected
+  coordinator_planner_turn_settle_timeout_sec: ${AION_COORDINATOR_PLANNER_TURN_SETTLE_TIMEOUT_SEC}
 
 execution:
   # Request-control mode. "gateway" routes Pi provider traffic through Aion.
@@ -72,6 +74,16 @@ isolation:
   runtime_base: "${AION_ISOLATION_RUNTIME_BASE}"
   # "isolated" removes network access; mounted Unix sockets provide kernel IPC
   network: "${AION_ISOLATION_NETWORK}"
+
+integration:
+  # Kernel-owned validation starts only after DAG and contract work is terminal.
+  enabled: ${AION_INTEGRATION_ENABLED}
+  # Each assigned domain may publish JSON directives beneath this relative path.
+  directive_dir: "${AION_INTEGRATION_DIRECTIVE_DIR}"
+  # Per-directive sandbox timeout and bounded captured output.
+  timeout_sec: ${AION_INTEGRATION_TIMEOUT_SEC}
+  max_output_bytes: ${AION_INTEGRATION_MAX_OUTPUT_BYTES}
+  max_directives: ${AION_INTEGRATION_MAX_DIRECTIVES}
 
 cgroups:
   # Enable cgroup resource limits (requires Linux + permissions)
@@ -134,6 +146,8 @@ agents:
   session_dir: "${AION_AGENT_SESSION_DIR}"
   # Maximum concurrent domain agents
   max_agents: ${AION_MAX_AGENTS}
+  # Direct prompt retries when Pi ends an uncheckpointed turn with active work
+  incomplete_turn_retries: ${AION_AGENT_INCOMPLETE_TURN_RETRIES}
   # Path to the Pi binary
   command_path: "${AION_AGENT_COMMAND_PATH}"
   # Optional explicit path to the matching orchestrator CLI. When empty, the
@@ -144,7 +158,8 @@ agents:
     - "${AION_AGENT_SKILL_PATH}"
   extension_paths:
     - "${AION_PI_GATEWAY_EXTENSION_PATH}"
-  # Files that cannot be locked directly — must use Utility Agent
+  # Approved shared metadata. These are copied by digest into the integration
+  # artifact bundle; they are never exposed by mounting the project root.
   shared_files:
     - "go.mod"
     - "go.sum"

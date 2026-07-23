@@ -591,6 +591,8 @@ func parseCommand(command string, args []string) (map[string]interface{}, error)
 		return map[string]interface{}{}, nil
 	case "build-progress":
 		return map[string]interface{}{}, nil
+	case "integration-status", "integration-run":
+		return map[string]interface{}{}, nil
 	case "stop-agents":
 		return map[string]interface{}{}, nil
 	case "set-gateway-capacity":
@@ -615,7 +617,12 @@ func requiredPositiveRevision(flags map[string]string, command string) (int64, e
 
 func writeFetchedContract(raw json.RawMessage, outputPath string) error {
 	if strings.TrimSpace(outputPath) == "" {
-		return fmt.Errorf("contract-fetch requires --output <path>")
+		return fmt.Errorf("contract-fetch requires --output <file-path>")
+	}
+	if info, err := os.Stat(outputPath); err == nil && info.IsDir() {
+		return fmt.Errorf("contract-fetch --output must name a regular file, got directory %q", outputPath)
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("inspect artifact output path: %w", err)
 	}
 	var result struct {
 		Contract interface{} `json:"contract"`
@@ -698,6 +705,7 @@ func printDebugStatus(raw json.RawMessage, pretty bool, key string) error {
 		"last_hub_event_at",
 		"inference_gateway",
 		"coordination",
+		"integration",
 		"agents",
 	}
 	printed := map[string]bool{}
@@ -813,7 +821,7 @@ Commands:
 	contract-request  --contract '<json>'
 	contract-ensure   --producer-node <id> --consumer-node <id> --resource <name> [--details '<json>'|--details-file <path>] [--wait]
 	contract-publish  --contract-id <id> --artifact-file <path> [--expected-revision N]
-	contract-fetch    --contract-id <id> [--revision N] --output <path>
+	contract-fetch    --contract-id <id> [--revision N] --output <file-path>
 	contract-validate --contract-id <id> --revision <N> [--evidence '<json>']
 	contract-correct  --contract-id <id> --revision <N> --reason <text>
 	contract-propose-terms --contract-id <id> --revision <N> --terms '<json>' --rationale <text>
@@ -834,6 +842,8 @@ Commands:
   query-memory    --text <query> [--top-k N]
   debug-status    Print server/run/hub/DAG/agent diagnostics [--pretty|-p] [--key <field>]
   build-progress  Print current build-spec progress projection
+  integration-status  Print the durable integration validation state
+  integration-run     Retry integration validation for the current build
   set-gateway-capacity --capacity <N>  Change runtime inference concurrency
   stop-agents     Pause active domain agents; resume with /continue-agents
   dashboard       Launch real-time monitoring TUI [--verbose]

@@ -20,7 +20,7 @@ This skill provides the `orchestrator-cli` tool for coordinating with the Aion-K
 
 ### `orchestrator-cli work-inbox [--current]`
 
-Read the kernel-owned projection of your active, ready, waiting, and recently completed work. `--current` returns the active item when one exists, otherwise the highest-ranked ready item. Run it at the start of every dispatched turn and process only that item.
+Read the kernel-owned projection of your active, ready, waiting, and recently completed work. `--current` returns the active item when one exists, otherwise the highest-ranked dispatched contract item. A pending DAG node remains waiting until the allocator assigns it and changes it to `active`; never claim or execute an unassigned node. Run this command at the start of every dispatched turn and process only the returned item.
 
 For a `dag_node` item, `id` and `node_id` are the same raw DAG node ID; pass
 that value to both `update-node --node-id` and `work-checkpoint --item`. For a
@@ -90,8 +90,10 @@ Request a fully specified versioned artifact with an explicit contract ID. Prefe
 # Producer publishes a concrete artifact. Revision 0 means none exists yet.
 orchestrator-cli contract-publish --contract-id <id> --artifact-file <path> --expected-revision 0
 
-# Consumer materializes an immutable revision in its own workspace.
-orchestrator-cli contract-fetch --contract-id <id> --revision 1 --output <path>
+# Consumer materializes an immutable public descriptor at a regular file path.
+# The artifact describes the public surface; producer source stays isolated and
+# behavioral acceptance runs later in the assembled integration workspace.
+orchestrator-cli contract-fetch --contract-id <id> --revision 1 --output /tmp/aion-contract-<id>-r1.json
 
 # Consumer accepts it or requests a corrected revision.
 orchestrator-cli contract-validate --contract-id <id> --revision 1 --evidence '{"tests":"passed"}'
@@ -132,6 +134,21 @@ unrelated work. Agents never own the reconciliation lease or modify ownership.
 - `split-node --node-id <uuid> --into '<json>'` splits a task that is too large.
 - `read-dag [--node-id <uuid>]` reads the current DAG or one node.
 - `heartbeat --agent-id <uuid>` reports liveness during long local operations.
+
+### Integration directives
+
+When a domain has an executable public acceptance check, publish one schema-v1
+JSON directive beneath `<assigned-path>/integration/directives/`. Use an
+absolute `/usr` or `/bin` command array and include at least one
+`owner_node_ids` entry from your domain. List every consumed public artifact in
+`required_contracts`. Omit `working_directory` when the command crosses domain
+boundaries so the runner uses the assembled `/workspace` root. The kernel runs
+these directives only after DAG and coordination work are terminal, in a
+network-isolated assembled workspace where all domain outputs and contracts are
+read-only. Validate the JSON and your owned unit tests, then complete the node;
+do not search for peer source or execute a cross-domain directive from the
+Domain Agent workspace. Do not run `integration-run` from a Domain Agent;
+retry authority is an operator action.
 
 ## Execution Loop
 

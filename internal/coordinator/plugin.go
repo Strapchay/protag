@@ -63,8 +63,22 @@ type PlanResponse struct {
 	Nodes []TaskNode `json:"nodes"`
 	// Edges are the dependency edges.
 	Edges []TaskEdge `json:"edges"`
+	// Contracts are durable cross-domain artifacts required by planned nodes.
+	Contracts []PlannedContract `json:"contracts,omitempty"`
 	// Milestones are optional client-facing capability groupings for progress.
 	Milestones []Milestone `json:"milestones,omitempty"`
+}
+
+// PlannedContract declares one producer/consumer artifact before agents run.
+type PlannedContract struct {
+	Resource         string   `json:"resource"`
+	ProducerNode     string   `json:"producer_node"`
+	ConsumerNode     string   `json:"consumer_node"`
+	Kind             string   `json:"kind,omitempty"`
+	Language         string   `json:"language,omitempty"`
+	PublicEntrypoint string   `json:"public_entrypoint,omitempty"`
+	Acceptance       []string `json:"acceptance,omitempty"`
+	HardWait         bool     `json:"hard_wait,omitempty"`
 }
 
 // Domain describes an area of responsibility.

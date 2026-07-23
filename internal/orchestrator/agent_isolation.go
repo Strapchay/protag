@@ -115,11 +115,11 @@ func (a *Allocator) prepareIsolatedAgentRuntime(agentID string, domain coordinat
 	}
 	policy.ReadOnly = append(policy.ReadOnly, runtimeMounts...)
 
-	skills, skillMounts, err := resolveAgentResources(projectRoot, a.config.Agents.SkillPaths)
+	skills, skillMounts, err := resolveAgentResources(projectRoot, a.config.Agents.SkillPaths, "/runtime/skills")
 	if err != nil {
 		return isolatedAgentRuntime{}, fmt.Errorf("allocator: resolve agent skills: %w", err)
 	}
-	extensions, extensionMounts, err := resolveAgentResources(projectRoot, a.config.Agents.ExtensionPaths)
+	extensions, extensionMounts, err := resolveAgentResources(projectRoot, a.config.Agents.ExtensionPaths, "/runtime/extensions")
 	if err != nil {
 		return isolatedAgentRuntime{}, fmt.Errorf("allocator: resolve agent extensions: %w", err)
 	}
@@ -211,36 +211,67 @@ func resolveAgentBinary(configured string) (string, []isolation.Mount, string, e
 	if err != nil {
 		return "", nil, "", fmt.Errorf("allocator: resolve Pi binary: %w", err)
 	}
-	if pathWithinRoot(resolved, "/usr") {
-		return resolved, nil, filepath.Dir(resolved), nil
-	}
-
-	clean := filepath.ToSlash(resolved)
-	if index := strings.LastIndex(clean, "/bin/"); index > 0 {
-		runtimeRoot := filepath.FromSlash(clean[:index])
-		if info, statErr := os.Stat(runtimeRoot); statErr == nil && info.IsDir() {
-			return resolved, []isolation.Mount{{
-				Source: runtimeRoot,
-				Target: filepath.ToSlash(runtimeRoot),
-				Kind:   isolation.MountDirectory,
-			}}, filepath.ToSlash(filepath.Join(runtimeRoot, "bin")), nil
-		}
-	}
-
 	realPath, err := filepath.EvalSymlinks(resolved)
 	if err != nil {
 		return "", nil, "", fmt.Errorf("allocator: resolve Pi binary symlink: %w", err)
 	}
-	if pathWithinRoot(realPath, "/usr") {
+	if pathWithinRoot(resolved, "/usr") && pathWithinRoot(realPath, "/usr") {
 		return realPath, nil, filepath.Dir(realPath), nil
 	}
-	return realPath, []isolation.Mount{{Source: realPath, Target: filepath.ToSlash(realPath), Kind: isolation.MountFile}}, "", nil
+
+	if packageRoot, ok := findNodePackageRoot(realPath); ok {
+		relativeCLI, relErr := filepath.Rel(packageRoot, realPath)
+		if relErr != nil || relativeCLI == "." || strings.HasPrefix(relativeCLI, ".."+string(filepath.Separator)) {
+			return "", nil, "", fmt.Errorf("allocator: resolve Pi package entrypoint: %w", relErr)
+		}
+		mounts := []isolation.Mount{{
+			Source: packageRoot,
+			Target: "/runtime/pi",
+			Kind:   isolation.MountDirectory,
+		}}
+		nodePath, lookErr := exec.LookPath("node")
+		if lookErr != nil {
+			return "", nil, "", fmt.Errorf("allocator: locate Node runtime for Pi: %w", lookErr)
+		}
+		nodePath, err = resolveExecutableFile(nodePath, "Node runtime for Pi")
+		if err != nil {
+			return "", nil, "", err
+		}
+		if !pathWithinRoot(nodePath, "/usr") {
+			mounts = append(mounts, isolation.Mount{
+				Source: nodePath,
+				Target: "/runtime/bin/node",
+				Kind:   isolation.MountFile,
+			})
+		}
+		return filepath.ToSlash(filepath.Join("/runtime/pi", relativeCLI)), mounts, "/runtime/bin", nil
+	}
+
+	return "/runtime/bin/pi", []isolation.Mount{{
+		Source: realPath,
+		Target: "/runtime/bin/pi",
+		Kind:   isolation.MountFile,
+	}}, "/runtime/bin", nil
 }
 
-func resolveAgentResources(projectRoot string, configured []string) ([]string, []isolation.Mount, error) {
+func findNodePackageRoot(entrypoint string) (string, bool) {
+	dir := filepath.Dir(entrypoint)
+	for {
+		if info, err := os.Stat(filepath.Join(dir, "package.json")); err == nil && info.Mode().IsRegular() {
+			return dir, true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", false
+		}
+		dir = parent
+	}
+}
+
+func resolveAgentResources(projectRoot string, configured []string, targetRoot string) ([]string, []isolation.Mount, error) {
 	paths := make([]string, 0, len(configured))
 	mounts := make([]isolation.Mount, 0, len(configured))
-	for _, raw := range configured {
+	for index, raw := range configured {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
 			continue
@@ -261,8 +292,13 @@ func resolveAgentResources(projectRoot string, configured []string) ([]string, [
 		if info.IsDir() {
 			kind = isolation.MountDirectory
 		}
-		paths = append(paths, resolved)
-		mounts = append(mounts, isolation.Mount{Source: resolved, Target: filepath.ToSlash(resolved), Kind: kind})
+		name := strings.TrimSpace(filepath.Base(resolved))
+		if name == "" || name == "." || name == string(filepath.Separator) {
+			name = "resource"
+		}
+		target := filepath.ToSlash(filepath.Join(targetRoot, fmt.Sprintf("%02d-%s", index, name)))
+		paths = append(paths, target)
+		mounts = append(mounts, isolation.Mount{Source: resolved, Target: target, Kind: kind})
 	}
 	return paths, mounts, nil
 }

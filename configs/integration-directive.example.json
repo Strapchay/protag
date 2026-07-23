@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "domain-acceptance",
+  "description": "Run the domain's public acceptance checks in the assembled workspace.",
+  "command": [
+    "/usr/bin/env",
+    "go",
+    "test",
+    "./..."
+  ],
+  "working_directory": "path-owned-by-domain",
+  "required_contracts": [],
+  "owner_node_ids": [],
+  "timeout_sec": 120
+}

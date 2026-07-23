@@ -19,7 +19,7 @@ cd kernel && go build -o skills/orchestrator-cli/bin/orchestrator-cli ./cmd/orch
 | `update-node` | `--node-id`, `--status`; agent identity via `--agent-id` or env | Update an assigned task status |
 | `contract-request` | `--contract` | Request a versioned cross-domain artifact |
 | `contract-publish` | `--contract-id`, `--artifact-file` | Publish the next immutable artifact revision |
-| `contract-fetch` | `--contract-id`, `--output` | Materialize an artifact revision locally |
+| `contract-fetch` | `--contract-id`, `--output <file-path>` | Materialize a public artifact descriptor locally |
 | `contract-validate` | `--contract-id`, `--revision` | Accept a produced revision |
 | `contract-correct` | `--contract-id`, `--revision`, `--reason` | Reject a revision and request correction |
 | `contract-propose-terms` | `--contract-id`, `--revision`, `--terms`, `--rationale` | Propose immutable bilateral terms |

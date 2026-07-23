@@ -388,6 +388,13 @@ func (d *Daemon) resumeCoordinationNode(nodeID string) error {
 	if node.Status != dag.StatusBlocked {
 		return nil
 	}
+	// A planned hard-wait contract can block its consumer before the allocator
+	// has ever assigned that node. Return such nodes to Pending so normal
+	// allocation durably records ownership before moving them InProgress and
+	// delivering the task prompt. Already-owned nodes are resuming paused work.
+	if strings.TrimSpace(node.AssignedAgent) == "" {
+		return d.setCoordinationNodeStatus(nodeID, dag.StatusPending)
+	}
 	return d.setCoordinationNodeStatus(nodeID, dag.StatusInProgress)
 }
 

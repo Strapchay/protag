@@ -53,6 +53,8 @@ type Server struct {
 	hubCallback                func(hub.Message) // called when hub messages need routing
 	replanCb                   func()
 	reviveCb                   func(string) error
+	resetAgentSessionCb        func(string, string) error
+	nodeCompletionValidatorCb  func(string, string) error
 	buildSpecCb                func(string) // called when user issues /build-spec
 	refineCb                   func(string) // called when user sends message to orchestrator
 	retryCb                    func() error
@@ -74,6 +76,8 @@ type Server struct {
 	behaviorCb                 func(agentID, domainID, kind, evidence string)
 	inferenceGatewayStatusCb   func() InferenceGatewayStatus
 	inferenceGatewayCapacityCb func(int) (InferenceGatewayStatus, error)
+	integrationStatusCb        func() IntegrationRunStatus
+	integrationRetryCb         func() error
 	stopBuildSpecAgentsCb      func() error
 	agentListCb                func() []AgentInfo
 	coordinationEffectsCb      func()
@@ -169,6 +173,14 @@ func (s *Server) SetReplanCallback(cb func()) {
 
 func (s *Server) SetReviveCallback(cb func(string) error) {
 	s.reviveCb = cb
+}
+
+func (s *Server) SetResetAgentSessionCallback(cb func(string, string) error) {
+	s.resetAgentSessionCb = cb
+}
+
+func (s *Server) SetNodeCompletionValidatorCallback(cb func(nodeID, agentID string) error) {
+	s.nodeCompletionValidatorCb = cb
 }
 
 func (s *Server) SetBuildSpecCallback(cb func(string)) {
@@ -771,6 +783,10 @@ func (s *Server) handleRequest(req Request) Response {
 		return s.handleSetGatewayCapacity(req)
 	case "build-progress":
 		return s.handleBuildProgress(req)
+	case "integration-status":
+		return s.handleIntegrationStatus(req)
+	case "integration-run":
+		return s.handleIntegrationRun(req)
 	case "list-agents":
 		return s.handleListAgents(req)
 	case "debug-status":
@@ -779,6 +795,8 @@ func (s *Server) handleRequest(req Request) Response {
 		return s.handleTriggerReplan(req)
 	case "revive-agent":
 		return s.handleReviveAgent(req)
+	case "reset-agent-session":
+		return s.handleResetAgentSession(req)
 	default:
 		return Response{ID: req.ID, Error: fmt.Sprintf("unknown method: %s", req.Method)}
 	}
@@ -862,6 +880,14 @@ func (s *Server) SetInferenceGatewayStatusCallback(cb func() InferenceGatewaySta
 
 func (s *Server) SetInferenceGatewayCapacityCallback(cb func(int) (InferenceGatewayStatus, error)) {
 	s.inferenceGatewayCapacityCb = cb
+}
+
+func (s *Server) SetIntegrationStatusCallback(cb func() IntegrationRunStatus) {
+	s.integrationStatusCb = cb
+}
+
+func (s *Server) SetIntegrationRetryCallback(cb func() error) {
+	s.integrationRetryCb = cb
 }
 
 func (s *Server) SetBuildSpecStopAgentsCallback(cb func() error) {
@@ -1092,6 +1118,23 @@ func (s *Server) handleBuildProgress(req Request) Response {
 	return Response{ID: req.ID, Result: snapshot}
 }
 
+func (s *Server) handleIntegrationStatus(req Request) Response {
+	if s.integrationStatusCb == nil {
+		return Response{ID: req.ID, Error: "integration runner callback not configured"}
+	}
+	return Response{ID: req.ID, Result: s.integrationStatusCb()}
+}
+
+func (s *Server) handleIntegrationRun(req Request) Response {
+	if s.integrationRetryCb == nil {
+		return Response{ID: req.ID, Error: "integration runner callback not configured"}
+	}
+	if err := s.integrationRetryCb(); err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	return Response{ID: req.ID, Result: map[string]string{"status": "scheduled"}}
+}
+
 func (s *Server) handleListAgents(req Request) Response {
 	if s.agentListCb == nil {
 		return Response{ID: req.ID, Result: map[string][]AgentInfo{"agents": nil}}
@@ -1149,6 +1192,10 @@ func (s *Server) handleDebugStatus(req Request) Response {
 		}
 		cancel()
 	}
+	var integrationStatus interface{}
+	if s.integrationStatusCb != nil {
+		integrationStatus = s.integrationStatusCb()
+	}
 
 	result := map[string]interface{}{
 		"addr":                     s.Addr(),
@@ -1166,6 +1213,7 @@ func (s *Server) handleDebugStatus(req Request) Response {
 		"build_spec_status":        buildSpecStatus,
 		"inference_gateway":        inferenceGateway,
 		"coordination":             coordinationSnapshot,
+		"integration":              integrationStatus,
 		"agents":                   agents,
 	}
 	return Response{ID: req.ID, Result: result}
@@ -1201,6 +1249,31 @@ func (s *Server) handleReviveAgent(req Request) Response {
 		}
 	}
 	return Response{ID: req.ID, Result: []byte(`{"status":"reviving"}`)}
+}
+
+func (s *Server) handleResetAgentSession(req Request) Response {
+	var params struct {
+		AgentID string `json:"agent_id"`
+		Text    string `json:"text,omitempty"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	params.AgentID = strings.TrimSpace(params.AgentID)
+	if params.AgentID == "" {
+		return Response{ID: req.ID, Error: "reset-agent-session requires agent_id"}
+	}
+	if s.resetAgentSessionCb == nil {
+		return Response{ID: req.ID, Error: "agent session reset is not configured"}
+	}
+	log.Printf("server: user resetting persisted context for agent %s", params.AgentID)
+	if err := s.resetAgentSessionCb(params.AgentID, strings.TrimSpace(params.Text)); err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	return Response{ID: req.ID, Result: map[string]string{
+		"status":   "fresh_session_started",
+		"agent_id": params.AgentID,
+	}}
 }
 
 func (s *Server) handleAcquireLock(req Request) Response {
@@ -1306,6 +1379,30 @@ func (s *Server) handleUpdateNode(req Request) Response {
 			CompletionTokens: params.CompletionTokens,
 		}
 	}
+	if status == dag.StatusDone {
+		node, nodeErr := s.dagManager.GetNode(params.NodeID)
+		if nodeErr != nil {
+			return Response{ID: req.ID, Error: nodeErr.Error()}
+		}
+		if node.Status == dag.StatusDone {
+			assignedAgent := strings.TrimSpace(node.AssignedAgent)
+			if assignedAgent == "" {
+				return Response{ID: req.ID, Error: fmt.Sprintf("manager: node '%s' has no assigned agent", params.NodeID)}
+			}
+			if assignedAgent != params.AgentID {
+				return Response{ID: req.ID, Error: fmt.Sprintf("manager: agent '%s' cannot update node '%s'; assigned to '%s'", params.AgentID, params.NodeID, assignedAgent)}
+			}
+			return Response{ID: req.ID, Result: map[string]string{
+				"status":  "updated",
+				"node_id": params.NodeID,
+			}}
+		}
+		if s.nodeCompletionValidatorCb != nil {
+			if err := s.nodeCompletionValidatorCb(params.NodeID, params.AgentID); err != nil {
+				return Response{ID: req.ID, Error: fmt.Sprintf("node completion validation failed: %v", err)}
+			}
+		}
+	}
 	if status == dag.StatusDone && s.coordination != nil {
 		metadata, _ := json.Marshal(struct {
 			StartedAt        int64 `json:"started_at,omitempty"`
@@ -1398,8 +1495,16 @@ func (s *Server) recordNodeProgressFact(node dag.DagNode, status dag.NodeStatus)
 	severity := "info"
 	summary := fmt.Sprintf("Task %s moved to %s.", node.ID, status.String())
 	switch status {
+	case dag.StatusPending:
+		if s.recoveryResolvedCb != nil {
+			s.recoveryResolvedCb("task_blocked", node.ID, "")
+		}
 	case dag.StatusInProgress:
 		kind = "task_started"
+		if s.recoveryResolvedCb != nil {
+			s.recoveryResolvedCb("task_failed", node.ID, "")
+			s.recoveryResolvedCb("task_blocked", node.ID, "")
+		}
 	case dag.StatusDone:
 		kind = "task_completed"
 		severity = "ok"

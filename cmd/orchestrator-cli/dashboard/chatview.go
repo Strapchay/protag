@@ -65,10 +65,13 @@ var architectCommands = []architectCommand{
 	{Name: "/show-build-spec-trace", Description: "show the current build-spec planning trace"},
 	{Name: "/coordinator-status", Description: "show the current build-spec attempt state"},
 	{Name: "/progress", Description: "show client-facing build-spec progress"},
+	{Name: "/integration-status", Description: "show shared-artifact integration validation state"},
+	{Name: "/integration-run", Description: "retry integration validation for the current build"},
 	{Name: "/clear", Description: "clear visible chat history only"},
 	{Name: "/reset-session", Description: "delete current run state and start a fresh Architect session"},
 	{Name: "/replan", Description: "trigger DAG replan"},
 	{Name: "/revive", Description: "revive a stopped/crashed agent"},
+	{Name: "/reset-agent", Description: "start a fresh Pi conversation, optionally with recovery instructions"},
 	{Name: "/msg", Description: "send a message to a specific agent"},
 	{Name: "/help", Description: "show this command list"},
 }
@@ -346,7 +349,7 @@ func (m *ChatModel) addTUIEvent(msg tuiEventMsg) {
 	}
 
 	if msgType == tuiKindThinking {
-		author = "Architect Thinking"
+		author = strings.TrimSpace(author) + " Thinking"
 		authorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("240")).
 			Italic(true)
@@ -675,6 +678,14 @@ func (m *ChatModel) executeCommand(cmdStr string) {
 		methodName = "build-progress"
 		params = map[string]interface{}{}
 		showResponse = true
+	case "/integration-status":
+		methodName = "integration-status"
+		params = map[string]interface{}{}
+		showResponse = true
+	case "/integration-run":
+		methodName = "integration-run"
+		params = map[string]interface{}{}
+		showResponse = true
 	case "/reset-session":
 		methodName = "architect-reset"
 		params = map[string]interface{}{}
@@ -692,6 +703,18 @@ func (m *ChatModel) executeCommand(cmdStr string) {
 		params = map[string]interface{}{
 			"agent_id": parts[1],
 		}
+	case "/reset-agent":
+		if len(parts) < 2 {
+			return
+		}
+		methodName = "reset-agent-session"
+		params = map[string]interface{}{
+			"agent_id": parts[1],
+		}
+		if len(parts) == 3 {
+			params["text"] = parts[2]
+		}
+		showResponse = true
 	case "/replan":
 		methodName = "trigger-replan"
 		params = map[string]interface{}{}
@@ -750,6 +773,34 @@ func (m *ChatModel) executeCommand(cmdStr string) {
 }
 
 func responseText(raw json.RawMessage) string {
+	var integration struct {
+		Enabled        bool   `json:"enabled"`
+		Status         string `json:"status"`
+		DirectiveCount int    `json:"directive_count"`
+		ContractCount  int    `json:"contract_count"`
+		Error          string `json:"error"`
+		Results        []struct {
+			DirectiveID string `json:"directive_id"`
+			Status      string `json:"status"`
+			Error       string `json:"error"`
+		} `json:"results"`
+	}
+	var integrationShape map[string]json.RawMessage
+	if json.Unmarshal(raw, &integrationShape) == nil && integrationShape["directive_count"] != nil && json.Unmarshal(raw, &integration) == nil {
+		var lines []string
+		lines = append(lines, fmt.Sprintf("Integration validation: %s (%d directive(s), %d contract(s)).", integration.Status, integration.DirectiveCount, integration.ContractCount))
+		if integration.Error != "" {
+			lines = append(lines, "Error: "+integration.Error)
+		}
+		for _, result := range integration.Results {
+			line := fmt.Sprintf("- %s: %s", result.DirectiveID, result.Status)
+			if result.Error != "" {
+				line += " (" + result.Error + ")"
+			}
+			lines = append(lines, line)
+		}
+		return strings.Join(lines, "\n")
+	}
 	var textFields map[string]string
 	if err := json.Unmarshal(raw, &textFields); err == nil {
 		for _, key := range []string{"status", "spec", "plan", "trace"} {

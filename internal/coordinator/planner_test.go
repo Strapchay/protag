@@ -66,6 +66,84 @@ func TestValidatePlanResponseRejectsExcludedPaths(t *testing.T) {
 	}
 }
 
+func TestValidatePlanResponseAcceptsPlannedCrossDomainContract(t *testing.T) {
+	plan := validContractPlan()
+	if err := ValidatePlanResponse(plan); err != nil {
+		t.Fatalf("ValidatePlanResponse: %v", err)
+	}
+}
+
+func TestValidatePlanResponseRejectsIncompleteExecutionArtifacts(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*PlanResponse)
+		want string
+	}{
+		{
+			name: "contract without edge",
+			edit: func(plan *PlanResponse) { plan.Edges = nil },
+			want: "requires dependency edge",
+		},
+		{
+			name: "extensionless integration directive",
+			edit: func(plan *PlanResponse) {
+				plan.Nodes[1].TargetFiles = []string{"consumer/integration/directives/cross-domain"}
+			},
+			want: "must use a .json extension",
+		},
+		{
+			name: "same-domain contract",
+			edit: func(plan *PlanResponse) {
+				plan.Nodes[1].DomainID = "producer"
+			},
+			want: "must cross domain boundaries",
+		},
+		{
+			name: "interface without public entrypoint",
+			edit: func(plan *PlanResponse) {
+				plan.Contracts[0].PublicEntrypoint = ""
+			},
+			want: "requires a public_entrypoint",
+		},
+		{
+			name: "contract without acceptance criteria",
+			edit: func(plan *PlanResponse) {
+				plan.Contracts[0].Acceptance = nil
+			},
+			want: "requires acceptance criteria",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := validContractPlan()
+			tt.edit(plan)
+			err := ValidatePlanResponse(plan)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func validContractPlan() *PlanResponse {
+	return &PlanResponse{
+		Domains: []Domain{
+			{DomainID: "producer", AssignedPaths: []string{"producer/"}},
+			{DomainID: "consumer", AssignedPaths: []string{"consumer/"}},
+		},
+		Nodes: []TaskNode{
+			{ID: "producer-node", DomainID: "producer", TargetFiles: []string{"producer/api.py"}},
+			{ID: "consumer-node", DomainID: "consumer", TargetFiles: []string{"consumer/integration/directives/cross-domain.json"}},
+		},
+		Edges: []TaskEdge{{FromNode: "producer-node", ToNode: "consumer-node"}},
+		Contracts: []PlannedContract{{
+			Resource: "public-api", ProducerNode: "producer-node", ConsumerNode: "consumer-node",
+			Kind: "interface", Language: "go", PublicEntrypoint: "example/api.Client",
+			Acceptance: []string{"consumer can call the public API"}, HardWait: true,
+		}},
+	}
+}
+
 func TestParsePlanResponseText(t *testing.T) {
 	raw := "```json\n{\"type\":\"plan_response\",\"domains\":[{\"domain_id\":\"api\",\"description\":\"API\",\"assigned_paths\":[\"cmd/\"],\"agent_type\":\"domain\"}],\"nodes\":[{\"id\":\"api-task\",\"domain_id\":\"api\",\"task_spec\":\"build api\",\"target_files\":[\"cmd/server/main.go\"],\"priority\":1}],\"edges\":[]}\n```"
 

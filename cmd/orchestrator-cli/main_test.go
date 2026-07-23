@@ -111,6 +111,18 @@ func TestParseDebugStatusCommand(t *testing.T) {
 	}
 }
 
+func TestParseIntegrationCommands(t *testing.T) {
+	for _, command := range []string{"integration-status", "integration-run"} {
+		params, err := parseCommand(command, nil)
+		if err != nil {
+			t.Fatalf("parse %s: %v", command, err)
+		}
+		if len(params) != 0 {
+			t.Fatalf("%s params = %#v", command, params)
+		}
+	}
+}
+
 func TestParseGatewayCapacityCommand(t *testing.T) {
 	params, err := parseCommand("set-gateway-capacity", []string{"--capacity", "3"})
 	if err != nil {
@@ -253,6 +265,15 @@ func TestWriteFetchedContractAtomicallyMaterializesArtifact(t *testing.T) {
 	}
 	if !strings.Contains(output, `"status": "fetched"`) || !strings.Contains(output, "contract-1") {
 		t.Fatalf("fetch output = %s", output)
+	}
+}
+
+func TestWriteFetchedContractRejectsDirectoryOutput(t *testing.T) {
+	outputPath := t.TempDir()
+	raw := json.RawMessage(`{"contract":{"id":"contract-1","revision":1},"content":"e30="}`)
+	err := writeFetchedContract(raw, outputPath)
+	if err == nil || !strings.Contains(err.Error(), "must name a regular file") {
+		t.Fatalf("directory output error = %v", err)
 	}
 }
 

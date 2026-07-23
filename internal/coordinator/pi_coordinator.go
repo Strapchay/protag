@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -35,7 +36,9 @@ type PiCoordinator struct {
 	plannerSessionDir  string
 	plannerGatewayMu   sync.Mutex
 	plannerGatewayCh   chan struct{}
+	plannerActivityCh  chan string
 	plannerGatewayOn   bool
+	plannerTurnErrors  chan error
 	resolutionMu       sync.Mutex
 	resolutionProgress func()
 	resolutionEnvFn    func() ([]string, error)
@@ -56,6 +59,7 @@ type PiCoordinatorConfig struct {
 	PlannerStartTimeout        time.Duration
 	PlannerFirstRequestTimeout time.Duration
 	PlannerArtifactTimeout     time.Duration
+	PlannerTurnSettleTimeout   time.Duration
 	ResolutionIsolationEngine  isolation.Engine
 	ResolutionPolicy           isolation.Policy
 	ResolutionBinary           string
@@ -83,6 +87,22 @@ type planCapture struct {
 	done   chan struct{}
 	text   string
 	closed bool
+}
+
+type plannerArtifactTurnError struct {
+	readErr  error
+	response string
+}
+
+func (e *plannerArtifactTurnError) Error() string {
+	detail := "coordinator turn completed without writing the plan artifact"
+	if e.readErr != nil && !os.IsNotExist(e.readErr) {
+		detail += fmt.Sprintf("; artifact read failed: %v", e.readErr)
+	}
+	if preview := previewPlanResponse(e.response); preview != "<empty>" {
+		detail += "; chat response preview: " + preview
+	}
+	return detail
 }
 
 type planningInputArtifact struct {
@@ -116,6 +136,12 @@ func (p *planCapture) close() {
 		close(p.done)
 	}
 	p.mu.Unlock()
+}
+
+func (p *planCapture) snapshot() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.text
 }
 
 func (p *planCapture) wait(ctx context.Context) (string, error) {
@@ -304,13 +330,20 @@ func (c *PiCoordinator) RecordCoordinatorGatewayActivity(agentID, domainID, phas
 	if agentID != "coordinator" {
 		return
 	}
-	switch strings.ToLower(strings.TrimSpace(phase)) {
+	phase = strings.ToLower(strings.TrimSpace(phase))
+	switch phase {
 	case "queued", "admitted", "forwarding", "active", "completed":
 	default:
 		return
 	}
 	c.plannerGatewayMu.Lock()
 	defer c.plannerGatewayMu.Unlock()
+	if c.plannerActivityCh != nil {
+		select {
+		case c.plannerActivityCh <- phase:
+		default:
+		}
+	}
 	if c.plannerGatewayOn {
 		c.plannerGatewayOn = false
 		close(c.plannerGatewayCh)
@@ -350,8 +383,15 @@ func (c *PiCoordinator) beginPlannerGatewayWatch() <-chan struct{} {
 	c.plannerGatewayMu.Lock()
 	defer c.plannerGatewayMu.Unlock()
 	c.plannerGatewayCh = make(chan struct{})
+	c.plannerActivityCh = make(chan string, 32)
 	c.plannerGatewayOn = true
 	return c.plannerGatewayCh
+}
+
+func (c *PiCoordinator) plannerActivityEvents() <-chan string {
+	c.plannerGatewayMu.Lock()
+	defer c.plannerGatewayMu.Unlock()
+	return c.plannerActivityCh
 }
 
 func (c *PiCoordinator) waitForPlannerGatewayActivity(ctx context.Context, gatewayCh <-chan struct{}, outputPath string) error {
@@ -394,7 +434,8 @@ func (c *PiCoordinator) sendPlanningPromptWithHandshake(ctx context.Context, pro
 			c.traceFn(fmt.Sprintf("coordinator prompt send attempt %d starting", attempt))
 		}
 		c.plannerMu.Lock()
-		c.plannerCapture = nil
+		c.plannerCapture = newPlanCapture()
+		c.plannerTurnErrors = make(chan error, 1)
 		planner := c.plannerAgent
 		c.plannerMu.Unlock()
 
@@ -592,34 +633,69 @@ func (c *PiCoordinator) Plan(ctx context.Context, req PlanRequest) (*PlanRespons
 	defer func() { _ = c.StopPlanner() }()
 	c.plannerReasoningMessage()
 
-	if err := c.sendPlanningPromptWithHandshake(ctx, prompt, artifactPaths.OutputPath); err != nil {
-		if c.traceFn != nil {
-			c.traceFn(fmt.Sprintf("planning prompt handshake failed: %v", err))
+	var plan *PlanResponse
+	for turnAttempt := 1; turnAttempt <= 3; turnAttempt++ {
+		if err := c.sendPlanningPromptWithHandshake(ctx, prompt, artifactPaths.OutputPath); err != nil {
+			if c.traceFn != nil {
+				c.traceFn(fmt.Sprintf("planning prompt handshake failed: %v", err))
+			}
+			return nil, fmt.Errorf("pi_coordinator: planning prompt was not accepted by coordinator runtime: %w", err)
 		}
-		return nil, fmt.Errorf("pi_coordinator: planning prompt was not accepted by coordinator runtime: %w", err)
-	}
-	if c.statusFn != nil {
-		c.statusFn("Coordinator prompt dispatched; awaiting plan response...", "info")
-	}
+		if c.statusFn != nil {
+			c.statusFn("Coordinator prompt dispatched; awaiting plan response...", "info")
+		}
 
-	plan, err := c.waitForPlanArtifact(ctx, artifactPaths.OutputPath)
-	if err != nil {
+		var err error
+		plan, err = c.waitForPlanArtifact(ctx, artifactPaths.OutputPath)
+		if err == nil {
+			break
+		}
 		if c.traceFn != nil {
 			c.traceFn(fmt.Sprintf("plan artifact wait/read failed: %v", err))
 		}
-		return nil, fmt.Errorf("pi_coordinator: planning failed: %w", err)
-	}
-	if err := ValidatePlanResponse(plan); err != nil {
-		if c.traceFn != nil {
-			c.traceFn(fmt.Sprintf("initial validation failed: %v", err))
+		if isPlannerArtifactTurnError(err) && turnAttempt < 3 {
+			prompt = coordinatorArtifactCorrectionPrompt(artifactPaths, err)
+			if c.statusFn != nil {
+				c.statusFn(fmt.Sprintf("Coordinator returned without a valid plan artifact; requesting correction (%d/2)...", turnAttempt), "warn")
+			}
+			if c.traceFn != nil {
+				c.traceFn(fmt.Sprintf("coordinator turn completed without valid artifact; direct-prompt correction %d/2", turnAttempt))
+			}
+			continue
 		}
-		plan, err = c.repairPlanArtifact(ctx, artifactPaths.OutputPath, err)
+		if turnAttempt == 3 || !transientPlannerTurnError(err) {
+			return nil, fmt.Errorf("pi_coordinator: planning failed: %w", err)
+		}
+		if err := c.waitForPlannerIdle(ctx); err != nil {
+			return nil, fmt.Errorf("pi_coordinator: wait for planner retry: %w", err)
+		}
+		delay := time.Duration(turnAttempt*10) * time.Second
+		if c.statusFn != nil {
+			c.statusFn(fmt.Sprintf("Coordinator inference was temporarily unavailable; retrying in %s...", delay), "warn")
+		}
+		if c.traceFn != nil {
+			c.traceFn(fmt.Sprintf("transient coordinator turn failure; direct-prompt retry %d/3 after %s", turnAttempt+1, delay))
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	if validationErr := ValidatePlanResponse(plan); validationErr != nil {
+		if c.traceFn != nil {
+			c.traceFn(fmt.Sprintf("initial validation failed: %v", validationErr))
+		}
+		repairedPlan, err := c.repairPlanArtifact(ctx, artifactPaths.OutputPath, validationErr)
 		if err != nil {
 			if c.traceFn != nil {
 				c.traceFn(fmt.Sprintf("validation failed: %v", err))
 			}
 			return nil, fmt.Errorf("pi_coordinator: planning validation failed: %w", err)
 		}
+		plan = repairedPlan
 	}
 	if c.traceFn != nil {
 		c.traceFn(fmt.Sprintf("plan valid: domains=%d nodes=%d edges=%d", len(plan.Domains), len(plan.Nodes), len(plan.Edges)))
@@ -670,6 +746,9 @@ func (c *PiCoordinator) preparePlanningArtifacts(specText string, req PlanReques
 			"each node must reference an existing domain",
 			"edges must reference existing nodes and must not be self-referential",
 			"edge direction is prerequisite/producer from_node -> dependent/consumer to_node",
+			"every explicit cross-domain artifact must be a contracts entry with exact producer_node and consumer_node IDs plus a matching edge",
+			"every interface contract must include non-empty language, public_entrypoint, and acceptance fields so an isolated consumer never guesses its integration locator",
+			"integration directive target files must end in .json",
 			"prefer one cohesive implementation-and-test node per explicit domain; split only independently schedulable work",
 			"the dependency graph must be acyclic",
 			"broad fallback path '.' must not be assigned to multiple domains",
@@ -696,6 +775,26 @@ func (c *PiCoordinator) waitForPlanArtifact(ctx context.Context, outputPath stri
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
+	c.plannerMu.Lock()
+	turnErrors := c.plannerTurnErrors
+	capture := c.plannerCapture
+	c.plannerMu.Unlock()
+	var turnDone <-chan struct{}
+	if capture != nil {
+		turnDone = capture.done
+	}
+	activityEvents := c.plannerActivityEvents()
+	settleTimeout := c.config.PlannerTurnSettleTimeout
+	if settleTimeout <= 0 {
+		settleTimeout = 5 * time.Second
+	}
+	var settleTimer *time.Timer
+	var settled <-chan time.Time
+	defer func() {
+		if settleTimer != nil {
+			settleTimer.Stop()
+		}
+	}()
 
 	var lastErr error
 	var lastErrText string
@@ -704,7 +803,7 @@ func (c *PiCoordinator) waitForPlanArtifact(ctx context.Context, outputPath stri
 		plan, err := readPlanArtifact(outputPath)
 		if err == nil {
 			if c.traceFn != nil {
-				c.traceFn(fmt.Sprintf("plan artifact read: domains=%d nodes=%d edges=%d", len(plan.Domains), len(plan.Nodes), len(plan.Edges)))
+				c.traceFn(fmt.Sprintf("plan artifact read: domains=%d nodes=%d edges=%d contracts=%d", len(plan.Domains), len(plan.Nodes), len(plan.Edges), len(plan.Contracts)))
 			}
 			return plan, nil
 		}
@@ -727,6 +826,70 @@ func (c *PiCoordinator) waitForPlanArtifact(ctx context.Context, outputPath stri
 				return nil, lastErr
 			}
 			return nil, ctx.Err()
+		case turnErr := <-turnErrors:
+			return nil, fmt.Errorf("planner inference turn failed: %w", turnErr)
+		case phase := <-activityEvents:
+			if phase == "completed" {
+				if settleTimer == nil {
+					settleTimer = time.NewTimer(settleTimeout)
+				} else {
+					if !settleTimer.Stop() {
+						select {
+						case <-settleTimer.C:
+						default:
+						}
+					}
+					settleTimer.Reset(settleTimeout)
+				}
+				settled = settleTimer.C
+			} else {
+				if settleTimer != nil && !settleTimer.Stop() {
+					select {
+					case <-settleTimer.C:
+					default:
+					}
+				}
+				settled = nil
+			}
+		case <-settled:
+			settled = nil
+			if plan, err := readPlanArtifact(outputPath); err == nil {
+				return plan, nil
+			} else {
+				var response string
+				if capture != nil {
+					response = capture.snapshot()
+				}
+				return nil, &plannerArtifactTurnError{
+					readErr:  err,
+					response: response,
+				}
+			}
+		case <-turnDone:
+			// Tool completion precedes turn_end, but allow a brief grace period
+			// for the artifact write to become visible before correcting the turn.
+			grace := time.NewTimer(750 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				grace.Stop()
+				return nil, ctx.Err()
+			case turnErr := <-turnErrors:
+				grace.Stop()
+				return nil, fmt.Errorf("planner inference turn failed: %w", turnErr)
+			case <-grace.C:
+			}
+			if plan, err := readPlanArtifact(outputPath); err == nil {
+				return plan, nil
+			} else {
+				var response string
+				if capture != nil {
+					response = capture.snapshot()
+				}
+				return nil, &plannerArtifactTurnError{
+					readErr:  err,
+					response: response,
+				}
+			}
 		case <-timer.C:
 			if lastErr != nil {
 				return nil, fmt.Errorf("plan artifact was not written within %s; last_read_error=%v; planner_raw_tail=%q", timeout, lastErr, c.tailPlannerRawLog(20))
@@ -735,6 +898,55 @@ func (c *PiCoordinator) waitForPlanArtifact(ctx context.Context, outputPath stri
 		case <-ticker.C:
 		}
 	}
+}
+
+func isPlannerArtifactTurnError(err error) bool {
+	var target *plannerArtifactTurnError
+	return errors.As(err, &target)
+}
+
+func coordinatorArtifactCorrectionPrompt(paths planningArtifactPaths, cause error) string {
+	return strings.TrimSpace(fmt.Sprintf(`Your previous planning turn completed without writing a valid plan artifact.
+
+Observed problem:
+%s
+
+Do not return or restate the plan in chat. Read the planning input again:
+%s
+
+Use the write tool now to create this exact output file:
+%s
+
+The output must be one JSON object with these exact fields:
+{"type":"plan_response","domains":[{"domain_id":"id","description":"area","assigned_paths":["relative/path"],"agent_type":"domain"}],"nodes":[{"id":"task-id","domain_id":"id","task_spec":"specific task","target_files":["relative/path/file.ext"],"priority":1}],"edges":[{"from_node":"producer-task-id","to_node":"consumer-task-id"}],"contracts":[{"resource":"public-resource","producer_node":"producer-task-id","consumer_node":"consumer-task-id","kind":"interface","language":"implementation-language","public_entrypoint":"exact consumer-visible locator","acceptance":["machine-checkable condition"],"hard_wait":true}]}
+
+Use empty edges or contracts arrays only when the build spec has no corresponding dependency. Do not use domain field "id", node field "assigned_paths", edge fields "from"/"to", or extra top-level integration_directives. Integration directives belong in node target_files and must end in .json.
+After the write succeeds, reply only with a short confirmation.`, cause, paths.InputPath, paths.OutputPath))
+}
+
+func (c *PiCoordinator) waitForPlannerIdle(ctx context.Context) error {
+	c.plannerMu.Lock()
+	planner := c.plannerAgent
+	c.plannerMu.Unlock()
+	if planner == nil {
+		return fmt.Errorf("planner agent is unavailable")
+	}
+	idleCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	return planner.WaitForTurnIdle(idleCtx)
+}
+
+func transientPlannerTurnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{"resourceexhausted", "resource exhausted", "request limit", "rate limit", "too many requests", "429", "temporarily unavailable", "timeout"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func readPlanArtifact(path string) (*PlanResponse, error) {
@@ -787,6 +999,7 @@ Read the planning input artifact at %s again and overwrite the output artifact w
 %s
 
 Every edge object must use exactly this shape: {"from_node":"source-task-id","to_node":"dependent-task-id"}.
+Every cross-domain artifact must use a contracts entry with resource, producer_node, consumer_node, kind, acceptance, and a matching producer-to-consumer edge. Every interface contract must also include language and an exact consumer-visible public_entrypoint. Integration directive targets must end in .json.
 Do not answer with the plan in chat. Write the corrected artifact directly.`, outputPath, validationErr.Error(), paths.InputPath, outputPath))
 	if c.traceFn != nil {
 		c.traceFn("requesting coordinator plan artifact repair after validation failure")
@@ -916,7 +1129,24 @@ func (c *PiCoordinator) handlePlannerLifecycle(event supervisor.AgentLifecycleEv
 			c.traceFn("planner thinking:\n" + truncateForTrace(event.Content, 2000))
 		}
 		// Keep the latest transcript text for parsing, but preserve thinking in the UI.
-	case "turn_end", "agent_end", "agent_error", "agent_stream_closed":
+	case "model_error":
+		if c.traceFn != nil {
+			c.traceFn("planner model error: " + truncateForTrace(event.Error, 2000))
+		}
+		c.plannerMu.Lock()
+		turnErrors := c.plannerTurnErrors
+		c.plannerMu.Unlock()
+		if turnErrors != nil {
+			select {
+			case turnErrors <- fmt.Errorf("%s", event.Error):
+			default:
+			}
+		}
+	case "turn_end":
+		if capture != nil && event.Content != "" {
+			capture.setText(event.Content)
+		}
+	case "agent_end", "agent_error", "agent_stream_closed":
 		if capture != nil && event.Content != "" {
 			capture.setText(event.Content)
 		}

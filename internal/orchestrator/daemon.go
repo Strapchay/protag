@@ -37,6 +37,7 @@ type Daemon struct {
 	coordinator              coordinator.Coordinator
 	memoryStore              memory.Store
 	inferenceGateway         *InferenceGateway
+	integrationRunner        *IntegrationRunner
 	ipcPaths                 daemonIPCPaths
 	projectRoot              string
 	auditor                  *Auditor
@@ -90,6 +91,10 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	if err != nil {
 		return nil, fmt.Errorf("daemon: init dag manager: %w", err)
 	}
+	if err := recoverUnassignedInProgressNodes(dagMgr); err != nil {
+		_ = dagMgr.Close()
+		return nil, fmt.Errorf("daemon: recover unassigned active nodes: %w", err)
+	}
 
 	// Initialize Lock Manager
 	lockMgr := locking.NewManager(config.Agents.SharedFiles)
@@ -103,6 +108,11 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 		_ = coordinationManager.Close()
 		_ = dagMgr.Close()
 		return nil, fmt.Errorf("daemon: recover coordination leases: %w", err)
+	}
+	if err := recoverAcknowledgedNodeCompletions(dagMgr, coordinationManager); err != nil {
+		_ = coordinationManager.Close()
+		_ = dagMgr.Close()
+		return nil, fmt.Errorf("daemon: recover acknowledged node completions: %w", err)
 	}
 
 	// Initialize Hub Router
@@ -208,6 +218,19 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 		cancel:              cancel,
 		staleReported:       make(map[string]bool),
 	}
+	var integrationEngine isolation.Engine
+	if config.Integration.Enabled {
+		integrationEngine, err = newDomainIsolationEngine(config)
+		if err != nil {
+			cancel()
+			_ = coordinationManager.Close()
+			_ = dagMgr.Close()
+			return nil, fmt.Errorf("daemon: init integration isolation: %w", err)
+		}
+	}
+	daemon.integrationRunner = NewIntegrationRunner(config, projectRoot, runState, coordinationManager, integrationEngine, ctx)
+	alloc.SetIntegrationGateFunc(daemon.integrationRunner.Gate)
+	daemon.integrationRunner.SetChangeFunc(daemon.handleIntegrationStatusChange)
 
 	server.SetHubCallback(func(msg hub.Message) {
 		if msg.Type == hub.MsgDependencyDiscovered {
@@ -228,6 +251,16 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 
 	server.SetReviveCallback(func(agentID string) error {
 		return daemon.allocator.ReviveAgent(daemon.ctx, agentID)
+	})
+	server.SetResetAgentSessionCallback(func(agentID, prompt string) error {
+		return daemon.allocator.ResetAgentSessionWithPrompt(daemon.ctx, agentID, prompt)
+	})
+	server.SetNodeCompletionValidatorCallback(func(nodeID, _ string) error {
+		node, err := daemon.dagManager.GetNode(nodeID)
+		if err != nil {
+			return err
+		}
+		return validatePlannedNodeDirectives(daemon.projectRoot, daemon.config.Integration.DirectiveDir, node)
 	})
 
 	server.SetRefineCallback(func(text string) {
@@ -390,6 +423,12 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 		}
 		return daemon.inferenceGateway.SetCapacity(capacity)
 	})
+	server.SetIntegrationStatusCallback(func() IntegrationRunStatus {
+		return daemon.integrationRunner.Status()
+	})
+	server.SetIntegrationRetryCallback(func() error {
+		return daemon.retryIntegrationValidation()
+	})
 	server.SetAgentListCallback(func() []AgentInfo {
 		infos := []AgentInfo{{
 			AgentID:  "coordinator",
@@ -401,8 +440,60 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	})
 
 	daemon.configureAllocatorCallbacks()
+	daemon.reconcilePersistedRecoveries()
 
 	return daemon, nil
+}
+
+func recoverUnassignedInProgressNodes(manager *dag.Manager) error {
+	if manager == nil {
+		return nil
+	}
+	for _, node := range manager.Snapshot().Nodes {
+		if node.Status != dag.StatusInProgress || strings.TrimSpace(node.AssignedAgent) != "" {
+			continue
+		}
+		log.Printf("daemon: recovering unassigned InProgress node %s to Pending", node.ID)
+		if err := manager.UpdateNode(node.ID, dag.StatusPending); err != nil {
+			return fmt.Errorf("reset node %s: %w", node.ID, err)
+		}
+	}
+	return nil
+}
+
+func recoverAcknowledgedNodeCompletions(manager *dag.Manager, coordinationManager *coordinationruntime.Manager) error {
+	if manager == nil || coordinationManager == nil {
+		return nil
+	}
+	receipts, err := coordinationManager.AcknowledgedNodeCompletionEffects(context.Background())
+	if err != nil {
+		return err
+	}
+	for _, receipt := range receipts {
+		node, nodeErr := manager.GetNode(receipt.TargetNodeID)
+		if nodeErr != nil {
+			return nodeErr
+		}
+		if node.Status == dag.StatusDone {
+			continue
+		}
+		agentID := strings.TrimSpace(receipt.TargetAgentID)
+		if agentID == "" {
+			return fmt.Errorf("completion receipt %s has no target agent", receipt.ID)
+		}
+		if strings.TrimSpace(node.AssignedAgent) == "" {
+			if err := manager.AssignNode(node.ID, agentID); err != nil {
+				return fmt.Errorf("restore owner for completed node %s: %w", node.ID, err)
+			}
+		} else if node.AssignedAgent != agentID {
+			return fmt.Errorf("completion receipt %s targets %s but node %s is assigned to %s", receipt.ID, agentID, node.ID, node.AssignedAgent)
+		}
+		log.Printf("daemon: recovering acknowledged completed node %s to Done", node.ID)
+		if err := manager.UpdateNodeForAgent(node.ID, agentID, dag.StatusDone, nil); err != nil {
+			return fmt.Errorf("restore completed node %s: %w", node.ID, err)
+		}
+	}
+	return nil
 }
 
 func (d *Daemon) routeHubMessage(msg hub.Message) error {
@@ -411,7 +502,7 @@ func (d *Daemon) routeHubMessage(msg hub.Message) error {
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		return d.allocator.DeliverOrWakeContext(ctx, msg, "")
+		return d.allocator.SteerOrWakeContext(ctx, msg)
 	}
 	return d.hubRouter.Route(msg)
 }
@@ -577,6 +668,84 @@ func (d *Daemon) resolveRecovery(kind, nodeID, agentID string) {
 		return
 	}
 	_ = markRecoveryResolved(d.runState.Root, kind, nodeID, agentID)
+}
+
+func (d *Daemon) handleIntegrationStatusChange(status IntegrationRunStatus) {
+	if d == nil {
+		return
+	}
+	summary := "Integration validation is " + string(status.Status) + "."
+	level := "info"
+	switch status.Status {
+	case IntegrationRunning:
+		summary = fmt.Sprintf("Integration validation started for %d directive(s).", status.DirectiveCount)
+	case IntegrationPassed:
+		level = "ok"
+		summary = fmt.Sprintf("Integration validation passed (%d directive(s)).", status.DirectiveCount)
+		d.resolveRecovery("integration_failed", "", "integration-runner")
+		d.clearIntegrationNodeRecoveries(status)
+	case IntegrationFailed:
+		level = "error"
+		summary = "Integration validation failed: " + strings.TrimSpace(status.Error)
+		d.recordRecovery(RecoveryRecord{
+			FailureID:        recoveryID("integration_failed", "", "integration-runner"),
+			Kind:             "integration_failed",
+			Severity:         "error",
+			Status:           "open",
+			AgentID:          "integration-runner",
+			DomainID:         "integration",
+			Summary:          summary,
+			LastError:        status.Error,
+			SuggestedCommand: "orchestrator-cli integration-run",
+		})
+	case IntegrationSkipped:
+		level = "warn"
+		summary = "Integration validation skipped because no domain published a directive."
+	case IntegrationDisabled:
+		summary = "Integration validation is disabled."
+	}
+	d.recordExecutionEvent(ExecutionJournalEvent{
+		Kind: "integration_" + string(status.Status), Severity: level,
+		AgentID: "integration-runner", DomainID: "integration", Summary: summary,
+	})
+	if d.server != nil {
+		d.server.BroadcastAgentStatus("integration-runner", summary, level)
+	}
+	d.refreshBuildProgress("integration_" + string(status.Status))
+	if status.Status == IntegrationFailed {
+		reopened, err := d.prepareIntegrationFailureRecovery(status)
+		if err != nil {
+			log.Printf("integration: prepare owner-node recovery: %v", err)
+			return
+		}
+		if len(reopened) > 0 {
+			if err := d.integrationRunner.Retry(); err != nil {
+				log.Printf("integration: schedule owner-node retry: %v", err)
+				return
+			}
+			d.startBuildSpecExecutionMonitor()
+		}
+	}
+}
+
+func (d *Daemon) retryIntegrationValidation() error {
+	if d == nil || d.integrationRunner == nil {
+		return fmt.Errorf("integration runner is unavailable")
+	}
+	status := d.integrationRunner.Status()
+	if status.Status == IntegrationFailed {
+		if _, err := d.prepareIntegrationFailureRecovery(status); err != nil {
+			return err
+		}
+	}
+	if err := d.integrationRunner.Retry(); err != nil {
+		return err
+	}
+	d.startBuildSpecExecutionMonitor()
+	if d.server != nil {
+		d.server.BroadcastAgentStatus("integration-runner", "Integration validation retry scheduled.", "info")
+	}
+	return nil
 }
 
 func (d *Daemon) recordAgentLifecycleProgress(agentID, domainID, state, reason string) {
@@ -769,6 +938,7 @@ func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunSta
 		PlannerStartTimeout:        time.Duration(config.Health.CoordinatorPlannerStartTimeoutSec) * time.Second,
 		PlannerFirstRequestTimeout: time.Duration(config.Health.CoordinatorPlannerFirstRequestTimeoutSec) * time.Second,
 		PlannerArtifactTimeout:     time.Duration(config.Health.CoordinatorPlannerArtifactTimeoutSec) * time.Second,
+		PlannerTurnSettleTimeout:   time.Duration(config.Health.CoordinatorPlannerTurnSettleTimeoutSec) * time.Second,
 		ResolutionArtifactTimeout:  time.Duration(config.Coordination.ArtifactTimeoutSec) * time.Second,
 	}
 	if config.GatewayEnabled() {
@@ -780,11 +950,11 @@ func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunSta
 		if err != nil {
 			return nil, fmt.Errorf("resolution coordinator binary: %w", err)
 		}
-		skills, skillMounts, err := resolveAgentResources(projectRoot, config.Agents.SkillPaths)
+		skills, skillMounts, err := resolveAgentResources(projectRoot, config.Agents.SkillPaths, "/runtime/skills")
 		if err != nil {
 			return nil, fmt.Errorf("resolution coordinator skills: %w", err)
 		}
-		extensions, extensionMounts, err := resolveAgentResources(projectRoot, config.Agents.ExtensionPaths)
+		extensions, extensionMounts, err := resolveAgentResources(projectRoot, config.Agents.ExtensionPaths, "/runtime/extensions")
 		if err != nil {
 			return nil, fmt.Errorf("resolution coordinator extensions: %w", err)
 		}
@@ -887,6 +1057,10 @@ func (d *Daemon) Start() error {
 		}
 	}()
 
+	if err := d.reconcileInterruptedBuildSpecAttempt(); err != nil {
+		return fmt.Errorf("daemon: reconcile interrupted build-spec attempt: %w", err)
+	}
+
 	// Start Auditor
 	d.auditor.Start(d.ctx)
 	d.startCoordinationEffectLoop()
@@ -906,9 +1080,30 @@ func (d *Daemon) Start() error {
 	if attempt, err := loadBuildSpecAttempt(d.runState.Root); err == nil && attempt != nil {
 		switch attempt.Status {
 		case BuildSpecAttemptActive, BuildSpecAttemptPaused, BuildSpecAttemptAllocating, BuildSpecAttemptPlanning, BuildSpecAttemptCommitting:
+			if attempt.Status == BuildSpecAttemptActive || attempt.Status == BuildSpecAttemptPaused {
+				converged, convergenceErr := d.allocator.checkConvergenceContext(d.ctx)
+				if convergenceErr != nil {
+					log.Printf("daemon: startup convergence reconciliation failed: %v", convergenceErr)
+				} else if converged {
+					if finalizeErr := d.finalizeBuildSpecAttemptConvergence(); finalizeErr != nil {
+						return fmt.Errorf("daemon: finalize converged build-spec attempt: %w", finalizeErr)
+					}
+					attempt, _ = loadBuildSpecAttempt(d.runState.Root)
+				}
+			}
+			if attempt != nil && attempt.Status == BuildSpecAttemptCompleted {
+				d.seedBuildSpecAttemptContext(attempt)
+				d.refreshBuildProgress("startup_completed")
+				d.server.BroadcastTransientStatus("Persisted completed build-spec attempt loaded.", "ok")
+				break
+			}
 			d.seedBuildSpecAttemptContext(attempt)
 			d.refreshBuildProgress("startup")
 			d.server.BroadcastTransientStatus("Persisted build-spec attempt loaded. Issue /continue-agents to resume domain work.", "info")
+		case BuildSpecAttemptCompleted:
+			d.seedBuildSpecAttemptContext(attempt)
+			d.refreshBuildProgress("startup_completed")
+			d.server.BroadcastTransientStatus("Persisted completed build-spec attempt loaded.", "ok")
 		}
 	}
 
@@ -964,6 +1159,9 @@ func (d *Daemon) ResetCurrentRun() error {
 		}
 	}
 	d.stopBuildSpecExecutionMonitor()
+	if d.integrationRunner != nil {
+		d.integrationRunner.Close()
+	}
 	d.allocator.StopAll()
 
 	oldDAG := d.dagManager
@@ -996,6 +1194,18 @@ func (d *Daemon) ResetCurrentRun() error {
 	alloc.SetIPCDir(d.ipcPaths.Dir)
 	workInbox := NewWorkInboxService(dagMgr, coordinationManager, filepath.Join(newRun.Root, "work_checkpoints.json"))
 	alloc.SetWorkInboxService(workInbox)
+	var integrationEngine isolation.Engine
+	if d.config.Integration.Enabled {
+		integrationEngine, err = newDomainIsolationEngine(d.config)
+		if err != nil {
+			_ = coordinationManager.Close()
+			_ = dagMgr.Close()
+			return fmt.Errorf("init reset integration isolation: %w", err)
+		}
+	}
+	integrationRunner := NewIntegrationRunner(d.config, d.projectRoot, newRun, coordinationManager, integrationEngine, d.ctx)
+	alloc.SetIntegrationGateFunc(integrationRunner.Gate)
+	integrationRunner.SetChangeFunc(d.handleIntegrationStatusChange)
 	alloc.SetStatusFunc(func(text, level string) {
 		d.server.BroadcastStatus(text, level)
 	})
@@ -1019,6 +1229,7 @@ func (d *Daemon) ResetCurrentRun() error {
 	oldCoordination := d.coordinationManager
 	d.coordinationManager = coordinationManager
 	d.workInbox = workInbox
+	d.integrationRunner = integrationRunner
 	d.hubRouter = hubRouter
 	d.allocator = alloc
 	d.coordinator = coord
@@ -1222,6 +1433,9 @@ func (d *Daemon) SubmitWork(ctx context.Context, userPrompt string) error {
 // and shuts down internal modules.
 func (d *Daemon) CloseProject() error {
 	log.Println("daemon: closing project, halting agents...")
+	if d.integrationRunner != nil {
+		d.integrationRunner.Close()
+	}
 	d.allocator.StopAll()
 
 	if d.memoryStore != nil {

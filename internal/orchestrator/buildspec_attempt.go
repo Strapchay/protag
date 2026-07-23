@@ -21,6 +21,7 @@ const (
 	BuildSpecAttemptAllocating       BuildSpecAttemptStatus = "allocating"
 	BuildSpecAttemptActive           BuildSpecAttemptStatus = "active"
 	BuildSpecAttemptPaused           BuildSpecAttemptStatus = "paused"
+	BuildSpecAttemptCompleted        BuildSpecAttemptStatus = "completed"
 	BuildSpecAttemptFailed           BuildSpecAttemptStatus = "failed"
 	BuildSpecAttemptCommitFailed     BuildSpecAttemptStatus = "commit_failed"
 	BuildSpecAttemptAllocationFailed BuildSpecAttemptStatus = "allocation_failed"
@@ -50,6 +51,7 @@ type BuildSpecAttempt struct {
 	Plan                *coordinator.PlanResponse      `json:"plan,omitempty"`
 	CreatedNodeIDs      []string                       `json:"created_node_ids,omitempty"`
 	CreatedEdgeIDs      []string                       `json:"created_edge_ids,omitempty"`
+	CreatedContractIDs  []string                       `json:"created_contract_ids,omitempty"`
 	AllocatedDomainIDs  []string                       `json:"allocated_domain_ids,omitempty"`
 	AgentStates         map[string]BuildSpecAgentState `json:"agent_states,omitempty"`
 	CanceledAt          *time.Time                     `json:"canceled_at,omitempty"`

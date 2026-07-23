@@ -40,10 +40,12 @@ func (s *Server) handleWorkInbox(req Request) Response {
 	if inbox.Active != nil {
 		return Response{ID: req.ID, Result: map[string]interface{}{"current": inbox.Active}}
 	}
-	if len(inbox.Ready) > 0 {
-		return Response{ID: req.ID, Result: map[string]interface{}{"current": inbox.Ready[0]}}
+	for index := range inbox.Ready {
+		if inbox.Ready[index].Kind != WorkItemNode {
+			return Response{ID: req.ID, Result: map[string]interface{}{"current": inbox.Ready[index]}}
+		}
 	}
-	return Response{ID: req.ID, Result: map[string]interface{}{"current": nil, "waiting": inbox.Waiting}}
+	return Response{ID: req.ID, Result: map[string]interface{}{"current": nil, "ready": inbox.Ready, "waiting": inbox.Waiting}}
 }
 
 func (s *Server) handleWorkCheckpoint(req Request) Response {
@@ -121,20 +123,48 @@ func (s *Server) handleContractEnsure(req Request) Response {
 	if commandID == "" {
 		commandID = "ensure:" + contractID
 	}
-	contract, err := s.coordination.Request(context.Background(), principal, coordination.RequestCommand{
-		CommandID: commandID,
-		Contract: coordination.Contract{
-			ID:              contractID,
-			ProducerAgentID: producerAgentID,
-			ProducerNodeID:  producer.ID,
-			ConsumerAgentID: consumerAgentID,
-			ConsumerNodeID:  consumer.ID,
-			Details:         params.Details,
-			HardWait:        params.HardWait,
-		},
-	})
+	var contract *coordination.Contract
+	existingContracts, err := s.coordination.List(context.Background(), principal)
 	if err != nil {
 		return Response{ID: req.ID, Error: err.Error()}
+	}
+	for index := range existingContracts {
+		existing := &existingContracts[index]
+		if existing.ID != contractID {
+			continue
+		}
+		if existing.ProducerNodeID != producer.ID || existing.ConsumerNodeID != consumer.ID {
+			return Response{ID: req.ID, Error: fmt.Sprintf("coordination: existing contract %s does not match requested participants", contractID)}
+		}
+		contract = existing
+		if params.HardWait && !contract.HardWait && !contract.Status.Terminal() {
+			contract, err = s.coordination.SetWait(context.Background(), principal, coordination.WaitCommand{
+				CommandID:  commandID + ":wait",
+				ContractID: contractID,
+				Hard:       true,
+			})
+			if err != nil {
+				return Response{ID: req.ID, Error: err.Error()}
+			}
+		}
+		break
+	}
+	if contract == nil {
+		contract, err = s.coordination.Request(context.Background(), principal, coordination.RequestCommand{
+			CommandID: commandID,
+			Contract: coordination.Contract{
+				ID:              contractID,
+				ProducerAgentID: producerAgentID,
+				ProducerNodeID:  producer.ID,
+				ConsumerAgentID: consumerAgentID,
+				ConsumerNodeID:  consumer.ID,
+				Details:         params.Details,
+				HardWait:        params.HardWait,
+			},
+		})
+		if err != nil {
+			return Response{ID: req.ID, Error: err.Error()}
+		}
 	}
 	s.afterCoordinationMutation("contract_ensured")
 
