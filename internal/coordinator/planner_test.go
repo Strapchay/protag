@@ -66,6 +66,53 @@ func TestValidatePlanResponseRejectsExcludedPaths(t *testing.T) {
 	}
 }
 
+func TestValidatePlanResponseRejectsAmbiguousDomainOwnership(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*PlanResponse)
+		want string
+	}{
+		{
+			name: "overlapping domain paths",
+			edit: func(plan *PlanResponse) {
+				plan.Domains[1].AssignedPaths = []string{"producer/api/"}
+			},
+			want: "assigned paths \"producer\" (domain \"producer\") and \"producer/api\" (domain \"consumer\") overlap",
+		},
+		{
+			name: "target outside domain ownership",
+			edit: func(plan *PlanResponse) {
+				plan.Nodes[1].TargetFiles = []string{"shared/client.py"}
+			},
+			want: "outside domain \"consumer\" assigned paths",
+		},
+		{
+			name: "absolute assigned path",
+			edit: func(plan *PlanResponse) {
+				plan.Domains[0].AssignedPaths = []string{"/tmp/producer"}
+			},
+			want: "path must be project-relative",
+		},
+		{
+			name: "escaping target path",
+			edit: func(plan *PlanResponse) {
+				plan.Nodes[0].TargetFiles = []string{"../producer.py"}
+			},
+			want: "path escapes the project root",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := validContractPlan()
+			tt.edit(plan)
+			err := ValidatePlanResponse(plan)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestValidatePlanResponseAcceptsPlannedCrossDomainContract(t *testing.T) {
 	plan := validContractPlan()
 	if err := ValidatePlanResponse(plan); err != nil {
@@ -95,6 +142,7 @@ func TestValidatePlanResponseRejectsIncompleteExecutionArtifacts(t *testing.T) {
 			name: "same-domain contract",
 			edit: func(plan *PlanResponse) {
 				plan.Nodes[1].DomainID = "producer"
+				plan.Nodes[1].TargetFiles = []string{"producer/integration/directives/cross-domain.json"}
 			},
 			want: "must cross domain boundaries",
 		},
@@ -111,6 +159,14 @@ func TestValidatePlanResponseRejectsIncompleteExecutionArtifacts(t *testing.T) {
 				plan.Contracts[0].Acceptance = nil
 			},
 			want: "requires acceptance criteria",
+		},
+		{
+			name: "contract without consumer integration directive",
+			edit: func(plan *PlanResponse) {
+				plan.Nodes[0].TargetFiles = append(plan.Nodes[0].TargetFiles, "producer/integration/directives/producer.json")
+				plan.Nodes[1].TargetFiles = []string{"consumer/client.py"}
+			},
+			want: "consumer node \"consumer-node\" requires an owned integration directive target",
 		},
 	}
 	for _, tt := range tests {

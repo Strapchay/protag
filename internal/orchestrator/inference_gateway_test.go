@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -159,6 +160,35 @@ func TestProfileCredentialPrefersTokenOverAccountIdentifier(t *testing.T) {
 	applyUpstreamAuth(headers, profile)
 	if got := headers.Get("Authorization"); got != "Bearer fixture-cipher" {
 		t.Fatalf("unexpected upstream auth header: %q", got)
+	}
+}
+
+func TestTargetURLForRequestAdaptsGoogleGeminiOpenAICompatibilityPath(t *testing.T) {
+	requestURL, err := url.Parse("/v1/chat/completions")
+	if err != nil {
+		t.Fatalf("parse request URL: %v", err)
+	}
+
+	geminiURL, err := targetURLForRequest(ModelProfile{
+		Provider: "google-gemini",
+		Endpoint: "https://generativelanguage.googleapis.com/v1beta/openai",
+	}, requestURL)
+	if err != nil {
+		t.Fatalf("build Gemini target URL: %v", err)
+	}
+	if want := "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"; geminiURL != want {
+		t.Fatalf("Gemini target URL=%q want=%q", geminiURL, want)
+	}
+
+	compatibleURL, err := targetURLForRequest(ModelProfile{
+		Provider: "redacted-openai-compatible",
+		Endpoint: "https://provider.example",
+	}, requestURL)
+	if err != nil {
+		t.Fatalf("build OpenAI-compatible target URL: %v", err)
+	}
+	if want := "https://provider.example/v1/chat/completions"; compatibleURL != want {
+		t.Fatalf("OpenAI-compatible target URL=%q want=%q", compatibleURL, want)
 	}
 }
 

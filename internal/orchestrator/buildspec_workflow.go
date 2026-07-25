@@ -864,7 +864,7 @@ Build-spec attempt: %s
 
 The server was restarted or the agent set was explicitly continued. Keep your existing context and continue pending DAG work for your assigned domain.
 Your current working directory is the isolated writable view for your assigned domain. Other domain and kernel runtime paths are not mounted.
-Do not re-run the original onboarding/system prompt. Use orchestrator-cli to read the DAG, acquire locks, update task status, exchange durable artifact contracts, and coordinate through the context hub.
+Do not re-run the original onboarding/system prompt. Use orchestrator-cli to read the DAG, update task status, exchange durable artifact contracts, and coordinate through the context hub.
 If you are unsure what is pending, inspect the DAG first and continue only work assigned to you.`, attemptID))
 }
 

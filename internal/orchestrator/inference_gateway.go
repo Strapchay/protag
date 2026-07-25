@@ -1243,6 +1243,9 @@ func targetURLForRequest(profile ModelProfile, requestURL *url.URL) (string, err
 		return "", fmt.Errorf("gateway target endpoint is empty")
 	}
 	path := canonicalGatewayProxyPath(requestURL.Path)
+	if isGoogleGeminiProvider(profile.Provider) && strings.HasPrefix(path, "/v1/") {
+		path = strings.TrimPrefix(path, "/v1")
+	}
 	if strings.HasSuffix(base, "/v1") && strings.HasPrefix(path, "/v1/") {
 		path = strings.TrimPrefix(path, "/v1")
 	}
@@ -1355,11 +1358,20 @@ func gatewayAPIForProvider(provider string) string {
 	return "openai-completions"
 }
 
+func isGoogleGeminiProvider(provider string) bool {
+	p := strings.ToLower(strings.TrimSpace(provider))
+	return strings.Contains(p, "gemini") ||
+		strings.Contains(p, "google-generative") ||
+		strings.Contains(p, "google-ai")
+}
+
 func defaultProviderEndpoint(provider string) string {
 	p := strings.ToLower(strings.TrimSpace(provider))
 	switch {
 	case strings.Contains(p, "anthropic") || strings.Contains(p, "claude"):
 		return "https://api.anthropic.com"
+	case isGoogleGeminiProvider(p):
+		return "https://generativelanguage.googleapis.com/v1beta/openai"
 	case strings.Contains(p, "openai"):
 		return "https://api.openai.com"
 	case strings.Contains(p, "nvidia") || strings.Contains(p, "nim"):

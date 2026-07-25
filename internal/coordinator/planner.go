@@ -155,6 +155,12 @@ func ValidatePlanResponse(plan *PlanResponse) error {
 	}
 
 	domainIDs := make(map[string]struct{}, len(plan.Domains))
+	domainPaths := make(map[string][]string, len(plan.Domains))
+	type pathGrant struct {
+		domainID string
+		path     string
+	}
+	var grants []pathGrant
 	for _, domain := range plan.Domains {
 		id := strings.TrimSpace(domain.DomainID)
 		if id == "" {
@@ -167,17 +173,29 @@ func ValidatePlanResponse(plan *PlanResponse) error {
 			return fmt.Errorf("coordinator: duplicate domain id %q", id)
 		}
 		domainIDs[id] = struct{}{}
-		for _, path := range domain.AssignedPaths {
-			if IsProjectScanExcluded(path, DefaultProjectScanExcludes()) {
-				return fmt.Errorf("coordinator: domain %q assigned excluded path %q", id, path)
+		for _, rawPath := range domain.AssignedPaths {
+			if IsProjectScanExcluded(rawPath, DefaultProjectScanExcludes()) {
+				return fmt.Errorf("coordinator: domain %q assigned excluded path %q", id, rawPath)
 			}
-			if strings.TrimSpace(path) == "." {
-				return fmt.Errorf("coordinator: domain %q cannot own the project root", id)
+			assignedPath, err := normalizeOwnedPath(rawPath)
+			if err != nil {
+				return fmt.Errorf("coordinator: domain %q assigned path %q: %w", id, rawPath, err)
 			}
+			for _, grant := range grants {
+				if pathsOverlap(grant.path, assignedPath) {
+					return fmt.Errorf(
+						"coordinator: assigned paths %q (domain %q) and %q (domain %q) overlap",
+						grant.path, grant.domainID, assignedPath, id,
+					)
+				}
+			}
+			grants = append(grants, pathGrant{domainID: id, path: assignedPath})
+			domainPaths[id] = append(domainPaths[id], assignedPath)
 		}
 	}
 	nodeIDs := make(map[string]struct{}, len(plan.Nodes))
 	nodeDomains := make(map[string]string, len(plan.Nodes))
+	nodeHasDirective := make(map[string]bool, len(plan.Nodes))
 	for _, node := range plan.Nodes {
 		id := strings.TrimSpace(node.ID)
 		if id == "" {
@@ -192,12 +210,26 @@ func ValidatePlanResponse(plan *PlanResponse) error {
 		if _, ok := domainIDs[strings.TrimSpace(node.DomainID)]; !ok {
 			return fmt.Errorf("coordinator: node %q references unknown domain %q", id, node.DomainID)
 		}
-		for _, path := range node.TargetFiles {
-			if IsProjectScanExcluded(path, DefaultProjectScanExcludes()) {
-				return fmt.Errorf("coordinator: node %q targets excluded path %q", id, path)
+		for _, rawPath := range node.TargetFiles {
+			if IsProjectScanExcluded(rawPath, DefaultProjectScanExcludes()) {
+				return fmt.Errorf("coordinator: node %q targets excluded path %q", id, rawPath)
 			}
-			if isIntegrationDirectiveTarget(path) && strings.ToLower(filepath.Ext(strings.TrimSpace(path))) != ".json" {
-				return fmt.Errorf("coordinator: integration directive target %q must use a .json extension", path)
+			targetPath, err := normalizeOwnedPath(rawPath)
+			if err != nil {
+				return fmt.Errorf("coordinator: node %q target path %q: %w", id, rawPath, err)
+			}
+			nodeDomain := strings.TrimSpace(node.DomainID)
+			if !pathCoveredByOwnership(targetPath, domainPaths[nodeDomain]) {
+				return fmt.Errorf(
+					"coordinator: node %q target %q is outside domain %q assigned paths",
+					id, rawPath, nodeDomain,
+				)
+			}
+			if isIntegrationDirectiveTarget(targetPath) && strings.ToLower(filepath.Ext(targetPath)) != ".json" {
+				return fmt.Errorf("coordinator: integration directive target %q must use a .json extension", rawPath)
+			}
+			if isIntegrationDirectiveTarget(targetPath) {
+				nodeHasDirective[id] = true
 			}
 		}
 		nodeIDs[id] = struct{}{}
@@ -254,6 +286,9 @@ func ValidatePlanResponse(plan *PlanResponse) error {
 		if _, ok := edges[producer+"\x00"+consumer]; !ok {
 			return fmt.Errorf("coordinator: planned contract %q requires dependency edge %s -> %s", resource, producer, consumer)
 		}
+		if !nodeHasDirective[consumer] {
+			return fmt.Errorf("coordinator: planned contract %q consumer node %q requires an owned integration directive target", resource, consumer)
+		}
 		identity := producer + "\x00" + consumer + "\x00" + strings.ToLower(resource)
 		if _, exists := contracts[identity]; exists {
 			return fmt.Errorf("coordinator: duplicate planned contract %q between %s and %s", resource, producer, consumer)
@@ -288,6 +323,40 @@ func isIntegrationDirectiveTarget(path string) bool {
 	return strings.Contains("/"+clean, "/integration/directives/")
 }
 
+func normalizeOwnedPath(raw string) (string, error) {
+	value := strings.Trim(strings.TrimSpace(raw), "`\"'")
+	value = strings.ReplaceAll(value, "\\", "/")
+	if value == "" {
+		return "", fmt.Errorf("path is empty")
+	}
+	if filepath.IsAbs(value) || strings.HasPrefix(value, "/") {
+		return "", fmt.Errorf("path must be project-relative")
+	}
+	clean := filepath.ToSlash(filepath.Clean(value))
+	if clean == "." {
+		return "", fmt.Errorf("project root ownership is not allowed")
+	}
+	if clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", fmt.Errorf("path escapes the project root")
+	}
+	return strings.TrimPrefix(clean, "./"), nil
+}
+
+func pathsOverlap(left, right string) bool {
+	return left == right ||
+		strings.HasPrefix(left, right+"/") ||
+		strings.HasPrefix(right, left+"/")
+}
+
+func pathCoveredByOwnership(target string, assigned []string) bool {
+	for _, root := range assigned {
+		if target == root || strings.HasPrefix(target, root+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 type narrativeSection struct {
 	Heading string
 	Body    []string
@@ -314,6 +383,9 @@ func planFromNarrativeSpec(markdown string, scan *ProjectScan) *PlanResponse {
 			targetFiles = append([]string(nil), dependencyFiles...)
 			assignedPaths = assignedPathsFor(targetFiles)
 		}
+		if len(targetFiles) == 0 || len(assignedPaths) == 0 {
+			continue
+		}
 
 		plan.Domains = append(plan.Domains, Domain{
 			DomainID:      domainID,
@@ -328,10 +400,10 @@ func planFromNarrativeSpec(markdown string, scan *ProjectScan) *PlanResponse {
 			TargetFiles: targetFiles,
 			Priority:    int32(i + 1),
 		})
-		if i > 0 {
+		if len(plan.Nodes) > 1 {
 			plan.Edges = append(plan.Edges, TaskEdge{
-				FromNode: plan.Nodes[i-1].ID,
-				ToNode:   plan.Nodes[i].ID,
+				FromNode: plan.Nodes[len(plan.Nodes)-2].ID,
+				ToNode:   plan.Nodes[len(plan.Nodes)-1].ID,
 				Reason:   "narrative section ordering",
 			})
 		}
@@ -430,7 +502,14 @@ func assignedPathsFor(files []string) []string {
 			continue
 		}
 		dir := filepath.Dir(file)
-		if dir == "." || dir == "/" || dir == "" {
+		if dir == "." {
+			if _, ok := seen[file]; !ok {
+				seen[file] = struct{}{}
+				paths = append(paths, file)
+			}
+			continue
+		}
+		if dir == "/" || dir == "" {
 			continue
 		}
 		top := strings.Split(dir, string(filepath.Separator))[0]

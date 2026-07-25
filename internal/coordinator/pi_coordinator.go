@@ -920,7 +920,7 @@ Use the write tool now to create this exact output file:
 The output must be one JSON object with these exact fields:
 {"type":"plan_response","domains":[{"domain_id":"id","description":"area","assigned_paths":["relative/path"],"agent_type":"domain"}],"nodes":[{"id":"task-id","domain_id":"id","task_spec":"specific task","target_files":["relative/path/file.ext"],"priority":1}],"edges":[{"from_node":"producer-task-id","to_node":"consumer-task-id"}],"contracts":[{"resource":"public-resource","producer_node":"producer-task-id","consumer_node":"consumer-task-id","kind":"interface","language":"implementation-language","public_entrypoint":"exact consumer-visible locator","acceptance":["machine-checkable condition"],"hard_wait":true}]}
 
-Use empty edges or contracts arrays only when the build spec has no corresponding dependency. Do not use domain field "id", node field "assigned_paths", edge fields "from"/"to", or extra top-level integration_directives. Integration directives belong in node target_files and must end in .json.
+Use empty edges or contracts arrays only when the build spec has no corresponding dependency. Do not use domain field "id", node field "assigned_paths", edge fields "from"/"to", or extra top-level integration_directives. All assigned_paths must be project-relative and non-overlapping, and every target_file must be beneath its node domain's assigned_paths. Every cross-domain contract requires a .json integration directive in its consumer node target_files; do not assign that directive to the producer.
 After the write succeeds, reply only with a short confirmation.`, cause, paths.InputPath, paths.OutputPath))
 }
 
@@ -999,7 +999,8 @@ Read the planning input artifact at %s again and overwrite the output artifact w
 %s
 
 Every edge object must use exactly this shape: {"from_node":"source-task-id","to_node":"dependent-task-id"}.
-Every cross-domain artifact must use a contracts entry with resource, producer_node, consumer_node, kind, acceptance, and a matching producer-to-consumer edge. Every interface contract must also include language and an exact consumer-visible public_entrypoint. Integration directive targets must end in .json.
+Every assigned_path must be project-relative and non-overlapping, and every target_file must be beneath its node domain's assigned_paths.
+Every cross-domain artifact must use a contracts entry with resource, producer_node, consumer_node, kind, acceptance, and a matching producer-to-consumer edge. Every interface contract must also include language and an exact consumer-visible public_entrypoint. Every contract's consumer node must own a concrete integration/directives/*.json target; do not assign the cross-domain directive to its producer.
 Do not answer with the plan in chat. Write the corrected artifact directly.`, outputPath, validationErr.Error(), paths.InputPath, outputPath))
 	if c.traceFn != nil {
 		c.traceFn("requesting coordinator plan artifact repair after validation failure")

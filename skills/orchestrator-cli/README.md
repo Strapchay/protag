@@ -14,8 +14,6 @@ cd kernel && go build -o skills/orchestrator-cli/bin/orchestrator-cli ./cmd/orch
 
 | Command | Required Flags | Description |
 |---------|---------------|-------------|
-| `acquire-lock` | `--file`, `--agent-id` | Exclusive file lock |
-| `release-lock` | `--file`, `--agent-id` | Release file lock |
 | `update-node` | `--node-id`, `--status`; agent identity via `--agent-id` or env | Update an assigned task status |
 | `contract-request` | `--contract` | Request a versioned cross-domain artifact |
 | `contract-publish` | `--contract-id`, `--artifact-file` | Publish the next immutable artifact revision |
@@ -53,12 +51,12 @@ All commands output JSON to stdout. Errors output JSON to stderr with exit code 
 
 Success:
 ```json
-{"status": "acquired", "file": "internal/auth/handler.go"}
+{"node_id": "api-implementation", "status": "updated"}
 ```
 
 Error:
 ```json
-{"error": "lock: file 'auth.go' already locked by agent-123"}
+{"error": "agent is not assigned to node"}
 ```
 
 See [SKILL.md](SKILL.md) for full documentation and the execution loop protocol.

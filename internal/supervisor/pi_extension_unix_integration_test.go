@@ -84,7 +84,7 @@ func TestPiGatewayExtensionNormalizesTextEncodedToolCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	requestErrors := make(chan error, 3)
+	requestErrors := make(chan error, 4)
 	var requestCount atomic.Int32
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/aion/gateway/extension-loaded" {
@@ -104,6 +104,49 @@ func TestPiGatewayExtensionNormalizesTextEncodedToolCall(t *testing.T) {
 				requestErrors <- fmt.Errorf("Pi tools were not forwarded: %s", body)
 				return
 			}
+			chunk, _ := json.Marshal(map[string]any{
+				"id":    "native-tool-call",
+				"model": "test-model",
+				"choices": []any{map[string]any{
+					"delta": map[string]any{
+						"tool_calls": []any{map[string]any{
+							"index": 0,
+							"id":    "native-call-1",
+							"type":  "function",
+							"extra_content": map[string]any{
+								"google": map[string]any{
+									"thought_signature": "fixture-thought-signature",
+								},
+							},
+							"function": map[string]any{
+								"name":      "bash",
+								"arguments": `{"command":"printf native-tool-call"}`,
+							},
+						}},
+					},
+				}},
+			})
+			finish, _ := json.Marshal(map[string]any{
+				"id":    "native-tool-call",
+				"model": "test-model",
+				"choices": []any{map[string]any{
+					"delta":         map[string]any{},
+					"finish_reason": "stop",
+				}},
+			})
+			_, _ = fmt.Fprintf(w, "data: %s\n\ndata: %s\n\ndata: [DONE]\n\n", chunk, finish)
+			requestErrors <- nil
+			return
+		}
+		if number == 2 {
+			if !strings.Contains(string(body), "native-tool-call") {
+				requestErrors <- fmt.Errorf("native tool result missing from follow-up: %s", body)
+				return
+			}
+			if !strings.Contains(string(body), `"thought_signature":"fixture-thought-signature"`) {
+				requestErrors <- fmt.Errorf("native tool thought signature missing from follow-up: %s", body)
+				return
+			}
 			encoded := "{\n  \"name\": \"bash\",\n  \"parameters\": {\"command\": \"printf recovered-tool-call\n\"}\n}\n</tool_call>\n"
 			chunk, _ := json.Marshal(map[string]any{
 				"id":    "text-tool-call",
@@ -117,9 +160,13 @@ func TestPiGatewayExtensionNormalizesTextEncodedToolCall(t *testing.T) {
 			requestErrors <- nil
 			return
 		}
-		if number == 2 {
+		if number == 3 {
 			if !strings.Contains(string(body), "recovered-tool-call") {
 				requestErrors <- fmt.Errorf("recovered JSON tool result missing from follow-up: %s", body)
+				return
+			}
+			if !strings.Contains(string(body), `"thought_signature":"skip_thought_signature_validator"`) {
+				requestErrors <- fmt.Errorf("fallback tool thought signature missing from follow-up: %s", body)
 				return
 			}
 			encoded := "<function=bash>\n<parameter=command>\nprintf recovered-tagged-tool-call\n</parameter>\n</function>\n</tool_call>\n"
@@ -172,6 +219,7 @@ func TestPiGatewayExtensionNormalizesTextEncodedToolCall(t *testing.T) {
 			"AION_AGENT_CAPABILITY=test-capability",
 			"AION_TARGET_MODEL=test-model",
 			"AION_TARGET_PROFILE=test-profile",
+			"AION_TARGET_PROVIDER=google-gemini",
 			"AION_TARGET_API=openai-completions",
 			"PI_CODING_AGENT_DIR=" + filepath.Join(root, "pi-config"),
 		},
@@ -180,7 +228,7 @@ func TestPiGatewayExtensionNormalizesTextEncodedToolCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = process.Kill() })
-	if err := process.SendPrompt("Exercise the text-encoded tool-call adapter."); err != nil {
+	if err := process.SendPrompt("Exercise the native and text-encoded tool-call adapters."); err != nil {
 		t.Fatal(err)
 	}
 
@@ -203,10 +251,10 @@ func TestPiGatewayExtensionNormalizesTextEncodedToolCall(t *testing.T) {
 	}
 
 complete:
-	if requestCount.Load() != 3 {
-		t.Fatalf("expected recovered tool executions to produce three inference requests, got %d", requestCount.Load())
+	if requestCount.Load() != 4 {
+		t.Fatalf("expected tool executions to produce four inference requests, got %d", requestCount.Load())
 	}
-	for range 3 {
+	for range 4 {
 		if err := <-requestErrors; err != nil {
 			t.Fatal(err)
 		}

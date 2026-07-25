@@ -1057,7 +1057,11 @@ func (a *Allocator) dispatchReadyTasks(ctx context.Context) {
 		b.WriteString("Run `orchestrator-cli work-inbox --current` first and confirm this node is the authoritative active item. Work only this dispatched node. Do not claim or update another pending or unassigned node. If you discover a missing cross-domain resource, use `contract-ensure --wait` and end the turn instead of polling or guessing. Record a concise `work-checkpoint` before yielding incomplete work. After the terminal update, end the agent loop so the allocator can dispatch later work.\n")
 		b.WriteString("\nWorkspace root is /workspace. Resolve every target file from /workspace and write each exact target path once; do not duplicate its first path component after changing directories.\n")
 		b.WriteString("Persist every new implementation, fixture, and test beneath an owned target path. Do not create /workspace/tests or another shared root unless it is explicitly listed in this node's targets; place focused tests under the owned domain path instead.\n")
-		b.WriteString("When this work establishes or changes domain-level acceptance behavior, update the domain's schema-v1 JSON directive under `<assigned-path>/integration/directives/`; the kernel integration runner will execute it after all implementation and contract work is terminal.\n")
+		for _, target := range node.TargetFiles {
+			if isIntegrationDirectiveTarget(target) {
+				b.WriteString(fmt.Sprintf("Create the planned schema-v1 integration directive at %s. This exact consumer-owned target will be executed after implementation and contract work is terminal.\n", target))
+			}
+		}
 		b.WriteString("Your current working directory contains only your isolated writable domain mounts. Use contracts and orchestrator messages for cross-domain requirements.\n")
 
 		if err := agent.SendPrompt(b.String()); err != nil {

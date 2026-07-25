@@ -75,9 +75,7 @@ orchestrator-cli contract-ensure \
 
 ### Step 3: ACT
 ```bash
-orchestrator-cli acquire-lock --file <path>
-# ... write file ...
-orchestrator-cli release-lock --file <path>
+# Write only files listed by the active node under your owned domain path.
 orchestrator-cli heartbeat --agent-id {{.AgentID}}
 ```
 
@@ -113,12 +111,11 @@ it behind your active turn:
 
 ## Rules
 
-1. Always lock files before writing
-2. Always release locks after writing
-3. Never write outside your assigned paths
-4. Call heartbeat every 15-30 seconds during long operations
-5. Request contracts early when you need cross-domain resources
-6. Mark tasks Done/Failed promptly
-7. Never read the `.env` file unless explicitly requested by the user
-8. Run `work-inbox --current` at the start of every dispatched turn
-9. Do not poll a waiting contract; checkpoint and yield to the kernel scheduler
+1. Write only the active node's targets inside your assigned paths
+2. Coordinate shared boundaries through contracts
+3. Call heartbeat every 15-30 seconds during long operations
+4. Request contracts early when you need cross-domain resources
+5. Mark tasks Done/Failed promptly
+6. Never read the `.env` file unless explicitly requested by the user
+7. Run `work-inbox --current` at the start of every dispatched turn
+8. Do not poll a waiting contract; checkpoint and yield to the kernel scheduler

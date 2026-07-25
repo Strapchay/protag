@@ -463,11 +463,23 @@ function convertMessages(context: Context): any[] {
         .join("");
       const toolCalls = message.content
         .filter((block) => block.type === "toolCall")
-        .map((block: any) => ({
-          id: block.id,
-          type: "function",
-          function: { name: block.name, arguments: JSON.stringify(block.arguments) },
-        }));
+        .map((block: any) => {
+          const thoughtSignature =
+            block.thoughtSignature ||
+            (isGoogleGeminiTarget() ? "skip_thought_signature_validator" : "");
+          return {
+            id: block.id,
+            type: "function",
+            function: { name: block.name, arguments: JSON.stringify(block.arguments) },
+            ...(thoughtSignature
+              ? {
+                  extra_content: {
+                    google: { thought_signature: thoughtSignature },
+                  },
+                }
+              : {}),
+          };
+        });
       if (text || toolCalls.length) {
         messages.push({
           role: "assistant",
@@ -611,6 +623,7 @@ async function consumeOpenAIStream(
     }
     for (const toolCall of delta.tool_calls ?? []) {
       const streamIndex = typeof toolCall.index === "number" ? toolCall.index : undefined;
+      const thoughtSignature = toolCall.extra_content?.google?.thought_signature || "";
       if (
         !currentBlock ||
         currentBlock.type !== "toolCall" ||
@@ -624,6 +637,7 @@ async function consumeOpenAIStream(
           arguments: {},
           partialArgs: "",
           streamIndex,
+          thoughtSignature: thoughtSignature || undefined,
         };
         output.content.push(currentBlock);
         stream.push({
@@ -634,6 +648,7 @@ async function consumeOpenAIStream(
       }
       currentBlock.id ||= toolCall.id || "";
       currentBlock.name ||= toolCall.function?.name || "";
+      currentBlock.thoughtSignature ||= thoughtSignature || undefined;
       const argumentDelta = toolCall.function?.arguments || "";
       currentBlock.partialArgs += argumentDelta;
       currentBlock.arguments = parseStreamingJson(currentBlock.partialArgs);
@@ -646,6 +661,18 @@ async function consumeOpenAIStream(
     }
   }
   finishCurrentBlock();
+  if (output.content.some((block) => block.type === "toolCall")) {
+    output.stopReason = "toolUse";
+  }
+}
+
+function isGoogleGeminiTarget(): boolean {
+  const provider = env("AION_TARGET_PROVIDER").trim().toLowerCase();
+  return (
+    provider.includes("gemini") ||
+    provider.includes("google-generative") ||
+    provider.includes("google-ai")
+  );
 }
 
 function couldBeTextEncodedToolCall(text: string): boolean {

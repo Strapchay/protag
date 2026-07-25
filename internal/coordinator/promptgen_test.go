@@ -35,6 +35,9 @@ func TestGenerateSystemInstructionsIncludesBuildSpecAndCoordinationRules(t *test
 		"The loaded orchestrator-cli skill is authoritative for commands and workflow.",
 		"integration/directives/*.json",
 		"reserved kernel execution manifests",
+		"Create one only when its exact path appears in the active node's target files",
+		"Cross-domain directives are consumer-owned",
+		"producer nodes publish public contract descriptors and focused unit tests",
 		"overrides any contradictory Build Spec wording",
 		"application input, configuration",
 		"strictly rejects unknown fields",
@@ -56,6 +59,11 @@ func TestGenerateSystemInstructionsIncludesBuildSpecAndCoordinationRules(t *test
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
 	}
+	for _, forbidden := range []string{"acquire-lock", "release-lock", "Never write without a lock"} {
+		if strings.Contains(prompt, forbidden) {
+			t.Fatalf("domain prompt retained obsolete lock requirement %q:\n%s", forbidden, prompt)
+		}
+	}
 }
 
 func TestGenerateCoordinatorPlanningInstructionUsesArtifactOnly(t *testing.T) {
@@ -75,6 +83,8 @@ func TestGenerateCoordinatorPlanningInstructionUsesArtifactOnly(t *testing.T) {
 		"\"from_node\":\"source-task-id\"",
 		"exact `from_node` and `to_node` field names",
 		"`from_node` is the prerequisite/producer",
+		"All assigned_paths must be project-relative and non-overlapping",
+		"Every target_file must be beneath its node domain's assigned_paths",
 		"one cohesive implementation-and-test node per explicit domain",
 		"enumerate the concrete test files in that node's target_files",
 		"\"contracts\":[",
@@ -82,6 +92,8 @@ func TestGenerateCoordinatorPlanningInstructionUsesArtifactOnly(t *testing.T) {
 		"\"public_entrypoint\":\"exact consumer-visible import, package, route, or resource locator\"",
 		"never make an isolated consumer guess an import path",
 		"Every target under `integration/directives/` must be a concrete file ending in `.json`",
+		"For every cross-domain contract, include at least one concrete `integration/directives/*.json` target in the consumer node",
+		"producer nodes publish the public descriptor and focused unit tests",
 		"reserved for schema-v1 kernel execution manifests",
 		"never as application input or configuration",
 		"Honor any explicit domain count or ownership split",
@@ -107,6 +119,8 @@ func TestGenerateArchitectInstructionDefinesReservedIntegrationDirectiveSemantic
 	for _, want := range []string{
 		"reserved kernel execution-manifest namespace",
 		"schema-v1 executable acceptance manifest",
+		"Every cross-domain contract must name a consumer-owned integration directive",
+		"Producers publish public descriptors and unit tests",
 		"Never describe it as application input/configuration",
 	} {
 		if !strings.Contains(prompt, want) {

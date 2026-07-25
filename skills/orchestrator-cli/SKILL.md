@@ -1,6 +1,6 @@
 ---
 name: orchestrator-cli
-description: Aion-Kernel coordination tools for multi-agent orchestration. Provides file locking, DAG state management, durable artifact contracts, and heartbeat monitoring.
+description: Aion-Kernel coordination tools for multi-agent orchestration. Provides DAG state management, durable artifact contracts, and heartbeat monitoring.
 ---
 
 # orchestrator-cli Skill
@@ -32,18 +32,6 @@ Inbox order is correction, validation, publication, then ready DAG work. An acti
 ### `orchestrator-cli work-checkpoint --item <work-item-id> --summary <text> [--next <text>]`
 
 Persist a concise recovery summary before yielding incomplete work. Checkpoints do not replace or duplicate DAG and contract state; the referenced item must be visible in your inbox.
-
-### `orchestrator-cli acquire-lock --file <path> --agent-id <uuid>`
-
-Acquire an exclusive write lock on a file. **You MUST acquire a lock before writing any file.**
-
-- Returns `{"status": "acquired"}` on success
-- Returns error if file is locked by another agent or is shared
-- Shared files cannot be locked; coordinate through artifact contracts
-
-### `orchestrator-cli release-lock --file <path> --agent-id <uuid>`
-
-Release a previously acquired lock. **Always release locks after writing.**
 
 ### `orchestrator-cli update-node --node-id <uuid> --status <status> [--agent-id <uuid>]`
 
@@ -137,18 +125,20 @@ unrelated work. Agents never own the reconciliation lease or modify ownership.
 
 ### Integration directives
 
-When a domain has an executable public acceptance check, publish one schema-v1
-JSON directive beneath `<assigned-path>/integration/directives/`. Use an
-absolute `/usr` or `/bin` command array and include at least one
-`owner_node_ids` entry from your domain. List every consumed public artifact in
-`required_contracts`. Omit `working_directory` when the command crosses domain
-boundaries so the runner uses the assembled `/workspace` root. The kernel runs
-these directives only after DAG and coordination work are terminal, in a
-network-isolated assembled workspace where all domain outputs and contracts are
-read-only. Validate the JSON and your owned unit tests, then complete the node;
-do not search for peer source or execute a cross-domain directive from the
-Domain Agent workspace. Do not run `integration-run` from a Domain Agent;
-retry authority is an operator action.
+Create a schema-v1 integration directive only when its exact
+`<assigned-path>/integration/directives/*.json` path appears in the current
+node's `target_files`. Cross-domain directives belong to the consumer node.
+Producers publish public contract descriptors and focused unit tests instead of
+inventing an unplanned directive. Use an absolute `/usr` or `/bin` command array
+and include the current node in `owner_node_ids`. List every consumed public
+artifact in `required_contracts`. Omit `working_directory` when the command
+crosses domain boundaries so the runner uses the assembled `/workspace` root.
+The kernel runs these directives only after DAG and coordination work are
+terminal, in a network-isolated assembled workspace where all domain outputs
+and contracts are read-only. Validate the JSON and your owned unit tests, then
+complete the node; do not search for peer source or execute a cross-domain
+directive from the Domain Agent workspace. Do not run `integration-run` from a
+Domain Agent; retry authority is an operator action.
 
 ## Execution Loop
 
@@ -166,9 +156,7 @@ Every Domain Agent follows this loop for each assigned task:
 - If you need a cross-domain resource, use `contract-ensure`; add `--wait` only for a hard dependency
 
 ### 3. ACT
-- `acquire-lock` on each file before writing
-- Write the code
-- `release-lock` after writing
+- Write only the current node's target files beneath your isolated writable domain
 - Call `heartbeat` periodically during long local operations
 
 ### 4. VALIDATE
@@ -199,8 +187,8 @@ Pi is idle or queues them behind the active turn:
 
 ## Coordination Rules
 
-1. **Never write without a lock.** Always `acquire-lock`, write, then `release-lock`.
-2. **Never lock shared files.** Shared entrypoints are coordinated through explicit contracts.
+1. **Stay inside ownership.** Write only the active node's targets beneath the isolated domain mount.
+2. **Coordinate shared boundaries.** Use explicit contracts rather than writing another domain or shared entrypoint.
 3. **Request contracts early.** Do not invent another domain's interface or inspect its workspace.
 4. **Validate revisions.** A produced artifact is not fulfilled until the consumer accepts it.
 5. **Use stable command IDs for retries.** A conflicting reuse is rejected.
