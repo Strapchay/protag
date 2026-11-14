@@ -127,3 +127,40 @@ func TestAgentsPaneKeepsActiveTabVisibleWhenOverflowing(t *testing.T) {
 		t.Fatalf("active agent should remain visible: %s", lines[0])
 	}
 }
+
+func TestToolResultRenderingIsBounded(t *testing.T) {
+	rendered := formatLogEvent(tuiEventMsg{
+		Kind:    tuiKindToolResult,
+		Content: "first line\nsecond line that should not render",
+	})
+	if !strings.Contains(rendered, "Result: first line") {
+		t.Fatalf("unexpected tool result rendering: %q", rendered)
+	}
+	if strings.Contains(rendered, "second line") {
+		t.Fatalf("tool result preview was not bounded: %q", rendered)
+	}
+}
+
+func TestAgentLogCoalescesSnapshotsByBlock(t *testing.T) {
+	m := NewMultiLogModel("127.0.0.1:0")
+
+	m.appendAgentEvent("agent-report", tuiEventMsg{
+		AgentID: "agent-report", Kind: tuiKindThinking, Content: "first",
+		Stream: tuiStreamSnapshot, Block: "agent-report-1",
+	})
+	m.appendAgentEvent("agent-report", tuiEventMsg{
+		AgentID: "agent-report", Kind: tuiKindThinking, Content: "first thought",
+		Stream: tuiStreamSnapshot, Block: "agent-report-1",
+	})
+	if got := len(m.agentOutput["agent-report"]); got != 1 {
+		t.Fatalf("expected one coalesced log line, got %d", got)
+	}
+
+	m.appendAgentEvent("agent-report", tuiEventMsg{
+		AgentID: "agent-report", Kind: tuiKindThinking, Content: "new block",
+		Stream: tuiStreamSnapshot, Block: "agent-report-2",
+	})
+	if got := len(m.agentOutput["agent-report"]); got != 2 {
+		t.Fatalf("expected a new line for a new block, got %d", got)
+	}
+}

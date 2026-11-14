@@ -393,6 +393,9 @@ func (m *MultiLogModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			})
 		}
 		normalizer := &tuiEventNormalizer{}
+		m.agentOutput = make(map[string][]string)
+		m.lastBlock = make(map[string]string)
+		m.lastKind = make(map[string]string)
 		for _, raw := range msg.Messages {
 			for _, event := range normalizer.Normalize(raw) {
 				if event.Audience != tuiAudienceLogs {
@@ -402,17 +405,7 @@ func (m *MultiLogModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if !isDisplayAgent(id) {
 					continue
 				}
-				m.ensureAgent(id)
-				m.agentOutput[id] = append(m.agentOutput[id], formatLogEvent(event))
-				if len(m.agentOutput[id]) > 500 {
-					m.agentOutput[id] = m.agentOutput[id][len(m.agentOutput[id])-500:]
-				}
-				m.renderDirty[id] = true
-				meta := m.agentMeta[id]
-				meta.LastKind = event.Kind
-				meta.LastStatus = event.Content
-				meta.LastLevel = event.Level
-				m.agentMeta[id] = meta
+				m.appendAgentEvent(id, event)
 			}
 		}
 		for id, vp := range m.viewports {
@@ -444,32 +437,7 @@ func (m *MultiLogModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.readNextCmd())
 			return m, tea.Batch(cmds...)
 		}
-		m.ensureAgent(id)
-
-		line := formatLogEvent(msg)
-		output := m.agentOutput[id]
-		sameBlock := msg.Block != "" && m.lastBlock[id] == msg.Block && m.lastKind[id] == msg.Kind
-		switch {
-		case sameBlock && msg.Stream == tuiStreamDelta && len(output) > 0:
-			output[len(output)-1] += msg.Content
-		case sameBlock && msg.Stream != tuiStreamDelta && len(output) > 0:
-			output[len(output)-1] = line
-		default:
-			output = append(output, line)
-			if len(output) > 500 {
-				output = output[len(output)-500:]
-			}
-		}
-		m.agentOutput[id] = output
-		m.lastBlock[id] = msg.Block
-		m.lastKind[id] = msg.Kind
-		m.renderDirty[id] = true
-
-		meta := m.agentMeta[id]
-		meta.LastKind = msg.Kind
-		meta.LastStatus = msg.Content
-		meta.LastLevel = msg.Level
-		m.agentMeta[id] = meta
+		m.appendAgentEvent(id, msg)
 
 		vp := m.viewports[id]
 		wasAtBottom := vp.AtBottom()
@@ -654,6 +622,34 @@ func (m *MultiLogModel) renderAgentOutput(id string, width int) string {
 	return rendered
 }
 
+func (m *MultiLogModel) appendAgentEvent(id string, event tuiEventMsg) {
+	m.ensureAgent(id)
+	line := formatLogEvent(event)
+	output := m.agentOutput[id]
+	sameBlock := event.Block != "" && m.lastBlock[id] == event.Block && m.lastKind[id] == event.Kind
+	switch {
+	case sameBlock && event.Stream == tuiStreamDelta && len(output) > 0:
+		output[len(output)-1] += event.Content
+	case sameBlock && event.Stream != tuiStreamDelta && len(output) > 0:
+		output[len(output)-1] = line
+	default:
+		output = append(output, line)
+		if len(output) > 500 {
+			output = output[len(output)-500:]
+		}
+	}
+	m.agentOutput[id] = output
+	m.lastBlock[id] = event.Block
+	m.lastKind[id] = event.Kind
+	m.renderDirty[id] = true
+
+	meta := m.agentMeta[id]
+	meta.LastKind = event.Kind
+	meta.LastStatus = event.Content
+	meta.LastLevel = event.Level
+	m.agentMeta[id] = meta
+}
+
 func formatLogEvent(msg tuiEventMsg) string {
 	switch msg.Kind {
 	case tuiKindThinking:
@@ -664,6 +660,18 @@ func formatLogEvent(msg tuiEventMsg) string {
 			summary = "Tool: " + msg.Tool + "(" + msg.Input + ")"
 		}
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true).Render(summary)
+	case tuiKindToolResult:
+		preview := strings.TrimSpace(msg.Content)
+		if idx := strings.IndexByte(preview, '\n'); idx >= 0 {
+			preview = preview[:idx]
+		}
+		if len(preview) > 160 {
+			preview = preview[:160] + "..."
+		}
+		if preview == "" {
+			preview = "(no output)"
+		}
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("Result: " + preview)
 	default:
 		return msg.Content
 	}

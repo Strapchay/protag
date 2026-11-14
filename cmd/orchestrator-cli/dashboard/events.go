@@ -13,11 +13,12 @@ const (
 	tuiAudienceLogs   = "logs"
 	tuiAudienceStatus = "status"
 
-	tuiKindText      = "text"
-	tuiKindThinking  = "thinking"
-	tuiKindToolStart = "tool_start"
-	tuiKindRaw       = "raw"
-	tuiKindStatus    = "status"
+	tuiKindText       = "text"
+	tuiKindThinking   = "thinking"
+	tuiKindToolStart  = "tool_start"
+	tuiKindToolResult = "tool_result"
+	tuiKindRaw        = "raw"
+	tuiKindStatus     = "status"
 
 	tuiStreamSnapshot = "snapshot"
 	tuiStreamDelta    = "delta"
@@ -100,6 +101,9 @@ func (n *tuiEventNormalizer) Normalize(msg hub.Message) []tuiEventMsg {
 	agentID := n.normalizeAgentID(msg)
 	payload := parseTUIPayload(msg.Payload)
 	kind := payload.Type
+	if payload.Role == "toolResult" || payload.Role == "tool" {
+		kind = tuiKindToolResult
+	}
 	if kind == "" {
 		kind = tuiKindRaw
 	}
@@ -259,15 +263,14 @@ func coalesceAgentID(msg hub.Message) string {
 }
 
 func isChatRelevant(msg hub.Message, agentID, role, kind string) bool {
-	if kind == tuiKindStatus {
+	if kind == tuiKindStatus || kind == tuiKindToolResult {
 		return false
 	}
-	if agentID == "context_prompt" || agentID == "user" || role == "user" {
+	if agentID == "context_prompt" || agentID == "user" {
 		return true
 	}
-	if msg.ToAgent == "tui" {
-		return true
-	}
+	// Domain agents stream into the Agents pane. Architect Chat stays focused
+	// on the user-facing planning conversation.
 	return agentID == "orchestrator" || agentID == "architect" || agentID == "coordinator"
 }
 

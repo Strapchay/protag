@@ -31,19 +31,20 @@ type chatLine struct {
 }
 
 type ChatModel struct {
-	addr            string
-	viewport        viewport.Model
-	input           textarea.Model
-	history         []chatLine
-	width           int
-	height          int
-	Focused         bool
-	FocusHistory    bool
-	autoScroll      bool
-	logger          *log.Logger
-	buildSpecActive bool
-	inputBlurred    bool
-	deferRender     bool
+	addr             string
+	viewport         viewport.Model
+	input            textarea.Model
+	history          []chatLine
+	width            int
+	height           int
+	Focused          bool
+	FocusHistory     bool
+	autoScroll       bool
+	logger           *log.Logger
+	buildSpecActive  bool
+	inputBlurred     bool
+	deferRender      bool
+	pendingTrimLines int
 }
 
 type architectCommand struct {
@@ -79,7 +80,7 @@ var architectCommands = []architectCommand{
 
 func NewChatModel(addr string) *ChatModel {
 	ti := textarea.New()
-	ti.Placeholder = "Type a message for the Solution Architect... (Press 'ESC' to unfocus)"
+	ti.Placeholder = "Type a message for the Solution Architect... (Tab: switch panes, Esc: unfocus)"
 	ti.Focus()
 	ti.CharLimit = 0
 	ti.ShowLineNumbers = false
@@ -312,9 +313,9 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// Update placeholder based on scroll state
 	if !m.autoScroll {
-		m.input.Placeholder = "History Mode (Scroll down to resume auto-scroll)"
+		m.input.Placeholder = "History Mode (scroll down to resume) — Tab: switch panes"
 	} else {
-		m.input.Placeholder = "Type a message for the Solution Architect... (Press 'ESC' to unfocus)"
+		m.input.Placeholder = "Type a message for the Solution Architect... (Tab: switch panes, Esc: unfocus)"
 	}
 
 	return m, tea.Batch(cmds...)
@@ -389,8 +390,9 @@ func (m *ChatModel) AddMessage(agentID, author, text string, style lipgloss.Styl
 // block, snapshots replace it. Block identity prevents separate assistant
 // messages from being merged.
 func (m *ChatModel) addStreamMessage(agentID, author, text string, style lipgloss.Style, msgType, block, stream string) {
-	// Allow streaming for architects, users, the orchestrator, and the initial context prompt chunks
-	isStreamable := agentID == "architect" || agentID == "user" || agentID == "orchestrator" || agentID == "context_prompt"
+	// Allow streaming for any agent that supplies an explicit stream block, plus
+	// the user-facing transcript identities.
+	isStreamable := block != "" || agentID == "architect" || agentID == "user" || agentID == "orchestrator" || agentID == "context_prompt"
 	if len(m.history) > 0 && isStreamable && (msgType == tuiKindText || msgType == tuiKindThinking) {
 		last := &m.history[len(m.history)-1]
 		sameBlock := block != "" && last.Block == block
@@ -460,12 +462,32 @@ func (m *ChatModel) addStreamMessage(agentID, author, text string, style lipglos
 	m.MeasureLine(&newLine)
 	m.history = append(m.history, newLine)
 
-	if len(m.history) > 500 {
-		m.history = m.history[len(m.history)-500:]
+	if removed := m.trimHistory(); removed > 0 {
+		m.pendingTrimLines += removed
 	}
 	if !m.deferRender {
 		m.renderHistory()
 	}
+}
+
+// trimHistory drops the oldest messages once the history exceeds the render
+// budget and reports how many rendered lines were removed. The caller uses the
+// count to keep a scrolled-up viewport anchored to the same content.
+func (m *ChatModel) trimHistory() int {
+	if len(m.history) <= 500 {
+		return 0
+	}
+	cut := len(m.history) - 500
+	removed := 0
+	for i := 0; i < cut; i++ {
+		lines := m.history[i].LineCount
+		if lines < 1 {
+			lines = 1
+		}
+		removed += lines
+	}
+	m.history = m.history[cut:]
+	return removed
 }
 
 func (m *ChatModel) MeasureLine(line *chatLine) {
@@ -612,6 +634,18 @@ func (m *ChatModel) renderHistory() {
 	if m.logger != nil {
 		m.logger.Printf("Render: Total Lines: %d, VP Height: %d, YOffset: %d, AtBottom: %v, AutoScroll: %v",
 			totalLines, m.viewport.Height, m.viewport.YOffset, m.viewport.AtBottom(), m.autoScroll)
+	}
+
+	// Preserve the visible content when the oldest history was trimmed. SetContent
+	// clamps offsets against the new length, so apply the adjustment first.
+	if m.pendingTrimLines > 0 {
+		if !m.autoScroll {
+			m.viewport.YOffset -= m.pendingTrimLines
+			if m.viewport.YOffset < 0 {
+				m.viewport.YOffset = 0
+			}
+		}
+		m.pendingTrimLines = 0
 	}
 
 	m.viewport.SetContent(contentStr)

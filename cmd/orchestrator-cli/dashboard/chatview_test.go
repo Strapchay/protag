@@ -271,3 +271,92 @@ func TestChatNormalizerCarriesStreamMetadata(t *testing.T) {
 	}
 	t.Fatal("missing chat event")
 }
+
+func TestChatHistoryTrimAnchorsScrolledViewport(t *testing.T) {
+	m := NewChatModel("127.0.0.1:0")
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 20})
+	m.autoScroll = false
+	m.history = make([]chatLine, 501)
+	for i := range m.history {
+		m.history[i] = chatLine{
+			AgentID: "orchestrator", Author: "Architect", Text: "x",
+			Type: tuiKindText, CachedRender: "x\n", LineCount: 1,
+		}
+	}
+	m.viewport.YOffset = 100
+
+	removed := m.trimHistory()
+	if removed != 1 || len(m.history) != 500 {
+		t.Fatalf("trim removed=%d remaining=%d", removed, len(m.history))
+	}
+
+	m.pendingTrimLines = removed
+	m.renderHistory()
+	if m.viewport.YOffset != 99 {
+		t.Fatalf("scrolled viewport shifted to %d, want 99", m.viewport.YOffset)
+	}
+}
+
+func TestDomainAgentStreamIsLogsOnly(t *testing.T) {
+	msg, err := hub.NewMessage(hub.MsgContextShare, "agent-ledger", "tui", map[string]string{
+		"type":    tuiKindText,
+		"content": "wrote ledger/api.py",
+		"role":    "assistant",
+		"stream":  tuiStreamSnapshot,
+		"block":   "agent-ledger-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, event := range (&tuiEventNormalizer{}).Normalize(*msg) {
+		if event.Audience == tuiAudienceChat {
+			t.Fatalf("domain agent leaked into chat: %#v", event)
+		}
+	}
+}
+
+func TestToolResultIsLogsOnlyAndClassified(t *testing.T) {
+	msg, err := hub.NewMessage(hub.MsgContextShare, "agent-report", "tui", map[string]string{
+		"type":    tuiKindText,
+		"content": "line one\nline two",
+		"role":    "toolResult",
+		"stream":  tuiStreamSnapshot,
+		"block":   "agent-report-9",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var found bool
+	for _, event := range (&tuiEventNormalizer{}).Normalize(*msg) {
+		if event.Audience == tuiAudienceChat {
+			t.Fatalf("tool result leaked into chat: %#v", event)
+		}
+		if event.Audience == tuiAudienceLogs && event.Kind == tuiKindToolResult {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("tool result was not classified for the agents pane")
+	}
+}
+
+func TestInternalUserRolePromptDoesNotLeakIntoChat(t *testing.T) {
+	msg, err := hub.NewMessage(hub.MsgContextShare, "agent-report", "tui", map[string]string{
+		"type":    tuiKindText,
+		"content": "AUTOMATIC INCOMPLETE-TURN RETRY 1/1",
+		"role":    "user",
+		"stream":  tuiStreamSnapshot,
+		"block":   "agent-report-50",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, event := range (&tuiEventNormalizer{}).Normalize(*msg) {
+		if event.Audience == tuiAudienceChat {
+			t.Fatalf("internal retry prompt leaked into chat: %#v", event)
+		}
+	}
+}
