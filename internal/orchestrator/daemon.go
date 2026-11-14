@@ -988,6 +988,7 @@ func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunSta
 			"AION_TARGET_MODEL=" + model,
 			"AION_TARGET_API=" + gatewayAPIForProvider(targetProviderForCoordinator(config, infConfig)),
 		}
+		piConfig.ResolutionEnv = append(piConfig.ResolutionEnv, targetInferenceEnv()...)
 	}
 	return coordinator.NewPiCoordinator(projectRoot, piConfig), nil
 }

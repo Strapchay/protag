@@ -264,6 +264,7 @@ func (a *Allocator) AllocateWithOptions(ctx context.Context, domains []coordinat
 				fmt.Sprintf("AION_TARGET_MODEL=%s", targetModel),
 				fmt.Sprintf("AION_TARGET_API=%s", gatewayAPIForProvider(targetProvider)),
 			)
+			envVars = append(envVars, targetInferenceEnv()...)
 		}
 
 		// Domain instructions live in Pi's configured AGENTS.md context. Starting
@@ -1340,4 +1341,22 @@ func findInboxItem(inbox *WorkInbox, workItemID string) (WorkItem, bool) {
 		}
 	}
 	return WorkItem{}, false
+}
+
+// targetInferenceEnv forwards optional Pi target tuning values to sandboxed
+// agents. Non-isolated agents inherit the daemon environment; isolated agents
+// receive only the environment explicitly attached to their command.
+func targetInferenceEnv() []string {
+	names := []string{
+		"AION_TARGET_MAX_TOKENS",
+		"AION_TARGET_CONTEXT_WINDOW",
+		"AION_TARGET_REASONING_EFFORT",
+	}
+	values := make([]string, 0, len(names))
+	for _, name := range names {
+		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+			values = append(values, name+"="+value)
+		}
+	}
+	return values
 }

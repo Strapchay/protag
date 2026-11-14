@@ -131,6 +131,12 @@ inference:
       endpoint: "${AION_PROFILE_LYRIC_ENDPOINT}"
       env:
         ${AION_PROFILE_LYRIC_ENV_KEY}: "${AION_PROFILE_LYRIC_API_KEY}"
+    phoenix:
+      provider: "${AION_PROFILE_PHOENIX_PROVIDER}"
+      model: "${AION_PROFILE_PHOENIX_MODEL}"
+      endpoint: "${AION_PROFILE_PHOENIX_ENDPOINT}"
+      env:
+        ${AION_PROFILE_PHOENIX_ENV_KEY}: "${AION_PROFILE_PHOENIX_API_KEY}"
 
   coordinator:
     use_profile: "${AION_COORDINATOR_PROFILE}"
