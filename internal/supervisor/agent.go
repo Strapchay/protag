@@ -119,6 +119,10 @@ type AgentRuntimeSnapshot struct {
 	PID                 int                 `json:"pid,omitempty"`
 	WorkspaceGeneration uint64              `json:"workspace_generation,omitempty"`
 	Workspace           *isolation.Snapshot `json:"workspace,omitempty"`
+	InTurn              bool                `json:"in_turn"`
+	ToolActive          bool                `json:"tool_active"`
+	LastHeartbeat       time.Time           `json:"last_heartbeat,omitempty"`
+	LastProgress        time.Time           `json:"last_progress,omitempty"`
 }
 
 // NewAgentSupervisor creates a new agent supervisor.
@@ -637,12 +641,13 @@ func (s *AgentSupervisor) DomainID() string {
 
 func (s *AgentSupervisor) RuntimeSnapshot() AgentRuntimeSnapshot {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	snapshot := AgentRuntimeSnapshot{
 		AgentID:             s.config.AgentID,
 		DomainID:            s.config.DomainID,
 		State:               s.state.String(),
 		WorkspaceGeneration: s.workspaceGen,
+		InTurn:              s.isThinking,
+		ToolActive:          s.toolActive,
 	}
 	if s.piAgent != nil && s.piAgent.IsAlive() {
 		snapshot.PID = s.piAgent.PID()
@@ -650,6 +655,11 @@ func (s *AgentSupervisor) RuntimeSnapshot() AgentRuntimeSnapshot {
 	if s.workspace != nil {
 		workspace := s.workspace.Snapshot()
 		snapshot.Workspace = &workspace
+	}
+	hm := s.healthMonitor
+	s.mu.Unlock()
+	if hm != nil {
+		snapshot.LastHeartbeat, snapshot.LastProgress = hm.Snapshot()
 	}
 	return snapshot
 }

@@ -82,6 +82,13 @@ func (h *HealthMonitor) OnTimeout(cb func(agentID string, status HealthStatus)) 
 	h.onTimeout = cb
 }
 
+// Snapshot returns the last heartbeat and progress timestamps.
+func (h *HealthMonitor) Snapshot() (time.Time, time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lastHeartbeat, h.lastProgress
+}
+
 // RecordHeartbeat records that a heartbeat was received.
 func (h *HealthMonitor) RecordHeartbeat() {
 	h.mu.Lock()

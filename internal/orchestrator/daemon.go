@@ -582,12 +582,56 @@ func (d *Daemon) shouldSuppressStaleNodeAudit(node dag.DagNode) bool {
 	if expectedAgent == "" || d.allocator == nil {
 		return true
 	}
+	progressWindow := 2 * time.Minute
+	if d.config != nil && d.config.Health.ProgressTimeoutSec > 0 {
+		progressWindow = time.Duration(d.config.Health.ProgressTimeoutSec) * time.Second
+	}
+	gatewayActive := gatewayHasActiveAgent(d.inferenceGateway, expectedAgent)
 	for _, info := range d.allocator.AgentInfos() {
-		if info.AgentID == expectedAgent && info.State == "Running" {
-			return false
+		if info.AgentID != expectedAgent {
+			continue
 		}
+		if info.State != "Running" {
+			return true
+		}
+		return agentActivitySuppressesStale(info, gatewayActive, progressWindow, time.Now())
 	}
 	return true
+}
+
+// agentActivitySuppressesStale reports whether live agent work explains an old
+// node timestamp. Warnings should reflect genuine stalls, not a turn or tool
+// that is still producing inference activity.
+func agentActivitySuppressesStale(info AgentInfo, gatewayActive bool, progressWindow time.Duration, now time.Time) bool {
+	if info.InTurn || info.ToolActive || gatewayActive {
+		return true
+	}
+	if progressWindow > 0 {
+		if !info.LastProgress.IsZero() && now.Sub(info.LastProgress) < progressWindow {
+			return true
+		}
+		if !info.LastHeartbeat.IsZero() && now.Sub(info.LastHeartbeat) < progressWindow {
+			return true
+		}
+	}
+	return false
+}
+
+func gatewayHasActiveAgent(gateway *InferenceGateway, agentID string) bool {
+	if gateway == nil || strings.TrimSpace(agentID) == "" {
+		return false
+	}
+	for _, request := range gateway.Status().Active {
+		if request.AgentID != agentID {
+			continue
+		}
+		switch request.Phase {
+		case "completed", "failed", "canceled":
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 func attemptOwnsNode(attempt *BuildSpecAttempt, nodeID string) bool {

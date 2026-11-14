@@ -632,6 +632,10 @@ type AgentInfo struct {
 	PID                 int                 `json:"pid,omitempty"`
 	WorkspaceGeneration uint64              `json:"workspace_generation,omitempty"`
 	Workspace           *isolation.Snapshot `json:"workspace,omitempty"`
+	InTurn              bool                `json:"in_turn"`
+	ToolActive          bool                `json:"tool_active"`
+	LastHeartbeat       time.Time           `json:"last_heartbeat,omitempty"`
+	LastProgress        time.Time           `json:"last_progress,omitempty"`
 }
 
 func (a *Allocator) AgentInfos() []AgentInfo {
@@ -648,6 +652,10 @@ func (a *Allocator) AgentInfos() []AgentInfo {
 			PID:                 runtime.PID,
 			WorkspaceGeneration: runtime.WorkspaceGeneration,
 			Workspace:           runtime.Workspace,
+			InTurn:              runtime.InTurn,
+			ToolActive:          runtime.ToolActive,
+			LastHeartbeat:       runtime.LastHeartbeat,
+			LastProgress:        runtime.LastProgress,
 		})
 	}
 	sort.Slice(infos, func(i, j int) bool {
