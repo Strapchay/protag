@@ -141,9 +141,12 @@ func (m *MultiLogModel) fetchAgentsCmd() tea.Cmd {
 func (m *MultiLogModel) fetchSnapshotCmd() tea.Cmd {
 	return func() tea.Msg {
 		req := map[string]interface{}{
-			"method": "hub-snapshot",
-			"id":     "multilog-snapshot-1",
-			"params": map[string]interface{}{},
+			"method": "hub-history",
+			"id":     "multilog-history-1",
+			"params": map[string]interface{}{
+				"limit":                4000,
+				"exclude_tool_results": true,
+			},
 		}
 		reqBytes, _ := json.Marshal(req)
 

@@ -638,6 +638,95 @@ func (s *Server) handleHubSnapshot(req Request, encoder *json.Encoder) {
 	})
 }
 
+func (s *Server) handleHubHistory(req Request) Response {
+	var params struct {
+		Limit              int       `json:"limit"`
+		Since              time.Time `json:"since,omitempty"`
+		AgentID            string    `json:"agent_id,omitempty"`
+		ExcludeToolResults bool      `json:"exclude_tool_results,omitempty"`
+	}
+	if len(req.Params) > 0 {
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return Response{ID: req.ID, Error: "invalid params for hub-history"}
+		}
+	}
+	messages := s.loadFilteredHubHistory(params.AgentID, params.ExcludeToolResults, params.Since, params.Limit)
+	asOf := time.Time{}
+	for _, msg := range messages {
+		if msg.Timestamp.After(asOf) {
+			asOf = msg.Timestamp
+		}
+	}
+	return Response{ID: req.ID, Result: struct {
+		Messages []hub.Message `json:"messages"`
+		AsOf     time.Time     `json:"as_of"`
+	}{Messages: messages, AsOf: asOf}}
+}
+
+// loadFilteredHubHistory reads the append-only history before falling back to
+// the in-memory ring. Filtering here keeps high-volume tool results from
+// evicting chat and per-agent context after a dashboard restart.
+func (s *Server) loadFilteredHubHistory(agentID string, excludeToolResults bool, since time.Time, limit int) []hub.Message {
+	if limit <= 0 || limit > 10000 {
+		limit = 2000
+	}
+	s.mu.RLock()
+	logsDir := s.logsDir
+	s.mu.RUnlock()
+
+	var messages []hub.Message
+	appendMessage := func(msg hub.Message) {
+		if !since.IsZero() && msg.Timestamp.Before(since) {
+			return
+		}
+		if agentID != "" && msg.FromAgent != agentID && msg.ToAgent != agentID {
+			return
+		}
+		if excludeToolResults && isToolResultHubMessage(msg) {
+			return
+		}
+		messages = append(messages, msg)
+		if len(messages) > limit {
+			messages = messages[len(messages)-limit:]
+		}
+	}
+
+	if strings.TrimSpace(logsDir) != "" {
+		if f, err := os.Open(filepath.Join(logsDir, "hub_history.jsonl")); err == nil {
+			scanner := bufio.NewScanner(f)
+			scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+			for scanner.Scan() {
+				var msg hub.Message
+				if json.Unmarshal(scanner.Bytes(), &msg) == nil {
+					appendMessage(msg)
+				}
+			}
+			_ = f.Close()
+			if len(messages) > 0 {
+				return messages
+			}
+		}
+	}
+
+	s.mu.RLock()
+	history := append([]hub.Message(nil), s.hubHistory...)
+	s.mu.RUnlock()
+	for _, msg := range history {
+		appendMessage(msg)
+	}
+	return messages
+}
+
+func isToolResultHubMessage(msg hub.Message) bool {
+	var payload struct {
+		Role string `json:"role"`
+	}
+	if len(msg.Payload) == 0 || json.Unmarshal(msg.Payload, &payload) != nil {
+		return false
+	}
+	return payload.Role == "toolResult" || payload.Role == "tool"
+}
+
 func (s *Server) hubSnapshotResponse() (interface{}, int, time.Time) {
 	type snapshotResponse struct {
 		Messages []hub.Message `json:"messages"`
@@ -749,6 +838,8 @@ func (s *Server) handleRequest(req Request) Response {
 	case "hub-snapshot":
 		resp, _, _ := s.hubSnapshotResponse()
 		return Response{ID: req.ID, Result: resp}
+	case "hub-history":
+		return s.handleHubHistory(req)
 	case "validate-write":
 		return s.handleValidateWrite(req)
 	case "query-memory":
