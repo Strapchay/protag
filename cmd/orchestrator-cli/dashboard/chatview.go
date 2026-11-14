@@ -80,7 +80,7 @@ var architectCommands = []architectCommand{
 
 func NewChatModel(addr string) *ChatModel {
 	ti := textarea.New()
-	ti.Placeholder = "Type a message for the Solution Architect... (Tab: switch panes, Esc: unfocus)"
+	ti.Placeholder = "Type a message for the Solution Architect... (Shift+Tab: switch panes, Esc: unfocus)"
 	ti.Focus()
 	ti.CharLimit = 0
 	ti.ShowLineNumbers = false
@@ -313,9 +313,9 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// Update placeholder based on scroll state
 	if !m.autoScroll {
-		m.input.Placeholder = "History Mode (scroll down to resume) — Tab: switch panes"
+		m.input.Placeholder = "History Mode (scroll down to resume) — Shift+Tab: switch panes"
 	} else {
-		m.input.Placeholder = "Type a message for the Solution Architect... (Tab: switch panes, Esc: unfocus)"
+		m.input.Placeholder = "Type a message for the Solution Architect... (Shift+Tab: switch panes, Esc: unfocus)"
 	}
 
 	return m, tea.Batch(cmds...)
