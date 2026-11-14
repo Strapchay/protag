@@ -79,3 +79,19 @@ func TestSupervisorLoopBreakerFileModified(t *testing.T) {
 		t.Fatalf("expected clear after file_modified, got %d", len(s.recentTools))
 	}
 }
+
+func TestToolExecutionKeepsAgentNonIdle(t *testing.T) {
+	s := &AgentSupervisor{config: AgentConfig{AgentID: "agent-test"}}
+	s.handleEvent(PiAgentEvent{
+		Type:     "tool_execution_start",
+		ToolName: "bash",
+		Data:     json.RawMessage(`{"name":"bash","input":"sleep 30"}`),
+	})
+	if s.TurnIdle() {
+		t.Fatal("agent reported idle while a tool was active")
+	}
+	s.handleEvent(PiAgentEvent{Type: "tool_execution_end"})
+	if !s.TurnIdle() {
+		t.Fatal("agent did not return to idle after the tool ended")
+	}
+}

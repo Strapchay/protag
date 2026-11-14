@@ -233,7 +233,8 @@ func TestNormalizeGatewayProviderRequestSuppliesMissingGeminiThoughtSignature(t 
 				{"id":"call-1","type":"function","function":{"name":"inspect","arguments":"{}"}},
 				{"id":"call-2","type":"function","function":{"name":"compare","arguments":"{}"}}
 			]},
-			{"role":"tool","tool_call_id":"call-1","content":"ok"}
+			{"role":"tool","tool_call_id":"call-1","content":"ok"},
+			{"role":"tool","tool_call_id":"call-2","content":"ok"}
 		],
 		"store":false,
 		"stream":true
@@ -270,7 +271,7 @@ func TestNormalizeGatewayProviderRequestSuppliesMissingGeminiThoughtSignature(t 
 }
 
 func TestNormalizeGatewayProviderRequestPreservesGeminiThoughtSignature(t *testing.T) {
-	body := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"extra_content":{"google":{"thought_signature":"signed-by-provider"}},"function":{"name":"inspect","arguments":"{}"}}]}]}`)
+	body := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"call-1","extra_content":{"google":{"thought_signature":"signed-by-provider"}},"function":{"name":"inspect","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call-1","content":"ok"}]}`)
 
 	normalized, err := normalizeGatewayProviderRequest(body, "google-gemini")
 	if err != nil {
@@ -282,7 +283,7 @@ func TestNormalizeGatewayProviderRequestPreservesGeminiThoughtSignature(t *testi
 }
 
 func TestNormalizeGatewayProviderRequestRewritesNullAssistantContent(t *testing.T) {
-	body := []byte(`{"model":"redacted-model","messages":[{"role":"user","content":"inspect"},{"role":"assistant","content":null,"tool_calls":[{"id":"call-1"}]},{"role":"tool","content":"ok"}]}`)
+	body := []byte(`{"model":"redacted-model","messages":[{"role":"user","content":"inspect"},{"role":"assistant","content":null,"tool_calls":[{"id":"call-1"}]},{"role":"tool","tool_call_id":"call-1","content":"ok"}]}`)
 	normalized, err := normalizeGatewayProviderRequest(body, "redacted-cloudflare-workers-ai")
 	if err != nil {
 		t.Fatalf("normalize request: %v", err)
@@ -879,5 +880,78 @@ func TestInferenceGatewayModelsEndpointUsesConfiguredProfiles(t *testing.T) {
 	}
 	if len(payload.Data) != 1 || payload.Data[0].ID != "redacted-model-forge" {
 		t.Fatalf("unexpected models payload: %#v", payload)
+	}
+}
+
+func TestNormalizeGatewayProviderRequestDropsOrphanToolCall(t *testing.T) {
+	body := []byte(`{
+		"model":"deepseek-flash",
+		"messages":[
+			{"role":"user","content":"implement"},
+			{"role":"assistant","content":null,"tool_calls":[
+				{"id":"call-orphan","type":"function","function":{"name":"bash","arguments":"{}"}}
+			]},
+			{"role":"user","content":"AUTOMATIC RETRY: continue"}
+		]
+	}`)
+
+	normalized, err := normalizeGatewayProviderRequest(body, "deepseek")
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	var payload struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(payload.Messages) != 2 {
+		t.Fatalf("messages=%d, want orphan assistant dropped: %s", len(payload.Messages), normalized)
+	}
+	if _, exists := payload.Messages[1]["tool_calls"]; exists {
+		t.Fatalf("orphan tool_calls survived: %s", normalized)
+	}
+}
+
+func TestNormalizeGatewayProviderRequestPreservesPairedToolCalls(t *testing.T) {
+	body := []byte(`{
+		"model":"deepseek-flash",
+		"messages":[
+			{"role":"user","content":"implement"},
+			{"role":"assistant","content":null,"tool_calls":[
+				{"id":"call-1","type":"function","function":{"name":"bash","arguments":"{}"}},
+				{"id":"call-2","type":"function","function":{"name":"bash","arguments":"{}"}}
+			]},
+			{"role":"tool","tool_call_id":"call-1","content":"one"},
+			{"role":"tool","tool_call_id":"call-2","content":"two"},
+			{"role":"assistant","content":"done"}
+		]
+	}`)
+
+	normalized, err := normalizeGatewayProviderRequest(body, "deepseek")
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if !bytes.Equal(normalized, body) {
+		t.Fatalf("paired tool history changed: %s", normalized)
+	}
+}
+
+func TestNormalizeGatewayProviderRequestDropsOrphanToolResult(t *testing.T) {
+	body := []byte(`{
+		"model":"deepseek-flash",
+		"messages":[
+			{"role":"user","content":"implement"},
+			{"role":"tool","tool_call_id":"call-unknown","content":"orphan result"},
+			{"role":"assistant","content":"done"}
+		]
+	}`)
+
+	normalized, err := normalizeGatewayProviderRequest(body, "deepseek")
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if bytes.Contains(normalized, []byte("call-unknown")) {
+		t.Fatalf("orphan tool result survived: %s", normalized)
 	}
 }

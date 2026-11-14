@@ -99,6 +99,8 @@ type AgentSupervisor struct {
 	streamText       agentStreamState
 	streamBlock      uint64
 	isThinking       bool
+	toolActive       bool
+	toolPulseStop    chan struct{}
 	autoRetryPending bool
 	recoveryPrompt   string
 	workspace        isolation.Workspace
@@ -407,6 +409,7 @@ func (s *AgentSupervisor) Stop() error {
 	s.workspace = nil
 	s.mu.Unlock()
 
+	s.stopToolPulse()
 	if hm != nil {
 		hm.Stop()
 	}
@@ -560,7 +563,7 @@ func (s *AgentSupervisor) WaitForTurnIdle(ctx context.Context) error {
 func (s *AgentSupervisor) TurnIdle() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return !s.isThinking && !s.autoRetryPending
+	return !s.isThinking && !s.autoRetryPending && !s.toolActive
 }
 
 // TurnRetryPending reports whether Pi is retrying a failed inference turn
@@ -679,8 +682,10 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 	case "turn_start":
 		s.mu.Lock()
 		s.isThinking = true
+		s.toolActive = false
 		s.resetStreamStateLocked()
 		s.mu.Unlock()
+		s.stopToolPulse()
 		s.emitStatus(s.displayLabel()+" is thinking...", "info")
 		if s.healthMonitor != nil {
 			s.healthMonitor.SetMonitoring(true)
@@ -747,8 +752,13 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 			s.broadcast(*msg)
 		}
 	case "tool_execution_start":
+		s.mu.Lock()
+		s.toolActive = true
+		s.mu.Unlock()
+		s.startToolPulse()
 		if s.healthMonitor != nil {
 			s.healthMonitor.RecordProgress()
+			s.healthMonitor.RecordExternalActivity("running_tool")
 		}
 		// Extract tool info for status and chat visibility
 		tool := extractToolInvocation(event)
@@ -772,10 +782,15 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 		}
 		s.detectLooping(event)
 	case "tool_execution_end":
+		s.stopToolPulse()
+		s.mu.Lock()
+		s.toolActive = false
+		s.mu.Unlock()
 		s.emitLifecycle(AgentLifecycleEvent{Kind: "tool_end"})
 		s.emitStatus(s.displayLabel()+" is thinking...", "info")
 		if s.healthMonitor != nil {
 			s.healthMonitor.RecordProgress()
+			s.healthMonitor.RecordExternalActivity("tool_end")
 		}
 	case "file_modified":
 		// Any successful file modification breaks the loop heuristic
@@ -784,6 +799,13 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 		s.mu.Unlock()
 		s.emitLifecycle(AgentLifecycleEvent{Kind: "file_modified", Content: string(event.Message)})
 	case "tool_error":
+		s.stopToolPulse()
+		s.mu.Lock()
+		s.toolActive = false
+		s.mu.Unlock()
+		if s.healthMonitor != nil {
+			s.healthMonitor.RecordExternalActivity("tool_end")
+		}
 		s.emitLifecycle(AgentLifecycleEvent{Kind: "tool_error", IsError: true, Error: event.ErrorMessage})
 		s.handleNetworkFault(event)
 	case "auto_retry_start":
@@ -1176,4 +1198,42 @@ func streamPayload(kind, content, role, block string) map[string]string {
 		"stream":  PiStreamSnapshot,
 		"block":   block,
 	}
+}
+
+// startToolPulse keeps the agent healthy while a local tool runs. Pi emits no
+// heartbeat between tool start and end, so a long command would otherwise be
+// mistaken for an unresponsive agent and respawned mid-tool.
+func (s *AgentSupervisor) startToolPulse() {
+	s.mu.Lock()
+	if s.toolPulseStop != nil {
+		close(s.toolPulseStop)
+	}
+	stop := make(chan struct{})
+	s.toolPulseStop = stop
+	hm := s.healthMonitor
+	s.mu.Unlock()
+	if hm == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				hm.RecordExternalActivity("running_tool")
+			}
+		}
+	}()
+}
+
+func (s *AgentSupervisor) stopToolPulse() {
+	s.mu.Lock()
+	if s.toolPulseStop != nil {
+		close(s.toolPulseStop)
+		s.toolPulseStop = nil
+	}
+	s.mu.Unlock()
 }

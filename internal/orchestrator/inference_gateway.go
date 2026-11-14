@@ -1203,6 +1203,11 @@ func enforceGatewayRequestModel(body []byte, model string) ([]byte, error) {
 
 func normalizeGatewayProviderRequest(body []byte, provider string) ([]byte, error) {
 	provider = strings.ToLower(strings.TrimSpace(provider))
+	repaired, err := repairOpenAIToolHistory(body)
+	if err != nil {
+		return nil, err
+	}
+	body = repaired
 	if isGoogleGeminiProvider(provider) {
 		var payload map[string]json.RawMessage
 		if err := json.Unmarshal(body, &payload); err != nil {
@@ -1284,7 +1289,7 @@ func normalizeGatewayProviderRequest(body []byte, provider string) ([]byte, erro
 	if !changed {
 		return body, nil
 	}
-	encodedMessages, err := json.Marshal(messages)
+	encodedMessages, err = json.Marshal(messages)
 	if err != nil {
 		return nil, fmt.Errorf("gateway request messages could not be encoded: %w", err)
 	}
@@ -1680,4 +1685,117 @@ func (l *gatewayLimiter) snapshot() (capacity, inUse, queued int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.capacity, l.inUse, len(l.waiters)
+}
+
+// repairOpenAIToolHistory enforces the OpenAI tool-call pairing invariant
+// before replay. A crashed or interrupted tool cycle can leave an assistant
+// tool_calls message without matching tool results; providers such as DeepSeek
+// reject the entire request in that state. Drop unmatched calls (and orphan
+// tool messages) so recovery can continue from valid history.
+func repairOpenAIToolHistory(body []byte) ([]byte, error) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("gateway request body is not valid JSON: %w", err)
+	}
+	encodedMessages, ok := payload["messages"]
+	if !ok {
+		return body, nil
+	}
+	var messages []map[string]any
+	if err := json.Unmarshal(encodedMessages, &messages); err != nil {
+		return nil, fmt.Errorf("gateway request messages are not valid JSON: %w", err)
+	}
+
+	remove := make([]bool, len(messages))
+	changed := false
+	for i, message := range messages {
+		if message["role"] != "assistant" {
+			continue
+		}
+		calls, ok := message["tool_calls"].([]any)
+		if !ok || len(calls) == 0 {
+			continue
+		}
+
+		answered := make(map[string]bool)
+		for j := i + 1; j < len(messages) && messages[j]["role"] == "tool"; j++ {
+			if id, ok := messages[j]["tool_call_id"].(string); ok {
+				answered[id] = true
+			}
+		}
+
+		kept := make([]any, 0, len(calls))
+		for _, raw := range calls {
+			call, ok := raw.(map[string]any)
+			if !ok {
+				changed = true
+				continue
+			}
+			id, _ := call["id"].(string)
+			if id != "" && answered[id] {
+				kept = append(kept, call)
+			} else {
+				changed = true
+			}
+		}
+
+		if len(kept) == 0 {
+			delete(message, "tool_calls")
+			content, _ := message["content"].(string)
+			if content == "" {
+				remove[i] = true
+			}
+			continue
+		}
+		if len(kept) != len(calls) {
+			message["tool_calls"] = kept
+		}
+	}
+
+	referenced := make(map[string]bool)
+	for i, message := range messages {
+		if remove[i] || message["role"] != "assistant" {
+			continue
+		}
+		calls, _ := message["tool_calls"].([]any)
+		for _, raw := range calls {
+			call, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if id, ok := call["id"].(string); ok {
+				referenced[id] = true
+			}
+		}
+	}
+	for i, message := range messages {
+		if message["role"] != "tool" {
+			continue
+		}
+		id, _ := message["tool_call_id"].(string)
+		if !referenced[id] {
+			remove[i] = true
+			changed = true
+		}
+	}
+
+	if !changed {
+		return body, nil
+	}
+	filtered := make([]map[string]any, 0, len(messages))
+	for i, message := range messages {
+		if !remove[i] {
+			filtered = append(filtered, message)
+		}
+	}
+	encoded, err := json.Marshal(filtered)
+	if err != nil {
+		return nil, fmt.Errorf("gateway repaired messages could not be encoded: %w", err)
+	}
+	payload["messages"] = encoded
+	repaired, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("gateway repaired request could not be encoded: %w", err)
+	}
+	return repaired, nil
 }
