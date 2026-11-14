@@ -101,6 +101,7 @@ type AgentSupervisor struct {
 	isThinking       bool
 	toolActive       bool
 	toolPulseStop    chan struct{}
+	pendingContext   []string
 	autoRetryPending bool
 	recoveryPrompt   string
 	workspace        isolation.Workspace
@@ -796,6 +797,7 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 		s.mu.Lock()
 		s.toolActive = false
 		s.mu.Unlock()
+		go s.flushPendingContext()
 		s.emitLifecycle(AgentLifecycleEvent{Kind: "tool_end"})
 		s.emitStatus(s.displayLabel()+" is thinking...", "info")
 		if s.healthMonitor != nil {
@@ -813,6 +815,7 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 		s.mu.Lock()
 		s.toolActive = false
 		s.mu.Unlock()
+		go s.flushPendingContext()
 		if s.healthMonitor != nil {
 			s.healthMonitor.RecordExternalActivity("tool_end")
 		}
@@ -1030,22 +1033,15 @@ func (s *AgentSupervisor) contextRouter(ctx context.Context) {
 				continue
 			}
 
-			var followUpText string
+			followUpText := formatContextDelivery(msg)
 			if msg.Type == hub.MsgContextShare && msg.FromAgent == "user" && msg.ToAgent == "orchestrator" {
-				// Deliver user messages to the Architect as plain-text prompts
-				var text string
-				if err := json.Unmarshal(msg.Payload, &text); err == nil {
-					followUpText = text
-				} else {
-					followUpText = string(msg.Payload)
-				}
 				log.Printf("supervisor: delivering user message to architect: %s", followUpText)
-			} else {
-				// Format other context messages as follow_up JSON
-				payload, _ := json.Marshal(msg)
-				followUpText = fmt.Sprintf("[Context Hub - %s] %s", msg.Type, string(payload))
 			}
 
+			if s.queueContextWhileToolActive(followUpText) {
+				delivery.result <- nil
+				continue
+			}
 			if err := s.DeliverTurn(followUpText); err != nil {
 				log.Printf("supervisor: failed to deliver context to %s: %v", s.config.AgentID, err)
 				delivery.result <- err
@@ -1207,6 +1203,47 @@ func streamPayload(kind, content, role, block string) map[string]string {
 		"role":    role,
 		"stream":  PiStreamSnapshot,
 		"block":   block,
+	}
+}
+
+func formatContextDelivery(msg hub.Message) string {
+	if msg.Type == hub.MsgContextShare && msg.FromAgent == "user" && msg.ToAgent == "orchestrator" {
+		var text string
+		if err := json.Unmarshal(msg.Payload, &text); err == nil {
+			return text
+		}
+		return string(msg.Payload)
+	}
+	payload, _ := json.Marshal(msg)
+	return fmt.Sprintf("[Context Hub - %s] %s", msg.Type, string(payload))
+}
+
+// queueContextWhileToolActive defers peer context until the current tool cycle
+// ends. Sending a follow-up between an assistant tool call and its result
+// corrupts the conversation for OpenAI-compatible providers.
+func (s *AgentSupervisor) queueContextWhileToolActive(text string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.toolActive {
+		return false
+	}
+	if len(s.pendingContext) >= 64 {
+		log.Printf("supervisor: context queue full for agent %s; dropping oldest entry", s.config.AgentID)
+		s.pendingContext = s.pendingContext[1:]
+	}
+	s.pendingContext = append(s.pendingContext, text)
+	return true
+}
+
+func (s *AgentSupervisor) flushPendingContext() {
+	s.mu.Lock()
+	pending := s.pendingContext
+	s.pendingContext = nil
+	s.mu.Unlock()
+	for _, text := range pending {
+		if err := s.DeliverTurn(text); err != nil {
+			log.Printf("supervisor: failed to flush queued context to %s: %v", s.config.AgentID, err)
+		}
 	}
 }
 
