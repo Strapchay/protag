@@ -22,6 +22,33 @@ function enabled(value: string): boolean {
   return value.toLowerCase() === "true" || value === "1";
 }
 
+// DeepSeek's public catalog exposes the Pi-native identifier while the direct
+// API also accepts the shorter alias. Normalize internally so Pi sees the
+// canonical model id in sessions, telemetry, and upstream requests.
+const DEEPSEEK_MODEL_ALIASES: Record<string, string> = {
+  "deepseek-flash": "deepseek-v4-flash",
+};
+
+const DEEPSEEK_EFFORT_LEVELS = new Set(["low", "high", "max"]);
+
+function isDeepSeekTarget(): boolean {
+  const provider = env("AION_TARGET_PROVIDER").toLowerCase();
+  const model = env("AION_TARGET_MODEL").toLowerCase();
+  return provider.includes("deepseek") || model.startsWith("deepseek");
+}
+
+function resolveGatewayModelId(modelId: string): string {
+  if (!isDeepSeekTarget()) {
+    return modelId;
+  }
+  return DEEPSEEK_MODEL_ALIASES[modelId.toLowerCase()] ?? modelId;
+}
+
+function deepSeekReasoningEffort(): string {
+  const requested = env("AION_TARGET_REASONING_EFFORT").toLowerCase();
+  return DEEPSEEK_EFFORT_LEVELS.has(requested) ? requested : "high";
+}
+
 export default function (pi: ExtensionAPI) {
   const globalKey = "__aionGatewayProviderRegistered";
   const globalState = globalThis as any;
@@ -82,9 +109,10 @@ function registerTCPGateway(pi: ExtensionAPI, targetModel: string) {
 function buildGatewayModel(modelId: string, api: string) {
   const contextWindow = parseInt(env("AION_TARGET_CONTEXT_WINDOW") || "128000", 10);
   const maxTokens = parseInt(env("AION_TARGET_MAX_TOKENS") || "4096", 10);
+  const resolvedModelId = resolveGatewayModelId(modelId);
   return {
-    id: modelId,
-    name: env("AION_TARGET_PROFILE") || modelId,
+    id: resolvedModelId,
+    name: env("AION_TARGET_PROFILE") || resolvedModelId,
     api,
     reasoning: false,
     input: ["text", "image"],
@@ -409,7 +437,7 @@ function mapAnthropicStopReason(reason: string) {
 
 function buildOpenAIRequest(model: Model<any>, context: Context, options?: SimpleStreamOptions) {
   const payload: any = {
-    model: model.id,
+    model: resolveGatewayModelId(model.id),
     messages: convertMessages(context),
     stream: true,
     stream_options: { include_usage: true },
@@ -417,6 +445,9 @@ function buildOpenAIRequest(model: Model<any>, context: Context, options?: Simpl
   payload.max_tokens = options?.maxTokens || model.maxTokens || 4096;
   if (isGoogleGeminiTarget()) {
     payload.reasoning_effort = env("AION_TARGET_REASONING_EFFORT") || "low";
+  } else if (isDeepSeekTarget()) {
+    payload.thinking = { type: "enabled" };
+    payload.reasoning_effort = deepSeekReasoningEffort();
   }
   if (options?.temperature !== undefined) {
     payload.temperature = options.temperature;
@@ -484,11 +515,15 @@ function convertMessages(context: Context): any[] {
           };
         });
       if (text || toolCalls.length) {
-        messages.push({
+        const assistantMessage: any = {
           role: "assistant",
           content: text || null,
           ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
-        });
+        };
+        if (isDeepSeekTarget() && assistantMessage.reasoning_content === undefined) {
+          assistantMessage.reasoning_content = "";
+        }
+        messages.push(assistantMessage);
       }
       continue;
     }

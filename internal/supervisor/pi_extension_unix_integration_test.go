@@ -627,6 +627,180 @@ func newPiRPCProbe(t *testing.T, blockFirst bool) (*piRPCProbe, PiAgentConfig) {
 	}
 }
 
+func TestPiGatewayExtensionAppliesDeepSeekCompatibility(t *testing.T) {
+	piBinary, err := exec.LookPath("pi")
+	if err != nil {
+		t.Skip("Pi is not installed")
+	}
+	extension, err := filepath.Abs(filepath.Join("..", "..", "install", "pi", "extensions", "aion-gateway-provider.ts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	socketPath := filepath.Join(root, "inference.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestErrors := make(chan error, 8)
+	var requestCount atomic.Int32
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/aion/gateway/extension-loaded" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		body, readErr := io.ReadAll(r.Body)
+		if readErr != nil {
+			requestErrors <- readErr
+			http.Error(w, "read request", http.StatusBadRequest)
+			return
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			requestErrors <- fmt.Errorf("decode request: %w", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		number := requestCount.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if number == 1 {
+			if payload["model"] != "deepseek-v4-flash" {
+				requestErrors <- fmt.Errorf("deepseek alias not applied: %s", body)
+				return
+			}
+			thinking, _ := payload["thinking"].(map[string]any)
+			if thinking["type"] != "enabled" {
+				requestErrors <- fmt.Errorf("deepseek thinking mode not enabled: %s", body)
+				return
+			}
+			if payload["reasoning_effort"] != "high" {
+				requestErrors <- fmt.Errorf("deepseek reasoning effort not applied: %s", body)
+				return
+			}
+			chunk, _ := json.Marshal(map[string]any{
+				"id":    "deepseek-tool-call",
+				"model": "deepseek-v4-flash",
+				"choices": []any{map[string]any{
+					"delta": map[string]any{
+						"tool_calls": []any{map[string]any{
+							"index": 0,
+							"id":    "deepseek-call-1",
+							"type":  "function",
+							"function": map[string]any{
+								"name":      "bash",
+								"arguments": `{"command":"printf deepseek-tool-call"}`,
+							},
+						}},
+					},
+				}},
+			})
+			finish, _ := json.Marshal(map[string]any{
+				"id":    "deepseek-tool-call",
+				"model": "deepseek-v4-flash",
+				"choices": []any{map[string]any{
+					"delta":         map[string]any{},
+					"finish_reason": "tool_calls",
+				}},
+			})
+			_, _ = fmt.Fprintf(w, "data: %s\n\ndata: %s\n\ndata: [DONE]\n\n", chunk, finish)
+			requestErrors <- nil
+			return
+		}
+		if !strings.Contains(string(body), "deepseek-tool-call") {
+			requestErrors <- fmt.Errorf("tool result missing from follow-up: %s", body)
+			return
+		}
+		messages, _ := payload["messages"].([]any)
+		replayed := false
+		for _, raw := range messages {
+			message, ok := raw.(map[string]any)
+			if !ok || message["role"] != "assistant" {
+				continue
+			}
+			toolCalls, ok := message["tool_calls"].([]any)
+			if !ok || len(toolCalls) == 0 {
+				continue
+			}
+			replayed = true
+			reasoning, exists := message["reasoning_content"]
+			if !exists || reasoning != "" {
+				requestErrors <- fmt.Errorf("assistant reasoning_content not replayed: %s", body)
+				return
+			}
+		}
+		if !replayed {
+			requestErrors <- fmt.Errorf("assistant tool call missing from follow-up: %s", body)
+			return
+		}
+		chunk, _ := json.Marshal(map[string]any{
+			"id":    "deepseek-complete",
+			"model": "deepseek-v4-flash",
+			"choices": []any{map[string]any{
+				"delta":         map[string]any{"content": "deepseek complete"},
+				"finish_reason": "stop",
+			}},
+		})
+		_, _ = fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", chunk)
+		requestErrors <- nil
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = os.Remove(socketPath)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	process, err := SpawnPiAgent(ctx, PiAgentConfig{
+		Binary:         piBinary,
+		SessionDir:     filepath.Join(root, "sessions"),
+		HostSessionDir: filepath.Join(root, "sessions"),
+		WorkingDir:     root,
+		Provider:       "aion-gateway",
+		Model:          "deepseek-flash",
+		ExtensionPaths: []string{extension},
+		Env: []string{
+			"AION_INFERENCE_GATEWAY_ENABLED=true",
+			"AION_INFERENCE_SOCKET=" + socketPath,
+			"AION_AGENT_CAPABILITY=test-capability",
+			"AION_TARGET_MODEL=deepseek-flash",
+			"AION_TARGET_PROFILE=phoenix",
+			"AION_TARGET_PROVIDER=deepseek",
+			"AION_TARGET_REASONING_EFFORT=high",
+			"AION_TARGET_API=openai-completions",
+			"PI_CODING_AGENT_DIR=" + filepath.Join(root, "pi-config"),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = process.Kill() })
+	if err := process.SendPrompt("Exercise DeepSeek compatibility."); err != nil {
+		t.Fatal(err)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("DeepSeek compatibility run timed out; requests=%d", requestCount.Load())
+		case event, ok := <-process.Events():
+			if !ok {
+				t.Fatalf("Pi event stream closed; requests=%d", requestCount.Load())
+			}
+			if event.Type == "agent_end" {
+				goto complete
+			}
+		}
+	}
+
+complete:
+	for i := int32(0); i < requestCount.Load(); i++ {
+		if err := <-requestErrors; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func awaitPiRPCRequest(t *testing.T, requests <-chan piRPCRequest) piRPCRequest {
 	t.Helper()
 	select {
