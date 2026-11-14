@@ -95,8 +95,9 @@ type AgentSupervisor struct {
 	broadcastFn      func(msg hub.Message)
 	lifecycleFn      func(event AgentLifecycleEvent)
 	pendingBroadcast []hub.Message
-	lastThinking     string
-	lastText         string
+	streamThinking   agentStreamState
+	streamText       agentStreamState
+	streamBlock      uint64
 	isThinking       bool
 	autoRetryPending bool
 	recoveryPrompt   string
@@ -477,8 +478,7 @@ func (s *AgentSupervisor) RestartFreshWithPrompt(ctx context.Context, prompt str
 // SendPrompt sends an initial prompt to the Pi Agent.
 func (s *AgentSupervisor) SendPrompt(message string) error {
 	s.mu.Lock()
-	s.lastThinking = ""
-	s.lastText = ""
+	s.resetStreamStateLocked()
 	s.autoRetryPending = false
 	pa := s.piAgent
 	// Treat an accepted prompt command as an active turn immediately. Pi emits
@@ -511,8 +511,7 @@ func (s *AgentSupervisor) SendPrompt(message string) error {
 // immediately when Pi is idle.
 func (s *AgentSupervisor) DeliverTurn(message string) error {
 	s.mu.Lock()
-	s.lastThinking = ""
-	s.lastText = ""
+	s.resetStreamStateLocked()
 	pa := s.piAgent
 	thinking := s.isThinking || s.autoRetryPending
 	s.mu.Unlock()
@@ -576,8 +575,7 @@ func (s *AgentSupervisor) TurnRetryPending() bool {
 // SendSteer sends a steer command to the Pi Agent.
 func (s *AgentSupervisor) SendSteer(message string) error {
 	s.mu.Lock()
-	s.lastThinking = ""
-	s.lastText = ""
+	s.resetStreamStateLocked()
 	pa := s.piAgent
 	thinking := s.isThinking
 	s.mu.Unlock()
@@ -681,8 +679,7 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 	case "turn_start":
 		s.mu.Lock()
 		s.isThinking = true
-		s.lastThinking = ""
-		s.lastText = ""
+		s.resetStreamStateLocked()
 		s.mu.Unlock()
 		s.emitStatus(s.displayLabel()+" is thinking...", "info")
 		if s.healthMonitor != nil {
@@ -695,7 +692,7 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 			s.healthMonitor.RecordHeartbeat()
 		}
 	case "text", "thinking", "message_start", "message_update", "message_end":
-		pMsg, err := event.ParseMessage()
+		pMsg, mode, err := event.ParseStreamMessage()
 		if err != nil {
 			// Some updates might not contain a full message yet, that's fine
 			return
@@ -717,38 +714,35 @@ func (s *AgentSupervisor) handleEvent(event PiAgentEvent) {
 			log.Printf("supervisor: agent %s broadcasting: thinkingLen=%d, textLen=%d", s.config.AgentID, len(thinking), len(text))
 		}
 
-		thinkingEvent := event.Type == "thinking" || event.Type == "message_update" || event.Type == "message_start"
+		now := time.Now()
+		force := event.Type == "message_end"
 		s.mu.Lock()
-		emitThinking := thinking != "" && thinking != s.lastThinking && thinkingEvent
-		if emitThinking {
-			s.lastThinking = thinking
+		if event.Type == "message_start" {
+			s.resetStreamStateLocked()
 		}
-		emitText := text != "" && text != s.lastText
-		if emitText {
-			s.lastText = text
+		if s.streamBlock == 0 {
+			s.resetStreamStateLocked()
 		}
+		block := s.streamBlockIDLocked()
+		thinkingOut, emitThinking := s.streamThinking.observe(mode, thinking, now, force)
+		textOut, emitText := s.streamText.observe(mode, text, now, force)
+		role := pMsg.Role
 		s.mu.Unlock()
 
-		// Broadcast thinking if present and relevant to this event type
+		// Broadcast thinking if present. The dashboard receives bounded
+		// snapshots so it can replace the current block instead of appending a
+		// row for every token.
 		if emitThinking {
-			s.emitLifecycle(AgentLifecycleEvent{Kind: "thinking", Content: thinking})
-			payload := map[string]string{
-				"type":    "thinking",
-				"content": thinking,
-				"role":    pMsg.Role,
-			}
+			s.emitLifecycle(AgentLifecycleEvent{Kind: "thinking", Content: thinkingOut})
+			payload := streamPayload("thinking", thinkingOut, role, block)
 			msg, _ := hub.NewMessage(hub.MsgContextShare, s.config.AgentID, "tui", payload)
 			s.broadcast(*msg)
 		}
 
-		// Broadcast text if present
+		// Broadcast text if present.
 		if emitText {
-			s.emitLifecycle(AgentLifecycleEvent{Kind: "text", Content: text})
-			payload := map[string]string{
-				"type":    "text",
-				"content": text,
-				"role":    pMsg.Role,
-			}
+			s.emitLifecycle(AgentLifecycleEvent{Kind: "text", Content: textOut})
+			payload := streamPayload("text", textOut, role, block)
 			msg, _ := hub.NewMessage(hub.MsgContextShare, s.config.AgentID, "tui", payload)
 			s.broadcast(*msg)
 		}
@@ -1113,5 +1107,73 @@ func (s *AgentSupervisor) handleCrash(reason string) {
 		s.state = StateStopped
 		s.mu.Unlock()
 		s.emitLifecycle(AgentLifecycleEvent{Kind: "agent_stopped", Error: err.Error()})
+	}
+}
+
+const (
+	streamEmitMinChars    = 512
+	streamEmitMinInterval = 500 * time.Millisecond
+)
+
+// agentStreamState accumulates one content stream (thinking or text) for the
+// current assistant message. Deltas append; snapshots replace. Emission is
+// throttled so a token stream becomes bounded dashboard updates rather than
+// one hub message per token.
+type agentStreamState struct {
+	value    string
+	emitted  string
+	lastEmit time.Time
+}
+
+func (s *agentStreamState) reset() {
+	*s = agentStreamState{}
+}
+
+func (s *agentStreamState) observe(mode, content string, now time.Time, force bool) (string, bool) {
+	if content == "" {
+		return "", false
+	}
+	if mode == PiStreamDelta {
+		s.value += content
+	} else {
+		// Ignore a stale snapshot that is a strict prefix of what we already
+		// accumulated. Any other snapshot is authoritative and replaces.
+		if s.value != "" && content != s.value && strings.HasPrefix(s.value, content) {
+			return "", false
+		}
+		s.value = content
+	}
+	if s.value == "" || s.value == s.emitted {
+		return "", false
+	}
+	if !force &&
+		len(s.value)-len(s.emitted) < streamEmitMinChars &&
+		now.Sub(s.lastEmit) < streamEmitMinInterval {
+		return "", false
+	}
+	s.emitted = s.value
+	s.lastEmit = now
+	return s.value, true
+}
+
+// resetStreamStateLocked begins a fresh dashboard stream block. Callers must
+// hold s.mu.
+func (s *AgentSupervisor) resetStreamStateLocked() {
+	s.streamBlock++
+	s.streamThinking.reset()
+	s.streamText.reset()
+}
+
+func (s *AgentSupervisor) streamBlockIDLocked() string {
+	return fmt.Sprintf("%s-%d", s.config.AgentID, s.streamBlock)
+}
+
+func streamPayload(kind, content, role, block string) map[string]string {
+	return map[string]string{
+		"type":    kind,
+		"content": content,
+		"role":    role,
+		"stream":  PiStreamSnapshot,
+		"block":   block,
 	}
 }

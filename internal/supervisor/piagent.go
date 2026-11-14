@@ -150,33 +150,58 @@ func (m *PiMessage) FullThinking() string {
 	return sb.String()
 }
 
+// Stream modes distinguish an incremental fragment from an authoritative
+// snapshot of the partial message. The dashboard relies on this distinction to
+// append deltas and replace snapshots without guessing.
+const (
+	PiStreamSnapshot = "snapshot"
+	PiStreamDelta    = "delta"
+)
+
 // ParseMessage attempts to unmarshal the event's Message field into a normalized PiMessage.
 func (e *PiAgentEvent) ParseMessage() (*PiMessage, error) {
+	message, _, err := e.ParseStreamMessage()
+	return message, err
+}
+
+// ParseStreamMessage returns the message plus whether the event carries a
+// delta fragment or a full snapshot. A full Message is always preferred over a
+// co-streamed assistantMessageEvent delta; otherwise message_update events
+// collapse to their trailing thinking fragment.
+func (e *PiAgentEvent) ParseStreamMessage() (*PiMessage, string, error) {
 	// Waterfall Level 1: Check 'choices' in the streaming response envelope
 	if len(e.Choices) > 0 {
 		choice := e.Choices[0]
 		// Try choice.message (final)
 		if len(choice.Message.Content) > 0 {
-			return &choice.Message, nil
+			return &choice.Message, PiStreamSnapshot, nil
 		}
 		// Try choice.delta (streaming)
 		if len(choice.Delta.Content) > 0 {
 			if choice.Delta.Role == "" {
 				choice.Delta.Role = "assistant"
 			}
-			return &choice.Delta, nil
+			return &choice.Delta, PiStreamDelta, nil
 		}
 	}
 
-	// Waterfall Level 2: Try 'Delta' field (direct streaming text)
+	// Waterfall Level 2: Prefer the explicit full message snapshot.
+	if len(e.Message) > 0 {
+		var msg PiMessage
+		if err := json.Unmarshal(e.Message, &msg); err == nil && (len(msg.Content) > 0 || msg.Role != "" || msg.ErrorMessage != "") {
+			return &msg, PiStreamSnapshot, nil
+		}
+	}
+
+	// Waterfall Level 3: Try 'Delta' field (direct streaming text)
 	if e.Delta != "" {
 		return &PiMessage{
 			Role:    "assistant",
 			Content: []PiMessageContent{{Type: "text", Text: e.Delta}},
-		}, nil
+		}, PiStreamDelta, nil
 	}
 
-	// Waterfall Level 3: Try 'AssistantMessageEvent' (streaming thinking deltas)
+	// Waterfall Level 4: Try 'AssistantMessageEvent' (streaming thinking deltas)
 	if len(e.AssistantMessageEvent) > 0 {
 		var amEvent struct {
 			Type  string `json:"type"`
@@ -187,16 +212,8 @@ func (e *PiAgentEvent) ParseMessage() (*PiMessage, error) {
 				return &PiMessage{
 					Role:    "assistant",
 					Content: []PiMessageContent{{Type: "thinking", Thinking: amEvent.Delta}},
-				}, nil
+				}, PiStreamDelta, nil
 			}
-		}
-	}
-
-	// Waterfall Level 4: Try explicit 'Message' field (standard/final)
-	if len(e.Message) > 0 {
-		var msg PiMessage
-		if err := json.Unmarshal(e.Message, &msg); err == nil && (len(msg.Content) > 0 || msg.Role != "" || msg.ErrorMessage != "") {
-			return &msg, nil
 		}
 	}
 
@@ -207,11 +224,11 @@ func (e *PiAgentEvent) ParseMessage() (*PiMessage, error) {
 			return &PiMessage{
 				Role:    "assistant",
 				Content: []PiMessageContent{{Type: "text", Text: str}},
-			}, nil
+			}, PiStreamSnapshot, nil
 		}
 	}
 
-	return nil, fmt.Errorf("could not extract message from event type %s", e.Type)
+	return nil, "", fmt.Errorf("could not extract message from event type %s", e.Type)
 }
 
 // PiAgentProcess manages a running Pi Agent subprocess.

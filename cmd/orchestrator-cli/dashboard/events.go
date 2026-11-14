@@ -18,6 +18,9 @@ const (
 	tuiKindToolStart = "tool_start"
 	tuiKindRaw       = "raw"
 	tuiKindStatus    = "status"
+
+	tuiStreamSnapshot = "snapshot"
+	tuiStreamDelta    = "delta"
 )
 
 // tuiEventMsg is the dashboard's normalized display contract. Raw hub messages
@@ -34,6 +37,8 @@ type tuiEventMsg struct {
 	Tool     string
 	Input    string
 	Level    string
+	Stream   string
+	Block    string
 	Raw      string
 }
 
@@ -117,6 +122,8 @@ func (n *tuiEventNormalizer) Normalize(msg hub.Message) []tuiEventMsg {
 		Summary:  payload.Summary,
 		Tool:     payload.Tool,
 		Input:    payload.Input,
+		Stream:   normalizeStream(payload.Stream),
+		Block:    payload.Block,
 		Raw:      string(msg.Payload),
 	}
 
@@ -209,6 +216,15 @@ type tuiPayload struct {
 	Tool    string `json:"tool"`
 	Input   string `json:"input"`
 	Role    string `json:"role"`
+	Stream  string `json:"stream"`
+	Block   string `json:"block"`
+}
+
+func normalizeStream(stream string) string {
+	if stream == tuiStreamDelta {
+		return tuiStreamDelta
+	}
+	return tuiStreamSnapshot
 }
 
 func parseTUIPayload(raw json.RawMessage) tuiPayload {

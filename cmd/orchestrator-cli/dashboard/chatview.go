@@ -21,6 +21,7 @@ type chatLine struct {
 	Text        string // Raw full text
 	Style       lipgloss.Style
 	Type        string // thinking, text, tool_start
+	Block       string // Dashboard stream block identity
 	IsCollapsed bool
 	CanCollapse bool
 
@@ -366,7 +367,7 @@ func (m *ChatModel) addTUIEvent(msg tuiEventMsg) {
 			Render(summary)
 	}
 
-	m.AddMessage(msg.AgentID, author, displayText, authorStyle, msgType)
+	m.addStreamMessage(msg.AgentID, author, displayText, authorStyle, msgType, msg.Block, msg.Stream)
 	if msg.AgentID == "orchestrator" {
 		lower := strings.ToLower(msg.Content)
 		switch {
@@ -381,16 +382,44 @@ func (m *ChatModel) addTUIEvent(msg tuiEventMsg) {
 }
 
 func (m *ChatModel) AddMessage(agentID, author, text string, style lipgloss.Style, msgType string) {
-	// Update existing message if it's a stream continuation from the same agent/author.
-	if len(m.history) > 0 {
-		lastIdx := len(m.history) - 1
-		last := &m.history[lastIdx]
+	m.addStreamMessage(agentID, author, text, style, msgType, "", "")
+}
 
-		// Allow streaming for architects, users, the orchestrator, and the initial context prompt chunks
-		isStreamable := agentID == "architect" || agentID == "user" || agentID == "orchestrator" || agentID == "context_prompt"
-		if isStreamable && last.AgentID == agentID && last.Author == author && last.Type == msgType && (msgType == "text" || msgType == "thinking") {
-			if len(text) > len(last.Text) && strings.HasPrefix(text, last.Text[:len(last.Text)/2]) {
-				last.Text = text
+// addStreamMessage applies an explicit stream contract: deltas extend the last
+// block, snapshots replace it. Block identity prevents separate assistant
+// messages from being merged.
+func (m *ChatModel) addStreamMessage(agentID, author, text string, style lipgloss.Style, msgType, block, stream string) {
+	// Allow streaming for architects, users, the orchestrator, and the initial context prompt chunks
+	isStreamable := agentID == "architect" || agentID == "user" || agentID == "orchestrator" || agentID == "context_prompt"
+	if len(m.history) > 0 && isStreamable && (msgType == tuiKindText || msgType == tuiKindThinking) {
+		last := &m.history[len(m.history)-1]
+		sameBlock := block != "" && last.Block == block
+		legacy := block == "" && last.Block == ""
+		if last.AgentID == agentID && last.Author == author && last.Type == msgType && (sameBlock || legacy) {
+			merged := false
+			switch stream {
+			case tuiStreamDelta:
+				if text != "" {
+					last.Text += text
+					merged = true
+				}
+			default:
+				switch {
+				case text == last.Text:
+					merged = true
+				case strings.HasPrefix(text, last.Text):
+					last.Text = text
+					merged = true
+				case strings.HasPrefix(last.Text, text):
+					// Older snapshot already superseded by more content.
+					merged = true
+				case sameBlock:
+					// Snapshots within a block are authoritative.
+					last.Text = text
+					merged = true
+				}
+			}
+			if merged {
 				last.CachedRender = "" // Invalidate cache
 				m.MeasureLine(last)
 				if !m.deferRender {
@@ -410,6 +439,7 @@ func (m *ChatModel) AddMessage(agentID, author, text string, style lipgloss.Styl
 		Text:    text,
 		Style:   style,
 		Type:    msgType,
+		Block:   block,
 	}
 
 	// Smarter collapsing:

@@ -21,6 +21,8 @@ type MultiLogModel struct {
 	viewports        map[string]viewport.Model
 	agentOutput      map[string][]string
 	agentMeta        map[string]agentTraceMeta
+	lastBlock        map[string]string
+	lastKind         map[string]string
 	renderCache      map[string]string
 	renderDirty      map[string]bool
 	agents           []string
@@ -81,6 +83,8 @@ func NewMultiLogModelWithOptions(addr string, options Options) *MultiLogModel {
 		viewports:   make(map[string]viewport.Model),
 		agentOutput: make(map[string][]string),
 		agentMeta:   make(map[string]agentTraceMeta),
+		lastBlock:   make(map[string]string),
+		lastKind:    make(map[string]string),
 		renderCache: make(map[string]string),
 		renderDirty: make(map[string]bool),
 		eventCh:     make(chan tea.Msg, 100),
@@ -97,7 +101,6 @@ func (m *MultiLogModel) Init() tea.Cmd {
 		m.agentListTickCmd(),
 	)
 }
-
 func (m *MultiLogModel) agentListTickCmd() tea.Cmd {
 	return tea.Tick(3*time.Second, func(time.Time) tea.Msg {
 		return agentListTickMsg{}
@@ -443,10 +446,23 @@ func (m *MultiLogModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.ensureAgent(id)
 
-		m.agentOutput[id] = append(m.agentOutput[id], formatLogEvent(msg))
-		if len(m.agentOutput[id]) > 500 {
-			m.agentOutput[id] = m.agentOutput[id][len(m.agentOutput[id])-500:]
+		line := formatLogEvent(msg)
+		output := m.agentOutput[id]
+		sameBlock := msg.Block != "" && m.lastBlock[id] == msg.Block && m.lastKind[id] == msg.Kind
+		switch {
+		case sameBlock && msg.Stream == tuiStreamDelta && len(output) > 0:
+			output[len(output)-1] += msg.Content
+		case sameBlock && msg.Stream != tuiStreamDelta && len(output) > 0:
+			output[len(output)-1] = line
+		default:
+			output = append(output, line)
+			if len(output) > 500 {
+				output = output[len(output)-500:]
+			}
 		}
+		m.agentOutput[id] = output
+		m.lastBlock[id] = msg.Block
+		m.lastKind[id] = msg.Kind
 		m.renderDirty[id] = true
 
 		meta := m.agentMeta[id]

@@ -200,3 +200,74 @@ func TestResponseTextFormatsIntegrationStatus(t *testing.T) {
 		}
 	}
 }
+
+func TestChatCoalescesSnapshotsByStreamBlock(t *testing.T) {
+	m := NewChatModel("127.0.0.1:0")
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 20})
+
+	m.addTUIEvent(tuiEventMsg{
+		AgentID: "orchestrator", Author: "Architect", Kind: tuiKindThinking,
+		Content: "first", Stream: tuiStreamSnapshot, Block: "orchestrator-1",
+	})
+	m.addTUIEvent(tuiEventMsg{
+		AgentID: "orchestrator", Author: "Architect", Kind: tuiKindThinking,
+		Content: "first thought", Stream: tuiStreamSnapshot, Block: "orchestrator-1",
+	})
+
+	if len(m.history) != 1 {
+		t.Fatalf("expected one coalesced thinking block, got %d", len(m.history))
+	}
+	if m.history[0].Text != "first thought" {
+		t.Fatalf("text=%q", m.history[0].Text)
+	}
+
+	m.addTUIEvent(tuiEventMsg{
+		AgentID: "orchestrator", Author: "Architect", Kind: tuiKindThinking,
+		Content: "second block", Stream: tuiStreamSnapshot, Block: "orchestrator-2",
+	})
+	if len(m.history) != 2 {
+		t.Fatalf("expected a new block for a new stream identity, got %d", len(m.history))
+	}
+}
+
+func TestChatAppendsDeltaWithinSameBlock(t *testing.T) {
+	m := NewChatModel("127.0.0.1:0")
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 20})
+
+	m.addTUIEvent(tuiEventMsg{
+		AgentID: "orchestrator", Author: "Architect", Kind: tuiKindText,
+		Content: "hello", Stream: tuiStreamSnapshot, Block: "orchestrator-1",
+	})
+	m.addTUIEvent(tuiEventMsg{
+		AgentID: "orchestrator", Author: "Architect", Kind: tuiKindText,
+		Content: " world", Stream: tuiStreamDelta, Block: "orchestrator-1",
+	})
+
+	if len(m.history) != 1 || m.history[0].Text != "hello world" {
+		t.Fatalf("delta merge = %#v", m.history)
+	}
+}
+
+func TestChatNormalizerCarriesStreamMetadata(t *testing.T) {
+	msg, err := hub.NewMessage(hub.MsgContextShare, "orchestrator", "tui", map[string]string{
+		"type":    tuiKindThinking,
+		"content": "snapshot",
+		"role":    "assistant",
+		"stream":  tuiStreamDelta,
+		"block":   "orchestrator-7",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events := (&tuiEventNormalizer{}).Normalize(*msg)
+	for _, event := range events {
+		if event.Audience == tuiAudienceChat {
+			if event.Stream != tuiStreamDelta || event.Block != "orchestrator-7" {
+				t.Fatalf("stream metadata = %#v", event)
+			}
+			return
+		}
+	}
+	t.Fatal("missing chat event")
+}
