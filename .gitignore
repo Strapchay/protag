@@ -1,0 +1,26 @@
+# Go build and test artifacts
+*.exe
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Harness binaries
+/coordination-harness
+/cmd/coordination-harness/coordination-harness
+
+# Local coordination state (SQLite WAL, object store)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+/state/
+/run/
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
