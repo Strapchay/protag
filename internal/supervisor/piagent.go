@@ -577,6 +577,9 @@ func (p *PiAgentProcess) readEvents() {
 
 		p.events <- event
 	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("piagent: event stream read error: %v", err)
+	}
 }
 
 func (p *PiAgentProcess) waitForExit() {

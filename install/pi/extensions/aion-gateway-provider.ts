@@ -827,6 +827,13 @@ function requestUnix(
         resolve(incoming);
       },
     );
+    // A socket reset while waiting for headers must surface through the request
+    // error path, not as an unhandled EPIPE that terminates the Pi process.
+    request.once("socket", (socket) => {
+      socket.on("error", (error: any) => {
+        console.error(`[aion] inference socket error: ${error?.code ?? error?.message ?? error}`);
+      });
+    });
     const cleanup = () => {
       signal?.removeEventListener("abort", abort);
       if (timer) clearTimeout(timer);
