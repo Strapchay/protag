@@ -49,6 +49,13 @@ type InferenceGatewayStatus struct {
 	LogPath            string                 `json:"log_path,omitempty"`
 	StatusCounts       map[int]int64          `json:"status_counts,omitempty"`
 	RecentEvents       []GatewayEvent         `json:"recent_events,omitempty"`
+	Cooldowns          []GatewayCooldown      `json:"cooldowns,omitempty"`
+}
+
+type GatewayCooldown struct {
+	Profile     string `json:"profile"`
+	Until       string `json:"until"`
+	RemainingMS int64  `json:"remaining_ms"`
 }
 
 type GatewayActiveRequest struct {
@@ -109,6 +116,7 @@ type InferenceGateway struct {
 	activityFn   func(agentID, domainID, phase string)
 	capabilityFn func(token string) (AgentCapabilityPolicy, bool)
 	active       map[string]gatewayActiveRequest
+	cooldowns    map[string]time.Time
 
 	activityPulseInterval time.Duration
 	sleepFn               func(context.Context, time.Duration) error
@@ -133,6 +141,7 @@ func NewInferenceGateway(config *Config, logsDir ...string) *InferenceGateway {
 		logPath:               logPath,
 		statusCounts:          make(map[int]int64),
 		active:                make(map[string]gatewayActiveRequest),
+		cooldowns:             make(map[string]time.Time),
 		activityPulseInterval: defaultGatewayActivityPulseInterval,
 		sleepFn:               sleepWithContext,
 		client: &http.Client{
@@ -284,6 +293,17 @@ func (g *InferenceGateway) Status() InferenceGatewayStatus {
 	recentEvents := append([]GatewayEvent(nil), g.recentEvents...)
 	active := make([]GatewayActiveRequest, 0, len(g.active))
 	now := time.Now()
+	cooldowns := make([]GatewayCooldown, 0, len(g.cooldowns))
+	for profile, until := range g.cooldowns {
+		if until.After(now) {
+			cooldowns = append(cooldowns, GatewayCooldown{
+				Profile:     profile,
+				Until:       until.UTC().Format(time.RFC3339Nano),
+				RemainingMS: until.Sub(now).Milliseconds(),
+			})
+		}
+	}
+	sort.Slice(cooldowns, func(i, j int) bool { return cooldowns[i].Profile < cooldowns[j].Profile })
 	for _, item := range g.active {
 		active = append(active, GatewayActiveRequest{
 			RequestID:   item.info.RequestID,
@@ -332,6 +352,7 @@ func (g *InferenceGateway) Status() InferenceGatewayStatus {
 		LogPath:            logPath,
 		StatusCounts:       statusCounts,
 		RecentEvents:       recentEvents,
+		Cooldowns:          cooldowns,
 	}
 }
 
@@ -606,6 +627,27 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		errorBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
+		if readErr == nil {
+			resp.Body = io.NopCloser(bytes.NewReader(errorBody))
+			g.recordEvent(GatewayEvent{
+				Level:       "warn",
+				RequestID:   reqInfo.RequestID,
+				AgentID:     reqInfo.AgentID,
+				DomainID:    reqInfo.DomainID,
+				Profile:     reqInfo.Profile,
+				Provider:    reqInfo.Provider,
+				Method:      reqInfo.Method,
+				Path:        reqInfo.Path,
+				Status:      resp.StatusCode,
+				QueueMS:     reqInfo.QueueMS,
+				Attempt:     reqInfo.Attempt,
+				MaxAttempts: reqInfo.MaxAttempts,
+				Message:     "upstream error response: " + string(errorBody),
+			})
+		}
+	}
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
@@ -662,7 +704,11 @@ func (g *InferenceGateway) forwardWithRetry(ctx context.Context, incoming *http.
 	retried := false
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		var retryBody []byte
 		info.Attempt = attempt
+		if err := g.waitForCooldown(ctx, *info); err != nil {
+			return nil, err
+		}
 		g.emitActivity(*info, "forwarding")
 		g.recordForwarding(*info, target, maxAttempts)
 
@@ -681,11 +727,19 @@ func (g *InferenceGateway) forwardWithRetry(ctx context.Context, incoming *http.
 			g.recordStatus(resp.StatusCode)
 			if resp.StatusCode == http.StatusTooManyRequests {
 				g.upstream429.Add(1)
+				retryBody, _ = io.ReadAll(io.LimitReader(resp.Body, 32*1024))
+				_ = resp.Body.Close()
+				resp.Body = io.NopCloser(bytes.NewReader(retryBody))
 			}
 			if !retryableGatewayStatus(resp.StatusCode) || attempt == maxAttempts {
+				if resp.StatusCode == http.StatusTooManyRequests {
+					g.setCooldown(info.Profile, g.retryDelay(resp, retryBody, attempt))
+				}
 				return resp, nil
 			}
-			_, _ = io.Copy(io.Discard, resp.Body)
+			if retryBody == nil {
+				retryBody, _ = io.ReadAll(io.LimitReader(resp.Body, 32*1024))
+			}
 			_ = resp.Body.Close()
 			requestErr = fmt.Errorf("upstream returned HTTP %d", resp.StatusCode)
 		} else if ctx.Err() != nil {
@@ -700,7 +754,7 @@ func (g *InferenceGateway) forwardWithRetry(ctx context.Context, incoming *http.
 			retried = true
 		}
 		g.retryAttempts.Add(1)
-		delay := g.retryDelay(resp, attempt)
+		delay := g.retryDelay(resp, retryBody, attempt)
 		g.emitActivity(*info, "retry_wait")
 		g.recordEvent(GatewayEvent{
 			Level:       "warn",
@@ -721,6 +775,57 @@ func (g *InferenceGateway) forwardWithRetry(ctx context.Context, incoming *http.
 		}
 	}
 	return nil, fmt.Errorf("upstream inference request exhausted retries")
+}
+
+func (g *InferenceGateway) setCooldown(profile string, delay time.Duration) {
+	profile = strings.TrimSpace(profile)
+	if profile == "" || delay <= 0 {
+		return
+	}
+	until := time.Now().Add(delay)
+	g.mu.Lock()
+	if g.cooldowns == nil {
+		g.cooldowns = make(map[string]time.Time)
+	}
+	if current := g.cooldowns[profile]; until.After(current) {
+		g.cooldowns[profile] = until
+	}
+	g.mu.Unlock()
+}
+
+func (g *InferenceGateway) waitForCooldown(ctx context.Context, info gatewayRequestInfo) error {
+	profile := strings.TrimSpace(info.Profile)
+	if profile == "" {
+		return nil
+	}
+	g.mu.Lock()
+	until := g.cooldowns[profile]
+	g.mu.Unlock()
+	delay := time.Until(until)
+	if delay <= 0 {
+		return nil
+	}
+	g.emitActivity(info, "retry_wait")
+	g.recordEvent(GatewayEvent{
+		Level:     "warn",
+		RequestID: info.RequestID,
+		AgentID:   info.AgentID,
+		DomainID:  info.DomainID,
+		Profile:   profile,
+		Provider:  info.Provider,
+		Method:    info.Method,
+		Path:      info.Path,
+		Message:   fmt.Sprintf("waiting %s for upstream profile cooldown", delay.Round(time.Millisecond)),
+	})
+	if err := g.sleepFn(ctx, delay); err != nil {
+		return err
+	}
+	g.mu.Lock()
+	if g.cooldowns[profile] == until {
+		delete(g.cooldowns, profile)
+	}
+	g.mu.Unlock()
+	return nil
 }
 
 func (g *InferenceGateway) recordForwarding(info gatewayRequestInfo, target string, maxAttempts int) {
@@ -874,7 +979,7 @@ func retryableGatewayError(err error) bool {
 	return strings.Contains(text, "connection reset") || strings.Contains(text, "unexpected eof") || strings.Contains(text, "server closed idle connection")
 }
 
-func (g *InferenceGateway) retryDelay(resp *http.Response, attempt int) time.Duration {
+func (g *InferenceGateway) retryDelay(resp *http.Response, body []byte, attempt int) time.Duration {
 	base := time.Second
 	maxDelay := 30 * time.Second
 	if g.config != nil {
@@ -887,11 +992,11 @@ func (g *InferenceGateway) retryDelay(resp *http.Response, attempt int) time.Dur
 	}
 	if resp != nil {
 		if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()); retryAfter > 0 {
-			if retryAfter > maxDelay {
-				return maxDelay
-			}
-			return retryAfter
+			return min(retryAfter, maxDelay)
 		}
+	}
+	if retryAfter := parseProviderRetryDelay(body); retryAfter > 0 {
+		return min(retryAfter, maxDelay)
 	}
 	delay := base
 	for i := 1; i < attempt && delay < maxDelay; i++ {
@@ -905,6 +1010,39 @@ func (g *InferenceGateway) retryDelay(resp *http.Response, attempt int) time.Dur
 		return delay
 	}
 	return half + time.Duration(rand.Int63n(int64(half)+1))
+}
+
+func parseProviderRetryDelay(body []byte) time.Duration {
+	type envelope struct {
+		Error struct {
+			Details []struct {
+				RetryDelay string `json:"retryDelay"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	var envelopes []envelope
+	switch {
+	case len(bytes.TrimSpace(body)) == 0:
+		return 0
+	case bytes.HasPrefix(bytes.TrimSpace(body), []byte("[")):
+		if json.Unmarshal(body, &envelopes) != nil {
+			return 0
+		}
+	default:
+		var item envelope
+		if json.Unmarshal(body, &item) != nil {
+			return 0
+		}
+		envelopes = append(envelopes, item)
+	}
+	for _, item := range envelopes {
+		for _, detail := range item.Error.Details {
+			if delay, err := time.ParseDuration(strings.TrimSpace(detail.RetryDelay)); err == nil && delay > 0 {
+				return delay
+			}
+		}
+	}
+	return 0
 }
 
 func parseRetryAfter(value string, now time.Time) time.Duration {
@@ -1065,6 +1203,57 @@ func enforceGatewayRequestModel(body []byte, model string) ([]byte, error) {
 
 func normalizeGatewayProviderRequest(body []byte, provider string) ([]byte, error) {
 	provider = strings.ToLower(strings.TrimSpace(provider))
+	if isGoogleGeminiProvider(provider) {
+		var payload map[string]json.RawMessage
+		if err := json.Unmarshal(body, &payload); err != nil {
+			return nil, fmt.Errorf("gateway request body is not valid JSON: %w", err)
+		}
+		changed := false
+		if _, exists := payload["store"]; exists {
+			delete(payload, "store")
+			changed = true
+		}
+		if encodedMessages, exists := payload["messages"]; exists {
+			var messages []map[string]any
+			if err := json.Unmarshal(encodedMessages, &messages); err != nil {
+				return nil, fmt.Errorf("gateway request messages are not valid JSON: %w", err)
+			}
+			for _, message := range messages {
+				if message["role"] != "assistant" {
+					continue
+				}
+				toolCalls, ok := message["tool_calls"].([]any)
+				if !ok || len(toolCalls) == 0 {
+					continue
+				}
+				first, ok := toolCalls[0].(map[string]any)
+				if !ok || hasGeminiThoughtSignature(first) {
+					continue
+				}
+				first["extra_content"] = map[string]any{
+					"google": map[string]any{
+						"thought_signature": "skip_thought_signature_validator",
+					},
+				}
+				changed = true
+			}
+			if changed {
+				encodedMessages, err := json.Marshal(messages)
+				if err != nil {
+					return nil, fmt.Errorf("gateway request messages could not be encoded: %w", err)
+				}
+				payload["messages"] = encodedMessages
+			}
+		}
+		if !changed {
+			return body, nil
+		}
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("gateway request body could not be encoded: %w", err)
+		}
+		return encoded, nil
+	}
 	if !strings.Contains(provider, "cloudflare") && !strings.Contains(provider, "workers-ai") {
 		return body, nil
 	}
@@ -1105,6 +1294,19 @@ func normalizeGatewayProviderRequest(body []byte, provider string) ([]byte, erro
 		return nil, fmt.Errorf("gateway request body could not be encoded: %w", err)
 	}
 	return encoded, nil
+}
+
+func hasGeminiThoughtSignature(toolCall map[string]any) bool {
+	extra, ok := toolCall["extra_content"].(map[string]any)
+	if !ok {
+		return false
+	}
+	google, ok := extra["google"].(map[string]any)
+	if !ok {
+		return false
+	}
+	signature, _ := google["thought_signature"].(string)
+	return strings.TrimSpace(signature) != ""
 }
 
 func gatewayPolicyAllowsPath(policy AgentCapabilityPolicy, path string) bool {
@@ -1269,6 +1471,7 @@ func canonicalGatewayProxyPath(path string) string {
 
 func copyGatewayHeaders(dst, src http.Header) {
 	hopByHop := map[string]bool{
+		"Accept-Encoding":     true,
 		"Connection":          true,
 		"Keep-Alive":          true,
 		"Proxy-Authenticate":  true,

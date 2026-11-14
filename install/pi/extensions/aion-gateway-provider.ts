@@ -415,6 +415,9 @@ function buildOpenAIRequest(model: Model<any>, context: Context, options?: Simpl
     stream_options: { include_usage: true },
   };
   payload.max_tokens = options?.maxTokens || model.maxTokens || 4096;
+  if (isGoogleGeminiTarget()) {
+    payload.reasoning_effort = env("AION_TARGET_REASONING_EFFORT") || "low";
+  }
   if (options?.temperature !== undefined) {
     payload.temperature = options.temperature;
   }

@@ -104,6 +104,10 @@ func TestPiGatewayExtensionNormalizesTextEncodedToolCall(t *testing.T) {
 				requestErrors <- fmt.Errorf("Pi tools were not forwarded: %s", body)
 				return
 			}
+			if !strings.Contains(string(body), `"reasoning_effort":"low"`) {
+				requestErrors <- fmt.Errorf("Gemini reasoning effort was not bounded: %s", body)
+				return
+			}
 			chunk, _ := json.Marshal(map[string]any{
 				"id":    "native-tool-call",
 				"model": "test-model",

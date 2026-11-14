@@ -192,6 +192,95 @@ func TestTargetURLForRequestAdaptsGoogleGeminiOpenAICompatibilityPath(t *testing
 	}
 }
 
+func TestCopyGatewayHeadersLetsTransportNegotiateCompression(t *testing.T) {
+	source := http.Header{
+		"Accept-Encoding": {"gzip, deflate"},
+		"Content-Type":    {"application/json"},
+	}
+	target := make(http.Header)
+
+	copyGatewayHeaders(target, source)
+
+	if got := target.Get("Accept-Encoding"); got != "" {
+		t.Fatalf("Accept-Encoding=%q, want transport-managed encoding", got)
+	}
+	if got := target.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type=%q, want application/json", got)
+	}
+}
+
+func TestNormalizeGatewayProviderRequestRemovesUnsupportedGeminiStore(t *testing.T) {
+	body := []byte(`{"model":"redacted-model","messages":[{"role":"user","content":"inspect"}],"store":false,"stream":true}`)
+
+	normalized, err := normalizeGatewayProviderRequest(body, "google-gemini")
+	if err != nil {
+		t.Fatalf("normalize Gemini request: %v", err)
+	}
+	if strings.Contains(string(normalized), `"store"`) {
+		t.Fatalf("normalized request retained unsupported store field: %s", normalized)
+	}
+	if !strings.Contains(string(normalized), `"stream":true`) {
+		t.Fatalf("normalized request lost supported fields: %s", normalized)
+	}
+}
+
+func TestNormalizeGatewayProviderRequestSuppliesMissingGeminiThoughtSignature(t *testing.T) {
+	body := []byte(`{
+		"model":"redacted-model",
+		"messages":[
+			{"role":"user","content":"inspect"},
+			{"role":"assistant","content":null,"tool_calls":[
+				{"id":"call-1","type":"function","function":{"name":"inspect","arguments":"{}"}},
+				{"id":"call-2","type":"function","function":{"name":"compare","arguments":"{}"}}
+			]},
+			{"role":"tool","tool_call_id":"call-1","content":"ok"}
+		],
+		"store":false,
+		"stream":true
+	}`)
+
+	normalized, err := normalizeGatewayProviderRequest(body, "google-gemini")
+	if err != nil {
+		t.Fatalf("normalize Gemini request: %v", err)
+	}
+	var payload struct {
+		Store    any `json:"store"`
+		Messages []struct {
+			ToolCalls []struct {
+				ExtraContent struct {
+					Google struct {
+						ThoughtSignature string `json:"thought_signature"`
+					} `json:"google"`
+				} `json:"extra_content"`
+			} `json:"tool_calls"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatalf("decode normalized request: %v", err)
+	}
+	if payload.Store != nil {
+		t.Fatalf("normalized request retained unsupported store field: %s", normalized)
+	}
+	if got := payload.Messages[1].ToolCalls[0].ExtraContent.Google.ThoughtSignature; got != "skip_thought_signature_validator" {
+		t.Fatalf("first tool thought signature=%q", got)
+	}
+	if got := payload.Messages[1].ToolCalls[1].ExtraContent.Google.ThoughtSignature; got != "" {
+		t.Fatalf("parallel tool thought signature=%q, want empty", got)
+	}
+}
+
+func TestNormalizeGatewayProviderRequestPreservesGeminiThoughtSignature(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"extra_content":{"google":{"thought_signature":"signed-by-provider"}},"function":{"name":"inspect","arguments":"{}"}}]}]}`)
+
+	normalized, err := normalizeGatewayProviderRequest(body, "google-gemini")
+	if err != nil {
+		t.Fatalf("normalize Gemini request: %v", err)
+	}
+	if !bytes.Equal(normalized, body) {
+		t.Fatalf("signed Gemini request changed: %s", normalized)
+	}
+}
+
 func TestNormalizeGatewayProviderRequestRewritesNullAssistantContent(t *testing.T) {
 	body := []byte(`{"model":"redacted-model","messages":[{"role":"user","content":"inspect"},{"role":"assistant","content":null,"tool_calls":[{"id":"call-1"}]},{"role":"tool","content":"ok"}]}`)
 	normalized, err := normalizeGatewayProviderRequest(body, "redacted-cloudflare-workers-ai")
@@ -637,8 +726,30 @@ func TestInferenceGatewayRetryAfterIsBounded(t *testing.T) {
 		RetryMaxDelayMS:  250,
 	}})
 	resp := &http.Response{Header: http.Header{"Retry-After": []string{"30"}}}
-	if got := gateway.retryDelay(resp, 1); got != 250*time.Millisecond {
+	if got := gateway.retryDelay(resp, nil, 1); got != 250*time.Millisecond {
 		t.Fatalf("retry delay=%s want=250ms", got)
+	}
+}
+
+func TestInferenceGatewayProviderRetryDelayIsBounded(t *testing.T) {
+	gateway := NewInferenceGateway(&Config{InferenceGateway: InferenceGatewayConfig{
+		RetryBaseDelayMS: 10,
+		RetryMaxDelayMS:  30_000,
+	}})
+	body := []byte(`[{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"32.433729398s"}]}}]`)
+
+	if got := gateway.retryDelay(&http.Response{}, body, 1); got != 30*time.Second {
+		t.Fatalf("retry delay=%s want=30s", got)
+	}
+}
+
+func TestInferenceGatewayExposesProfileCooldown(t *testing.T) {
+	gateway := NewInferenceGateway(&Config{})
+	gateway.setCooldown("forge", time.Minute)
+
+	status := gateway.Status()
+	if len(status.Cooldowns) != 1 || status.Cooldowns[0].Profile != "forge" || status.Cooldowns[0].RemainingMS <= 0 {
+		t.Fatalf("unexpected cooldown status: %#v", status.Cooldowns)
 	}
 }
 
