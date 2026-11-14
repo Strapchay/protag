@@ -955,3 +955,63 @@ func TestNormalizeGatewayProviderRequestDropsOrphanToolResult(t *testing.T) {
 		t.Fatalf("orphan tool result survived: %s", normalized)
 	}
 }
+
+type cancelingStreamBody struct {
+	sent bool
+}
+
+func (b *cancelingStreamBody) Read(p []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+		return copy(p, "data: {}\n\n"), nil
+	}
+	return 0, context.Canceled
+}
+
+func (b *cancelingStreamBody) Close() error { return nil }
+
+func TestInferenceGatewayCancellationIsNotAnUpstreamFailure(t *testing.T) {
+	gateway := NewInferenceGateway(&Config{
+		InferenceGateway: InferenceGatewayConfig{
+			Enabled:       true,
+			ListenAddr:    "127.0.0.1:0",
+			PublicBaseURL: "http://127.0.0.1:0",
+			GatewayKey:    "local-key",
+			TargetProfile: "forge",
+		},
+		Inference: InferenceConfig{
+			Models: map[string]ModelProfile{
+				"forge": {
+					Provider: "redacted-openai-compatible",
+					Model:    "redacted-model",
+					Endpoint: "http://upstream.local",
+					Env:      map[string]string{"API_KEY": "redacted-token"},
+				},
+			},
+		},
+	}, t.TempDir())
+	gateway.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       &cancelingStreamBody{},
+		}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"stream":true}`))
+	req.Header.Set(gatewayAuthHeader, "local-key")
+	req.Header.Set("X-Aion-Target-Profile", "forge")
+	rec := httptest.NewRecorder()
+	gateway.handleProxy(rec, req)
+
+	status := gateway.Status()
+	if status.Canceled != 1 {
+		t.Fatalf("canceled=%d, want 1", status.Canceled)
+	}
+	if status.LastError != "" {
+		t.Fatalf("cancellation polluted last_error: %q", status.LastError)
+	}
+	if !strings.Contains(status.LastCancellation, "client disconnected") {
+		t.Fatalf("last_cancellation=%q", status.LastCancellation)
+	}
+}

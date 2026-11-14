@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -46,6 +47,8 @@ type InferenceGatewayStatus struct {
 	Retried            int64                  `json:"retried_requests"`
 	UpstreamTimeoutSec int                    `json:"upstream_timeout_sec"`
 	LastError          string                 `json:"last_error,omitempty"`
+	Canceled           int64                  `json:"canceled"`
+	LastCancellation   string                 `json:"last_cancellation,omitempty"`
 	LogPath            string                 `json:"log_path,omitempty"`
 	StatusCounts       map[int]int64          `json:"status_counts,omitempty"`
 	RecentEvents       []GatewayEvent         `json:"recent_events,omitempty"`
@@ -103,20 +106,22 @@ type InferenceGateway struct {
 	client       *http.Client
 
 	totalRequests atomic.Int64
+	canceled      atomic.Int64
 	rejected      atomic.Int64
 	upstream429   atomic.Int64
 	retryAttempts atomic.Int64
 	retried       atomic.Int64
 
-	mu           sync.Mutex
-	lastError    string
-	logPath      string
-	statusCounts map[int]int64
-	recentEvents []GatewayEvent
-	activityFn   func(agentID, domainID, phase string)
-	capabilityFn func(token string) (AgentCapabilityPolicy, bool)
-	active       map[string]gatewayActiveRequest
-	cooldowns    map[string]time.Time
+	mu               sync.Mutex
+	lastError        string
+	lastCancellation string
+	logPath          string
+	statusCounts     map[int]int64
+	recentEvents     []GatewayEvent
+	activityFn       func(agentID, domainID, phase string)
+	capabilityFn     func(token string) (AgentCapabilityPolicy, bool)
+	active           map[string]gatewayActiveRequest
+	cooldowns        map[string]time.Time
 
 	activityPulseInterval time.Duration
 	sleepFn               func(context.Context, time.Duration) error
@@ -286,6 +291,7 @@ func (g *InferenceGateway) Status() InferenceGatewayStatus {
 	}
 	g.mu.Lock()
 	lastError := g.lastError
+	lastCancellation := g.lastCancellation
 	statusCounts := make(map[int]int64, len(g.statusCounts))
 	for status, count := range g.statusCounts {
 		statusCounts[status] = count
@@ -349,6 +355,8 @@ func (g *InferenceGateway) Status() InferenceGatewayStatus {
 		Retried:            g.retried.Load(),
 		UpstreamTimeoutSec: g.upstreamTimeoutSec(),
 		LastError:          lastError,
+		Canceled:           g.canceled.Load(),
+		LastCancellation:   lastCancellation,
 		LogPath:            logPath,
 		StatusCounts:       statusCounts,
 		RecentEvents:       recentEvents,
@@ -609,21 +617,24 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	defer cancelProxy()
 	resp, err := g.forwardWithRetry(proxyCtx, r, target, body, profile, &reqInfo, start)
 	if err != nil {
-		g.recordError(err)
-		phase := "failed"
-		status := http.StatusBadGateway
-		message := "upstream inference request failed: " + err.Error()
 		if errors.Is(proxyCtx.Err(), context.DeadlineExceeded) {
-			status = http.StatusGatewayTimeout
-			message = "upstream inference request timed out"
-		} else if r.Context().Err() != nil {
-			phase = "canceled"
+			g.recordError(err)
+			message := "upstream inference request timed out"
+			g.emitActivity(reqInfo, "failed")
+			g.recordFailure(reqInfo, http.StatusGatewayTimeout, start, message)
+			writeGatewayJSON(w, http.StatusGatewayTimeout, map[string]string{"error": message})
+			return
 		}
-		g.emitActivity(reqInfo, phase)
-		g.recordFailure(reqInfo, status, start, message)
-		if r.Context().Err() == nil {
-			writeGatewayJSON(w, status, map[string]string{"error": message})
+		if isClientDisconnect(r.Context(), err) {
+			g.emitActivity(reqInfo, "canceled")
+			g.recordCancellation(reqInfo, 0, start, 0, "client disconnected before upstream response")
+			return
 		}
+		g.recordError(err)
+		message := "upstream inference request failed: " + err.Error()
+		g.emitActivity(reqInfo, "failed")
+		g.recordFailure(reqInfo, http.StatusBadGateway, start, message)
+		writeGatewayJSON(w, http.StatusBadGateway, map[string]string{"error": message})
 		return
 	}
 	defer resp.Body.Close()
@@ -660,6 +671,11 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				if isClientDisconnect(r.Context(), writeErr) {
+					g.emitActivity(reqInfo, "canceled")
+					g.recordCancellation(reqInfo, resp.StatusCode, start, bytesWritten, "client disconnected while streaming")
+					return
+				}
 				g.emitActivity(reqInfo, "failed")
 				g.recordFailure(reqInfo, resp.StatusCode, start, "client write failed: "+writeErr.Error())
 				return
@@ -671,13 +687,20 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		if readErr != nil {
 			if readErr != io.EOF {
+				if errors.Is(proxyCtx.Err(), context.DeadlineExceeded) {
+					g.recordError(readErr)
+					g.emitActivity(reqInfo, "failed")
+					g.recordFailure(reqInfo, http.StatusGatewayTimeout, start, "upstream inference stream timed out")
+					return
+				}
+				if isClientDisconnect(r.Context(), readErr) {
+					g.emitActivity(reqInfo, "canceled")
+					g.recordCancellation(reqInfo, resp.StatusCode, start, bytesWritten, "client disconnected while streaming")
+					return
+				}
 				g.recordError(readErr)
 				g.emitActivity(reqInfo, "failed")
-				if errors.Is(proxyCtx.Err(), context.DeadlineExceeded) {
-					g.recordFailure(reqInfo, http.StatusGatewayTimeout, start, "upstream inference stream timed out")
-				} else {
-					g.recordFailure(reqInfo, resp.StatusCode, start, "upstream read failed: "+readErr.Error())
-				}
+				g.recordFailure(reqInfo, resp.StatusCode, start, "upstream read failed: "+readErr.Error())
 				return
 			}
 			g.emitActivity(reqInfo, "completed")
@@ -1348,6 +1371,45 @@ func (g *InferenceGateway) recordCompletion(info gatewayRequestInfo, status int,
 		QueueMS:     info.QueueMS,
 		DurationMS:  time.Since(start).Milliseconds(),
 		Bytes:       bytesWritten,
+		Attempt:     info.Attempt,
+		MaxAttempts: info.MaxAttempts,
+		Message:     message,
+	})
+}
+
+func isClientDisconnect(ctx context.Context, err error) bool {
+	if ctx != nil && ctx.Err() != nil {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	return errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET)
+}
+
+func (g *InferenceGateway) recordCancellation(info gatewayRequestInfo, status int, start time.Time, bytes int64, message string) {
+	g.canceled.Add(1)
+	message = sanitizeGatewayMessage(message)
+	g.mu.Lock()
+	g.lastCancellation = message
+	g.mu.Unlock()
+	g.recordEvent(GatewayEvent{
+		At:          time.Now().UTC().Format(time.RFC3339Nano),
+		Level:       "info",
+		RequestID:   info.RequestID,
+		AgentID:     info.AgentID,
+		DomainID:    info.DomainID,
+		Profile:     info.Profile,
+		Provider:    info.Provider,
+		Method:      info.Method,
+		Path:        info.Path,
+		Status:      status,
+		QueueMS:     info.QueueMS,
+		DurationMS:  time.Since(start).Milliseconds(),
+		Bytes:       bytes,
 		Attempt:     info.Attempt,
 		MaxAttempts: info.MaxAttempts,
 		Message:     message,
