@@ -224,6 +224,19 @@ type tuiPayload struct {
 	Block   string `json:"block"`
 }
 
+// isMouseReport identifies an SGR mouse report that escaped Bubble Tea's input
+// parser. Some terminal/tmux combinations deliver these as runes; without this
+// guard they are inserted into the composer as text.
+func isMouseReport(value string) bool {
+	if !strings.HasPrefix(value, "[<") {
+		return false
+	}
+	if !strings.HasSuffix(value, "M") && !strings.HasSuffix(value, "m") {
+		return false
+	}
+	return strings.Contains(value, ";")
+}
+
 func normalizeStream(stream string) string {
 	if stream == tuiStreamDelta {
 		return tuiStreamDelta

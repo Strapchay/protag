@@ -1033,6 +1033,66 @@ func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunSta
 			"AION_TARGET_API=" + gatewayAPIForProvider(targetProviderForCoordinator(config, infConfig)),
 		}
 		piConfig.ResolutionEnv = append(piConfig.ResolutionEnv, targetInferenceEnv()...)
+
+		architectSessionDir := filepath.Join(runState.PiSessionsDir, "orchestrator")
+		if err := os.MkdirAll(architectSessionDir, 0o755); err != nil {
+			return nil, fmt.Errorf("architect session dir: %w", err)
+		}
+		docsDir := filepath.Join(projectRoot, "docs")
+		if err := os.MkdirAll(docsDir, 0o755); err != nil {
+			return nil, fmt.Errorf("architect docs dir: %w", err)
+		}
+		docsMount, err := isolation.NewWorkspaceMount(projectRoot, "docs", isolation.MountDirectory)
+		if err != nil {
+			return nil, fmt.Errorf("architect docs mount: %w", err)
+		}
+		architectReadOnly := append([]isolation.Mount{}, binaryMounts...)
+		architectReadOnly = append(architectReadOnly, skillMounts...)
+		architectReadOnly = append(architectReadOnly, extensionMounts...)
+		piConfig.ArchitectIsolationEngine = engine
+		piConfig.ArchitectPolicy = isolation.Policy{
+			ID:         "architect",
+			WorkingDir: "/workspace",
+			Hostname:   "architect",
+			Network:    isolation.NetworkShared,
+			SourceRoot: projectRoot,
+			DeniedSources: []string{
+				filepath.Join(projectRoot, ".aion"),
+				filepath.Join(projectRoot, ".git"),
+			},
+			Writable: []isolation.Mount{
+				docsMount,
+				{Source: architectSessionDir, Target: "/state/pi", Kind: isolation.MountDirectory},
+			},
+			ReadOnly: architectReadOnly,
+			Environment: map[string]string{
+				"PATH":                strings.Join(uniqueStrings(pathEntries), ":"),
+				"PI_CODING_AGENT_DIR": "/state/pi/config",
+				"PI_TELEMETRY":        "0",
+			},
+		}
+		architectProfile := infConfig.UseProfile
+		if architectProfile == "" {
+			architectProfile = config.InferenceGateway.TargetProfile
+		}
+		architectProvider := targetProviderForCoordinator(config, infConfig)
+		architectGatewayURL := config.InferenceGateway.PublicBaseURL
+		if architectGatewayURL == "" {
+			architectGatewayURL = "http://" + config.InferenceGateway.ListenAddr
+		}
+		piConfig.ArchitectBinary = binary
+		piConfig.ArchitectSkillPaths = skills
+		piConfig.ArchitectExtensionPaths = extensions
+		piConfig.ArchitectEnv = []string{
+			"AION_INFERENCE_GATEWAY_ENABLED=true",
+			"AION_INFERENCE_GATEWAY_URL=" + architectGatewayURL,
+			"AION_INFERENCE_GATEWAY_KEY=" + config.InferenceGateway.GatewayKey,
+			"AION_TARGET_PROVIDER=" + architectProvider,
+			"AION_TARGET_PROFILE=" + architectProfile,
+			"AION_TARGET_MODEL=" + model,
+			"AION_TARGET_API=" + gatewayAPIForProvider(architectProvider),
+		}
+		piConfig.ArchitectEnv = append(piConfig.ArchitectEnv, targetInferenceEnv()...)
 	}
 	return coordinator.NewPiCoordinator(projectRoot, piConfig), nil
 }

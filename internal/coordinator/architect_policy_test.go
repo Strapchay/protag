@@ -227,3 +227,19 @@ func TestShutdownCheckpoint(t *testing.T) {
 		t.Fatalf("expected stopped, got %s", loaded.Status)
 	}
 }
+
+func TestArchitectInstructionEnforcesSandboxRails(t *testing.T) {
+	prompt := GenerateArchitectInstruction("")
+	for _, want := range []string{
+		"restricted to `/workspace`",
+		"Never attempt to read them",
+		"Do not use `strings`",
+		"Never emit kernel-generated contract IDs",
+		"state your assumption",
+		"Write only `docs/build_spec.md`",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("architect instruction missing %q:\n%s", want, prompt)
+		}
+	}
+}

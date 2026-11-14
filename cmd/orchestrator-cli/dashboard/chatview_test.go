@@ -360,3 +360,21 @@ func TestInternalUserRolePromptDoesNotLeakIntoChat(t *testing.T) {
 		}
 	}
 }
+
+func TestMouseReportDetection(t *testing.T) {
+	if !isMouseReport("[<65;41;11M") {
+		t.Fatal("SGR mouse report was not detected")
+	}
+	if isMouseReport("normal text") {
+		t.Fatal("normal text was misclassified as a mouse report")
+	}
+}
+
+func TestChatIgnoresSGRMouseReport(t *testing.T) {
+	m := NewChatModel("127.0.0.1:0")
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 20})
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("[<65;41;11M")})
+	if got := m.input.Value(); got != "" {
+		t.Fatalf("mouse report entered the composer: %q", got)
+	}
+}

@@ -46,7 +46,7 @@ The CLI uses the supervisor-issued capability automatically. The orchestrator de
 
 ### `orchestrator-cli contract-ensure --producer-node <id> --consumer-node <id> --resource <name> [--details '<json>'|--details-file <path>] [--wait]`
 
-Create or retrieve the stable contract for a discovered cross-domain dependency. The kernel derives participant identities from DAG ownership, rejects requests from agents that do not own the consumer node, and returns the producer work item's queue state. Use a stable resource name and retry the same command safely after transport failure.
+Create or retrieve the stable contract for a discovered cross-domain dependency. The kernel derives participant identities from DAG ownership, rejects requests from agents that do not own the consumer node, and returns the producer work item's queue state. Use a stable resource name and retry the same command safely after transport failure. The kernel generates the durable `contract_id` from the resource and participant node IDs. Never hardcode, derive, or guess a kernel contract ID; use the `contract_id` returned by this command for every lifecycle operation.
 
 Use `--wait` only when the consumer cannot continue without the artifact. After ensuring a hard-wait contract, checkpoint the current item and end the turn. Do not poll or fabricate the dependency; the kernel wakes the correct agent when publication, validation, or correction becomes ready.
 
@@ -116,6 +116,14 @@ by both participants. A standstill pauses only the affected nodes while the
 kernel runs bounded reconciliation; inspect delivered term events and continue
 unrelated work. Agents never own the reconciliation lease or modify ownership.
 
+### `orchestrator-cli send-message --agent-id <agent-id> --text <text>`
+
+Send a Context Hub message to a peer agent, for example `agent-ledger` or
+`agent-report`. Use it for consumption plans, compatibility notices, and
+acknowledgements. The message is durable in the peer's context stream; it is
+queued while the peer is executing a tool and delivered after that tool result.
+Do not include credentials or secrets.
+
 ### Other orchestration commands
 
 - `inject-edge --from <node-id> --to <node-id>` reports a newly discovered dependency.
@@ -129,16 +137,32 @@ Create a schema-v1 integration directive only when its exact
 `<assigned-path>/integration/directives/*.json` path appears in the current
 node's `target_files`. Cross-domain directives belong to the consumer node.
 Producers publish public contract descriptors and focused unit tests instead of
-inventing an unplanned directive. Use an absolute `/usr` or `/bin` command array
-and include the current node in `owner_node_ids`. List every consumed public
-artifact in `required_contracts`. Omit `working_directory` when the command
-crosses domain boundaries so the runner uses the assembled `/workspace` root.
-The kernel runs these directives only after DAG and coordination work are
-terminal, in a network-isolated assembled workspace where all domain outputs
-and contracts are read-only. Validate the JSON and your owned unit tests, then
-complete the node; do not search for peer source or execute a cross-domain
-directive from the Domain Agent workspace. Do not run `integration-run` from a
-Domain Agent; retry authority is an operator action.
+inventing an unplanned directive.
+
+Use this exact schema. Unknown fields are rejected:
+
+```json
+{
+  "schema_version": 1,
+  "id": "stable-id",
+  "command": ["/usr/bin/env", "python3", "-m", "unittest", "discover"],
+  "required_contracts": ["<contract_id returned by contract-ensure>"],
+  "owner_node_ids": ["<your-node-id>"],
+  "timeout_sec": 120
+}
+```
+
+- `command[0]` must be an absolute `/usr` or `/bin` executable.
+- `required_contracts` contains kernel `contract_id` values, not resource names.
+- Omit `working_directory` for a cross-domain directive.
+- The timeout field is `timeout_sec` (not `timeout_seconds`).
+- The kernel runs directives only after DAG and coordination work are terminal,
+  in a network-isolated assembled `/workspace` where all domain outputs and
+  contracts are read-only.
+- Validate the JSON and your owned unit tests, then complete the node; do not
+  search for peer source or execute a cross-domain directive from the Domain
+  Agent workspace. Do not run `integration-run` from a Domain Agent; retry
+  authority is an operator action.
 
 ## Execution Loop
 
@@ -184,6 +208,15 @@ Pi is idle or queues them behind the active turn:
 - **ContractTermsAgreed**: Both participants accepted the latest immutable terms; publication may continue.
 - **CycleDetected**: Hard waits form a cycle. Stop dependent work until the kernel reports recovery.
 - **ContextShare**: Additional context from a peer agent. Incorporate it.
+
+## Sandbox Boundary
+
+Your process is sandboxed to the project workspace and the mounted runtime
+skill/extension paths. Kernel source, kernel binaries, host home directories,
+and runtime internals are not mounted. Do not use `strings`, binary inspection,
+or source inspection to discover kernel schemas; use this skill. If a detail is
+missing, state the assumption or request it through the kernel rather than
+reading outside the workspace.
 
 ## Coordination Rules
 

@@ -577,7 +577,7 @@ func (p *PiAgentProcess) readEvents() {
 
 		p.events <- event
 	}
-	if err := scanner.Err(); err != nil {
+	if err := scanner.Err(); err != nil && !strings.Contains(err.Error(), "file already closed") {
 		log.Printf("piagent: event stream read error: %v", err)
 	}
 }

@@ -113,6 +113,9 @@ func (m *ChatModel) Init() tea.Cmd {
 }
 
 func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if key, ok := msg.(tea.KeyMsg); ok && isMouseReport(key.String()) {
+		return m, nil
+	}
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {

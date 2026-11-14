@@ -67,6 +67,13 @@ type PiCoordinatorConfig struct {
 	ResolutionExtensionPaths   []string
 	ResolutionEnv              []string
 	ResolutionArtifactTimeout  time.Duration
+
+	ArchitectIsolationEngine isolation.Engine
+	ArchitectPolicy          isolation.Policy
+	ArchitectBinary          string
+	ArchitectSkillPaths      []string
+	ArchitectExtensionPaths  []string
+	ArchitectEnv             []string
 }
 
 type SolutionArchitectMetadata struct {
@@ -219,7 +226,7 @@ func (c *PiCoordinator) StartArchitect(ctx context.Context) error {
 		return fmt.Errorf("pi_coordinator: start/resume architect session: %w", err)
 	}
 
-	c.agent = supervisor.NewAgentSupervisor(supervisor.AgentConfig{
+	agentConfig := supervisor.AgentConfig{
 		AgentID:          "orchestrator",
 		DomainID:         "architect",
 		InitialPrompt:    "",
@@ -241,7 +248,28 @@ func (c *PiCoordinator) StartArchitect(ctx context.Context) error {
 				"AION_DOMAIN_ID=architect",
 			),
 		},
-	})
+	}
+	if c.config.ArchitectIsolationEngine != nil {
+		agentConfig.IsolationEngine = c.config.ArchitectIsolationEngine
+		agentConfig.IsolationPolicy = c.config.ArchitectPolicy
+		agentConfig.PiAgent = supervisor.PiAgentConfig{
+			Binary:         c.config.ArchitectBinary,
+			SessionDir:     "/state/pi",
+			HostSessionDir: agentDir,
+			ResumeSession:  start.Resumed,
+			WorkingDir:     "/workspace",
+			Provider:       c.config.Provider,
+			Model:          c.config.Model,
+			Endpoint:       c.config.Endpoint,
+			SkillPaths:     c.config.ArchitectSkillPaths,
+			ExtensionPaths: c.config.ArchitectExtensionPaths,
+			Env: append(c.config.ArchitectEnv,
+				"AION_AGENT_ID=orchestrator",
+				"AION_DOMAIN_ID=architect",
+			),
+		}
+	}
+	c.agent = supervisor.NewAgentSupervisor(agentConfig)
 	c.agent.SetLifecycleFunc(c.handleArchitectLifecycle)
 
 	return c.agent.Start(ctx)

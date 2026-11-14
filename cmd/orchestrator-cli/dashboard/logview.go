@@ -262,6 +262,9 @@ func (m *MultiLogModel) PrevAgent() {
 }
 
 func (m *MultiLogModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if key, ok := msg.(tea.KeyMsg); ok && isMouseReport(key.String()) {
+		return m, nil
+	}
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
