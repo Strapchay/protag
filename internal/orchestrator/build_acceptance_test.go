@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -256,5 +257,61 @@ func TestAcceptanceSuccessorCreatesContract(t *testing.T) {
 	}
 	if contracts[0].Details.SupersedesContractID != "contract-alpha-core-old" {
 		t.Fatalf("contract supersession = %#v", contracts[0].Details)
+	}
+}
+
+func TestAcceptanceBriefClarifiesRuntimeAndHardWait(t *testing.T) {
+	daemon, attempt := acceptanceFixture(t)
+	attempt.Plan.Contracts = []coordinator.PlannedContract{{
+		Resource: "alpha-public-api", ProducerNode: "alpha-core", ConsumerNode: "alpha-core", HardWait: true,
+	}}
+	contracts := []coordination.Contract{{
+		ID: "contract-alpha", Status: coordination.StatusFulfilled, Revision: 1,
+		Details: coordination.ContractDetails{Name: "alpha-public-api"}, HardWait: false,
+	}}
+	data, err := daemon.buildAcceptanceBriefData(attempt, contracts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var brief buildAcceptanceBrief
+	if err := json.Unmarshal(data, &brief); err != nil {
+		t.Fatal(err)
+	}
+	if len(brief.Contracts) != 1 || !brief.Contracts[0].HardWaitDeclared || brief.Contracts[0].HardWaitCurrent {
+		t.Fatalf("contract brief = %#v", brief.Contracts)
+	}
+	if !strings.Contains(brief.TargetLanguageNote, "runtime may differ") || !strings.Contains(brief.HardWaitNote, "cleared") {
+		t.Fatalf("brief notes = %#v", brief)
+	}
+	if len(brief.Requirements) == 0 || len(brief.OutputSchema) == 0 {
+		t.Fatalf("brief content = %#v", brief)
+	}
+}
+
+func TestAcceptanceFailureCodes(t *testing.T) {
+	if acceptanceFailureCode(fmt.Errorf("resolution artifact was not written within 5m0s")) != "acceptance.timeout" {
+		t.Fatal("timeout code not classified")
+	}
+	if acceptanceFailureCode(fmt.Errorf("acceptance review modified the build spec")) != "acceptance.spec_modified" {
+		t.Fatal("spec mutation code not classified")
+	}
+}
+
+func TestAcceptanceSchemaDefinesReworkShapes(t *testing.T) {
+	var schema map[string]interface{}
+	if err := json.Unmarshal(buildAcceptanceSchema("buildspec_1"), &schema); err != nil {
+		t.Fatal(err)
+	}
+	reopen := schema["reopen_nodes"].([]interface{})[0].(map[string]interface{})
+	if reopen["node_id"] == nil || reopen["instruction"] == nil || reopen["target_files"] == nil {
+		t.Fatalf("reopen schema = %#v", reopen)
+	}
+	addNodes := schema["add_nodes"].([]interface{})[0].(map[string]interface{})
+	if addNodes["origin_node_id"] == nil || addNodes["target_files"] == nil {
+		t.Fatalf("add_nodes schema = %#v", addNodes)
+	}
+	addContracts := schema["add_contracts"].([]interface{})[0].(map[string]interface{})
+	if addContracts["supersedes_contract_id"] == nil || addContracts["resource"] == nil {
+		t.Fatalf("add_contracts schema = %#v", addContracts)
 	}
 }

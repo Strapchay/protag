@@ -67,6 +67,7 @@ type BuildSpecAttempt struct {
 	AcceptanceRounds          int                            `json:"acceptance_rounds,omitempty"`
 	AcceptanceSummary         string                         `json:"acceptance_summary,omitempty"`
 	AcceptanceReviewPath      string                         `json:"acceptance_review_path,omitempty"`
+	AcceptanceFailureCode     string                         `json:"acceptance_failure_code,omitempty"`
 	IntegrationRecoveryRounds int                            `json:"integration_recovery_rounds,omitempty"`
 	RecoveryQueue             []RecoveryRequest              `json:"recovery_queue,omitempty"`
 }

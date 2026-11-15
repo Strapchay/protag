@@ -130,3 +130,10 @@ func TestGenerateArchitectInstructionDefinesReservedIntegrationDirectiveSemantic
 		}
 	}
 }
+
+func TestArchitectPromptRequiresArtifactFirst(t *testing.T) {
+	prompt := GenerateArchitectInstruction("")
+	if !strings.Contains(prompt, "Artifact-first rule") || !strings.Contains(prompt, "Never end that turn without a written spec file") {
+		t.Fatalf("architect prompt missing artifact-first rule")
+	}
+}

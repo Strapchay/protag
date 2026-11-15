@@ -350,9 +350,12 @@ func TestResolutionPromptUsesSealedTemplate(t *testing.T) {
 func TestReviewPromptUsesTemplateAndRejectsSourceWrites(t *testing.T) {
 	prompt := reviewPrompt(BuildReviewRequest{AttemptID: "buildspec_1"}, "/workspace/docs/aion/acceptance/buildspec_1")
 	for _, want := range []string{
-		"/workspace/docs/aion/acceptance/buildspec_1/acceptance_input.json",
+		"/workspace/docs/aion/acceptance/buildspec_1/acceptance_brief.json",
+		"/workspace/docs/aion/acceptance/buildspec_1/acceptance_schema.json",
 		"/workspace/docs/aion/acceptance/buildspec_1/acceptance_template.json",
+		"/workspace/docs/aion/acceptance/buildspec_1/acceptance_output.draft.json",
 		"/workspace/docs/aion/acceptance/buildspec_1/acceptance_output.json",
+		"Do not run find or grep over /",
 		"Do not modify source files",
 		"verdict complete",
 		"verdict retry",
@@ -363,7 +366,7 @@ func TestReviewPromptUsesTemplateAndRejectsSourceWrites(t *testing.T) {
 		}
 	}
 	repair := reviewPrompt(BuildReviewRequest{AttemptID: "buildspec_1", Repair: true, ValidationError: "bad verdict"}, "/workspace/docs/aion/acceptance/buildspec_1")
-	if !strings.Contains(repair, "bad verdict") || !strings.Contains(repair, "acceptance_output.json") {
+	if !strings.Contains(repair, "bad verdict") || !strings.Contains(repair, "acceptance_output.draft.json") {
 		t.Fatalf("repair prompt = %s", repair)
 	}
 }
@@ -381,5 +384,43 @@ func TestReviewPolicyMountHelpers(t *testing.T) {
 	dropped := dropMountTarget(replaced, "/runtime/bin/orchestrator-cli")
 	if len(dropped) != 2 || dropped[1].Target != "/workspace/docs/aion/acceptance/a1" {
 		t.Fatalf("dropMountTarget = %#v", dropped)
+	}
+}
+
+func TestArchitectSpecRetryDetection(t *testing.T) {
+	if !architectSpecRequested("Create and finalize docs/build_spec.md for the project.") {
+		t.Fatal("spec creation request was not detected")
+	}
+	if architectSpecRequested("Explain the current architecture.") {
+		t.Fatal("ordinary chat was classified as a spec request")
+	}
+	root := t.TempDir()
+	if !architectSpecMissing(root) {
+		t.Fatal("missing spec was not detected")
+	}
+	if err := os.MkdirAll(filepath.Join(root, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "docs", "build_spec.md"), []byte("real spec"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if architectSpecMissing(root) {
+		t.Fatal("written spec was reported missing")
+	}
+}
+
+func TestArchitectSpecFallbackWritesRequirements(t *testing.T) {
+	root := t.TempDir()
+	c := NewPiCoordinator(root, PiCoordinatorConfig{})
+	c.lastUserText = "Create and finalize docs/build_spec.md for the workflow demo."
+	if err := c.writeArchitectSpecFallback(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(root, "docs", "build_spec.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "Architect artifact fallback") || !strings.Contains(string(data), "workflow demo") {
+		t.Fatalf("fallback spec = %s", data)
 	}
 }

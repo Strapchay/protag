@@ -49,22 +49,23 @@ type AgentResumePreflight struct {
 }
 
 type ResumePreflight struct {
-	AttemptID         string                 `json:"attempt_id,omitempty"`
-	Status            string                 `json:"status,omitempty"`
-	FailureReason     string                 `json:"failure_reason,omitempty"`
-	AcceptanceStatus  string                 `json:"acceptance_status,omitempty"`
-	AcceptanceSummary string                 `json:"acceptance_summary,omitempty"`
-	CanResume         bool                   `json:"can_resume"`
-	BlockingReasons   []string               `json:"blocking_reasons,omitempty"`
-	Warnings          []string               `json:"warnings,omitempty"`
-	NodeCounts        map[string]int         `json:"node_counts,omitempty"`
-	ProblemNodes      []string               `json:"problem_nodes,omitempty"`
-	Agents            []AgentResumePreflight `json:"agents,omitempty"`
-	OpenRecoveries    []RecoveryRecord       `json:"open_recoveries,omitempty"`
-	Integration       *IntegrationRunStatus  `json:"integration,omitempty"`
-	ResumePlan        []string               `json:"resume_plan,omitempty"`
-	ConfirmationHint  string                 `json:"confirmation_hint,omitempty"`
-	GeneratedAt       time.Time              `json:"generated_at"`
+	AttemptID             string                 `json:"attempt_id,omitempty"`
+	Status                string                 `json:"status,omitempty"`
+	FailureReason         string                 `json:"failure_reason,omitempty"`
+	AcceptanceStatus      string                 `json:"acceptance_status,omitempty"`
+	AcceptanceSummary     string                 `json:"acceptance_summary,omitempty"`
+	AcceptanceFailureCode string                 `json:"acceptance_failure_code,omitempty"`
+	CanResume             bool                   `json:"can_resume"`
+	BlockingReasons       []string               `json:"blocking_reasons,omitempty"`
+	Warnings              []string               `json:"warnings,omitempty"`
+	NodeCounts            map[string]int         `json:"node_counts,omitempty"`
+	ProblemNodes          []string               `json:"problem_nodes,omitempty"`
+	Agents                []AgentResumePreflight `json:"agents,omitempty"`
+	OpenRecoveries        []RecoveryRecord       `json:"open_recoveries,omitempty"`
+	Integration           *IntegrationRunStatus  `json:"integration,omitempty"`
+	ResumePlan            []string               `json:"resume_plan,omitempty"`
+	ConfirmationHint      string                 `json:"confirmation_hint,omitempty"`
+	GeneratedAt           time.Time              `json:"generated_at"`
 }
 
 func (d *Daemon) observeAgentRecovery(agentID, domainID, state, reason string) {
@@ -437,6 +438,7 @@ func (d *Daemon) buildResumePreflight() ResumePreflight {
 		preflight.FailureReason = attempt.FailureReason
 		preflight.AcceptanceStatus = attempt.AcceptanceStatus
 		preflight.AcceptanceSummary = attempt.AcceptanceSummary
+		preflight.AcceptanceFailureCode = attempt.AcceptanceFailureCode
 	}
 	if d.dagManager != nil {
 		for _, node := range d.dagManager.Snapshot().Nodes {

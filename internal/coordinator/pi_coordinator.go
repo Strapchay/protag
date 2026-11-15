@@ -22,31 +22,35 @@ import (
 // PiCoordinator is an implementation of Coordinator that uses a persistent
 // Pi Agent to engage in refinement chat and produce a plan.
 type PiCoordinator struct {
-	agent              *supervisor.AgentSupervisor
-	plannerAgent       *supervisor.AgentSupervisor
-	config             PiCoordinatorConfig
-	projectRoot        string
-	sessionRT          *session.Runtime
-	statusFn           func(text, level string)
-	broadcastFn        func(msg hub.Message)
-	traceFn            func(text string)
-	plannerMu          sync.Mutex
-	plannerCapture     *planCapture
-	plannerAttemptID   string
-	plannerSessionDir  string
-	plannerGatewayMu   sync.Mutex
-	plannerGatewayCh   chan struct{}
-	plannerActivityCh  chan string
-	plannerGatewayOn   bool
-	plannerTurnErrors  chan error
-	resolutionMu       sync.Mutex
-	resolutionProgress func()
-	resolutionEnvFn    func() ([]string, error)
-	reviewMu           sync.Mutex
-	reviewEnvFn        func() ([]string, error)
-	architectMu        sync.Mutex
-	architectEnvFn     func() ([]string, error)
-	lastUserText       string
+	agent                        *supervisor.AgentSupervisor
+	plannerAgent                 *supervisor.AgentSupervisor
+	config                       PiCoordinatorConfig
+	projectRoot                  string
+	sessionRT                    *session.Runtime
+	statusFn                     func(text, level string)
+	broadcastFn                  func(msg hub.Message)
+	traceFn                      func(text string)
+	plannerMu                    sync.Mutex
+	plannerCapture               *planCapture
+	plannerAttemptID             string
+	plannerSessionDir            string
+	plannerGatewayMu             sync.Mutex
+	plannerGatewayCh             chan struct{}
+	plannerActivityCh            chan string
+	plannerGatewayOn             bool
+	plannerTurnErrors            chan error
+	resolutionMu                 sync.Mutex
+	resolutionProgress           func()
+	resolutionEnvFn              func() ([]string, error)
+	reviewMu                     sync.Mutex
+	reviewEnvFn                  func() ([]string, error)
+	architectMu                  sync.Mutex
+	architectEnvFn               func() ([]string, error)
+	architectSpecMu              sync.Mutex
+	architectSpecRetry           int
+	architectSpecFailed          bool
+	architectSpecFallbackWritten bool
+	lastUserText                 string
 }
 
 // PiCoordinatorConfig configures the Pi-backed coordinator.
@@ -1147,6 +1151,11 @@ func (c *PiCoordinator) Refine(ctx context.Context, text string) error {
 		return fmt.Errorf("pi_coordinator: architect agent not started")
 	}
 	c.lastUserText = text
+	c.architectSpecMu.Lock()
+	c.architectSpecRetry = 0
+	c.architectSpecFailed = false
+	c.architectSpecFallbackWritten = false
+	c.architectSpecMu.Unlock()
 	if c.sessionRT != nil {
 		c.updateMetadataFromUser(text)
 		if _, _, err := c.sessionRT.BeginRequest(text, "", session.SideEffectNone); err != nil {
@@ -1407,6 +1416,7 @@ func (c *PiCoordinator) handleArchitectLifecycle(event supervisor.AgentLifecycle
 		c.sessionRT.RecordToolStart(event.ToolName, event.ToolInput, event.ToolSummary, level)
 	case "turn_end":
 		c.sessionRT.CompleteActiveRequest()
+		go c.maybeRetryMissingArchitectSpec()
 	case "tool_error":
 		c.sessionRT.FailActiveRequest(session.FailureToolFailure, event.Error, true)
 	case "agent_error":
@@ -1532,6 +1542,112 @@ func (c *PiCoordinator) updateMetadataFromUser(text string) {
 			metadata["spec_status"] = architectSpecClarifying
 		}
 	})
+}
+
+func (c *PiCoordinator) maybeRetryMissingArchitectSpec() {
+	if c == nil || c.agent == nil || c.sessionRT == nil {
+		return
+	}
+	c.architectSpecMu.Lock()
+	if c.architectSpecRetry > 0 || c.architectSpecFailed {
+		c.architectSpecMu.Unlock()
+		return
+	}
+	c.architectSpecMu.Unlock()
+	if !architectSpecRequested(c.lastUserText) || !architectSpecMissing(c.projectRoot) {
+		return
+	}
+	c.architectSpecMu.Lock()
+	c.architectSpecRetry++
+	c.architectSpecMu.Unlock()
+	if c.traceFn != nil {
+		c.traceFn("architect turn ended without docs/build_spec.md; issuing one bounded write-only retry")
+	}
+	if c.statusFn != nil {
+		c.statusFn("Architect did not write docs/build_spec.md; issuing one bounded write-only retry.", "warn")
+	}
+	prompt := "No docs/build_spec.md exists. Write the finalized build spec to docs/build_spec.md now using the write tool. Do not explain, ask questions, or restart discovery. Then stop."
+	if err := c.agent.DeliverTurn(prompt); err != nil {
+		c.architectSpecMu.Lock()
+		c.architectSpecFailed = true
+		c.architectSpecMu.Unlock()
+		if c.statusFn != nil {
+			c.statusFn("Architect spec retry could not be dispatched: "+err.Error(), "error")
+		}
+		return
+	}
+	go c.watchArchitectSpecAfterRetry()
+}
+
+func (c *PiCoordinator) watchArchitectSpecAfterRetry() {
+	deadline := time.Now().Add(2 * time.Minute)
+	for time.Now().Before(deadline) {
+		if !architectSpecMissing(c.projectRoot) {
+			return
+		}
+		time.Sleep(5 * time.Second)
+	}
+	c.architectSpecMu.Lock()
+	if c.architectSpecFallbackWritten {
+		c.architectSpecMu.Unlock()
+		return
+	}
+	c.architectSpecFallbackWritten = true
+	c.architectSpecMu.Unlock()
+	if err := c.writeArchitectSpecFallback(); err != nil {
+		c.architectSpecMu.Lock()
+		c.architectSpecFailed = true
+		c.architectSpecMu.Unlock()
+		if c.statusFn != nil {
+			c.statusFn("Architect spec fallback failed: "+err.Error(), "error")
+		}
+		return
+	}
+	if c.statusFn != nil {
+		c.statusFn("Architect did not produce a spec; wrote a requirements fallback to docs/build_spec.md.", "warn")
+	}
+}
+
+func (c *PiCoordinator) writeArchitectSpecFallback() error {
+	text := strings.TrimSpace(c.lastUserText)
+	if text == "" || !architectSpecRequested(text) {
+		return fmt.Errorf("no build-spec request to fall back to")
+	}
+	path := filepath.Join(c.projectRoot, "docs", "build_spec.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	content := "# Build Spec (Architect artifact fallback)\n\n" +
+		"The Architect did not write a finalized spec. The original user requirements are preserved below.\n\n" + text + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return err
+	}
+	if c.sessionRT != nil {
+		c.sessionRT.UpdateMetadata(func(metadata map[string]interface{}) {
+			metadata["spec_status"] = architectSpecReadyForBuild
+			metadata["last_architect_summary"] = "Architect artifact fallback written; review the requirements file before building."
+		})
+	}
+	if c.traceFn != nil {
+		c.traceFn("architect spec fallback written from the user request")
+	}
+	return nil
+}
+
+func architectSpecRequested(text string) bool {
+	lower := strings.ToLower(text)
+	if !strings.Contains(lower, "build_spec") && !strings.Contains(lower, "build spec") {
+		return false
+	}
+	return strings.Contains(lower, "write") || strings.Contains(lower, "create") || strings.Contains(lower, "finalize") || strings.Contains(lower, "draft")
+}
+
+func architectSpecMissing(projectRoot string) bool {
+	data, err := os.ReadFile(filepath.Join(projectRoot, "docs", "build_spec.md"))
+	if err != nil {
+		return true
+	}
+	return strings.TrimSpace(string(data)) == ""
 }
 
 func (c *PiCoordinator) updateMetadataFromArchitect(text string) {

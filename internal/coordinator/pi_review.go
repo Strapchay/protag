@@ -38,8 +38,10 @@ func (c *PiCoordinator) ReviewBuild(ctx context.Context, req BuildReviewRequest)
 		return nil, fmt.Errorf("pi_coordinator: create acceptance session: %w", err)
 	}
 	outputPath := filepath.Join(artifactDir, "acceptance_output.json")
-	if err := os.Remove(outputPath); err != nil && !os.IsNotExist(err) {
-		return nil, err
+	for _, stale := range []string{outputPath, filepath.Join(artifactDir, "acceptance_output.draft.json")} {
+		if err := os.Remove(stale); err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
 	}
 	env, err := c.reviewProcessEnv()
 	if err != nil {
@@ -93,16 +95,18 @@ func (c *PiCoordinator) ReviewBuild(ctx context.Context, req BuildReviewRequest)
 
 func reviewPrompt(req BuildReviewRequest, sandboxDir string) string {
 	sandboxDir = strings.TrimRight(strings.TrimSpace(sandboxDir), "/")
-	input := sandboxDir + "/acceptance_input.json"
+	brief := sandboxDir + "/acceptance_brief.json"
+	schema := sandboxDir + "/acceptance_schema.json"
 	template := sandboxDir + "/acceptance_template.json"
+	draft := sandboxDir + "/acceptance_output.draft.json"
 	output := sandboxDir + "/acceptance_output.json"
 	if req.Repair {
 		return fmt.Sprintf(`The prior acceptance report failed deterministic validation:
 %s
 
-Read %s and %s. Inspect the read-only project under /workspace. Overwrite %s with one valid JSON object using the template. Keep the exact type and attempt_id. Report only real missing or unverified requirements; do not invent work when the implementation is complete. Do not modify source files. Do not use orchestrator-cli. Do not answer in chat.`, strings.TrimSpace(req.ValidationError), input, template, output)
+Read %s, %s, and %s. Copy the template to %s first, then overwrite %s with the corrected report. The schema shows the exact object shape for reopen_nodes, add_nodes, add_edges, and add_contracts; do not infer structs. Keep the exact type and attempt_id. Do not search schemas or run find/grep over /. Do not modify source files. Do not answer in chat.`, strings.TrimSpace(req.ValidationError), brief, schema, template, draft, output)
 	}
-	return fmt.Sprintf(`You are the Aion Coordinator performing final acceptance review. Read %s and %s. Inspect the read-only implementation under /workspace and compare it with the build spec, accepted plan, contract evidence, DAG completion state, and integration results in the input. Write one acceptance report to %s using the template. Use verdict complete only when every requirement is implemented and evidenced. Use verdict retry only for unmet original requirements and populate reopen_nodes; retry cannot add successors or contracts. Use verdict successor only for new or expanded work on a completed implementation and populate add_nodes with origin_node_id; successor cannot reopen nodes. Use add_contracts with a new resource and supersedes_contract_id when a public contract surface changes; never reopen a fulfilled contract. Use verdict attention when the evidence is insufficient or the state is inconsistent. Use only existing domain ownership. Do not modify source files. Do not use orchestrator-cli. Do not answer in chat.`, input, template, output)
+	return fmt.Sprintf(`You are the Aion Coordinator performing final acceptance review. Read %s first; it contains the authoritative requirement list, contract declaration/current hard-wait values, integration status, file inventory, and output schema. Read %s for the exact object shape of reopen_nodes, add_nodes, add_edges, and add_contracts; do not infer structs. Do not run find or grep over / and do not search for schemas. Copy %s to %s first, then write the final report to %s. Write the final report from the brief before any optional targeted source inspection. Inspect only /workspace or files named in the brief. Use verdict complete only when every requirement is implemented and evidenced. Use verdict retry only for unmet original requirements and populate reopen_nodes; retry cannot add successors or contracts. Use verdict successor only for new or expanded work on a completed implementation and populate add_nodes with origin_node_id; successor cannot reopen nodes. Use add_contracts with a new resource and supersedes_contract_id when a public contract surface changes; never reopen a fulfilled contract. Use verdict attention when evidence is insufficient or inconsistent; list the missing evidence instead of exploring indefinitely. Do not modify source files. Do not use orchestrator-cli. Do not answer in chat.`, brief, schema, template, draft, output)
 }
 
 func replaceMount(mounts []isolation.Mount, oldTarget, source, target string) []isolation.Mount {
@@ -122,6 +126,17 @@ func replaceMountSource(mounts []isolation.Mount, target, source string) []isola
 		if out[i].Target == target {
 			out[i].Source = source
 		}
+	}
+	return out
+}
+
+func dropMountPrefix(mounts []isolation.Mount, prefix string) []isolation.Mount {
+	out := make([]isolation.Mount, 0, len(mounts))
+	for _, mount := range mounts {
+		if strings.HasPrefix(mount.Target, prefix) {
+			continue
+		}
+		out = append(out, mount)
 	}
 	return out
 }

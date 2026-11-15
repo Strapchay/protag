@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,6 +30,29 @@ type buildAcceptanceInput struct {
 	Contracts       []coordination.Contract   `json:"contracts"`
 	Integration     *IntegrationRunStatus     `json:"integration,omitempty"`
 	ValidationRules []string                  `json:"validation_rules"`
+}
+
+type buildAcceptanceBrief struct {
+	Type               string                    `json:"type"`
+	AttemptID          string                    `json:"attempt_id"`
+	TargetLanguageNote string                    `json:"target_language_note"`
+	HardWaitNote       string                    `json:"hard_wait_note"`
+	Requirements       []string                  `json:"requirements"`
+	Contracts          []acceptanceContractBrief `json:"contracts"`
+	IntegrationStatus  string                    `json:"integration_status,omitempty"`
+	IntegrationFailure string                    `json:"integration_failure_class,omitempty"`
+	Files              []string                  `json:"files,omitempty"`
+	OutputSchema       json.RawMessage           `json:"output_schema"`
+	Instructions       []string                  `json:"instructions"`
+}
+
+type acceptanceContractBrief struct {
+	Resource             string `json:"resource"`
+	Status               string `json:"status"`
+	Revision             int64  `json:"revision"`
+	HardWaitDeclared     bool   `json:"hard_wait_declared"`
+	HardWaitCurrent      bool   `json:"hard_wait_current"`
+	SupersedesContractID string `json:"supersedes_contract_id,omitempty"`
 }
 
 type buildAcceptanceRequirement struct {
@@ -69,16 +93,47 @@ type acceptancePlanPatch struct {
 
 func buildAcceptanceTemplate(attemptID string) []byte {
 	template := buildAcceptanceCandidate{
-		Type:      "aion_build_acceptance",
-		AttemptID: attemptID,
-		Verdict:   "complete",
-		Summary:   "Replace with the acceptance conclusion.",
+		Type:           "aion_build_acceptance",
+		AttemptID:      attemptID,
+		Verdict:        "complete",
+		ContractImpact: "none",
+		Summary:        "Replace with the acceptance conclusion.",
 		Requirements: []buildAcceptanceRequirement{{
 			ID: "R1", Status: "met", Evidence: "Replace with concrete source or integration evidence.", NodeIDs: []string{"replace-node-id"},
 		}},
 		Risks: []string{"Replace with a residual risk or remove this entry."},
 	}
 	data, _ := json.MarshalIndent(template, "", "  ")
+	return data
+}
+
+func buildAcceptanceSchema(attemptID string) []byte {
+	schema := map[string]interface{}{
+		"type":            "aion_build_acceptance",
+		"attempt_id":      attemptID,
+		"description":     "Copy acceptance_template.json, then replace placeholders. The arrays below show the exact object shape; empty arrays are valid.",
+		"verdict":         []string{"complete", "retry", "successor", "attention"},
+		"contract_impact": []string{"none", "implementation", "surface"},
+		"summary":         "non-empty acceptance conclusion",
+		"requirements": []map[string]interface{}{{
+			"id": "R1", "status": []string{"met", "missing", "unclear"}, "evidence": "concrete source or integration evidence", "node_ids": []string{"node-id"},
+		}},
+		"reopen_nodes": []map[string]interface{}{{
+			"node_id": "existing-plan-node-id", "instruction": "concrete retry instruction", "target_files": []string{"existing/owned/path.py"},
+		}},
+		"add_nodes": []map[string]interface{}{{
+			"id": "new-successor-node-id", "domain_id": "existing-domain-id", "task_spec": "successor task", "target_files": []string{"existing/owned/path.py"}, "priority": 1,
+			"origin_node_id": "completed-origin-node-id", "supersedes_contract_id": "optional-existing-contract-id",
+		}},
+		"add_edges": []map[string]string{{"from_node": "origin-node-id", "to_node": "successor-node-id"}},
+		"add_contracts": []map[string]interface{}{{
+			"resource": "new-public-resource-v2", "producer_node": "producer-node-id", "consumer_node": "consumer-node-id",
+			"kind": "interface", "language": "python", "public_entrypoint": "import path", "acceptance": []string{"machine-checkable condition"},
+			"hard_wait": true, "handshake_required": false, "supersedes_contract_id": "fulfilled-contract-id",
+		}},
+		"risks": []string{"residual risk"},
+	}
+	data, _ := json.MarshalIndent(schema, "", "  ")
 	return data
 }
 
@@ -157,9 +212,20 @@ func (d *Daemon) reviewBuildAcceptance(attempt *BuildSpecAttempt) (bool, error) 
 	if err := os.WriteFile(filepath.Join(artifactDir, "acceptance_template.json"), buildAcceptanceTemplate(attempt.AttemptID), 0o644); err != nil {
 		return d.acceptanceAttention(attempt, err)
 	}
+	if schemaData := buildAcceptanceSchema(attempt.AttemptID); len(schemaData) > 0 {
+		if err := os.WriteFile(filepath.Join(artifactDir, "acceptance_schema.json"), schemaData, 0o644); err != nil {
+			return d.acceptanceAttention(attempt, err)
+		}
+	}
+	if briefData, briefErr := d.buildAcceptanceBriefData(attempt, contracts); briefErr == nil {
+		if err := os.WriteFile(filepath.Join(artifactDir, "acceptance_brief.json"), briefData, 0o644); err != nil {
+			return d.acceptanceAttention(attempt, err)
+		}
+	}
 
 	attempt.AcceptanceStatus = "running"
 	attempt.AcceptanceSummary = ""
+	attempt.AcceptanceFailureCode = ""
 	d.saveBuildSpecAttempt(attempt)
 	if d.server != nil {
 		d.server.BroadcastAgentStatus("coordinator", "Build acceptance review started against the assembled implementation.", "info")
@@ -211,6 +277,7 @@ func (d *Daemon) reviewBuildAcceptance(attempt *BuildSpecAttempt) (bool, error) 
 		return d.acceptanceAttention(attempt, fmt.Errorf("%s", patch.candidate.Summary))
 	case "complete":
 		attempt.AcceptanceStatus = "passed"
+		attempt.AcceptanceFailureCode = ""
 		d.saveBuildSpecAttempt(attempt)
 		_ = appendBuildSpecTrace(d.runState.Root, "acceptance review passed: "+patch.candidate.Summary)
 		if d.server != nil {
@@ -242,6 +309,102 @@ func (d *Daemon) reviewBuildAcceptance(attempt *BuildSpecAttempt) (bool, error) 
 	default:
 		return d.acceptanceAttention(attempt, fmt.Errorf("unknown acceptance verdict %q", patch.candidate.Verdict))
 	}
+}
+
+func acceptanceFailureCode(cause error) string {
+	if cause == nil {
+		return "acceptance.error"
+	}
+	text := strings.ToLower(cause.Error())
+	switch {
+	case strings.Contains(text, "artifact was not written"):
+		return "acceptance.timeout"
+	case strings.Contains(text, "invalid") || strings.Contains(text, "repair"):
+		return "acceptance.invalid_report"
+	case strings.Contains(text, "integration is disabled"):
+		return "acceptance.integration_disabled"
+	case strings.Contains(text, "integration failed"):
+		return "acceptance.integration_failed"
+	case strings.Contains(text, "modified the build spec"):
+		return "acceptance.spec_modified"
+	default:
+		return "acceptance.error"
+	}
+}
+
+func (d *Daemon) buildAcceptanceBriefData(attempt *BuildSpecAttempt, contracts []coordination.Contract) ([]byte, error) {
+	if attempt == nil || attempt.Plan == nil {
+		return nil, fmt.Errorf("accepted build plan is unavailable")
+	}
+	brief := buildAcceptanceBrief{
+		Type: "aion_build_acceptance_brief", AttemptID: attempt.AttemptID,
+		TargetLanguageNote: "The execution runtime may differ from the target language version. Integration evidence is authoritative for assembled behavior; do not fail a requirement solely because the host python3 version differs.",
+		HardWaitNote:       "hard_wait is a plan declaration. Current contract hard_wait is cleared when a contract reaches Fulfilled; use hard_wait_declared to judge the plan.",
+		Instructions: []string{
+			"Read this brief before inspecting source.",
+			"Do not run find or grep over / and do not search for schemas.",
+			"Copy acceptance_template.json to acceptance_output.draft.json first.",
+			"Write acceptance_output.json before optional targeted source inspection.",
+			"If evidence is missing, use verdict attention with the missing evidence; do not explore indefinitely.",
+		},
+	}
+	for _, contract := range attempt.Plan.Contracts {
+		brief.Requirements = append(brief.Requirements, contract.Resource+": "+strings.Join(contract.Acceptance, "; "))
+	}
+	for _, node := range attempt.Plan.Nodes {
+		brief.Requirements = append(brief.Requirements, "Node "+node.ID+": "+truncateSingleLine(node.TaskSpec, 500))
+	}
+	planByResource := make(map[string]coordinator.PlannedContract, len(attempt.Plan.Contracts))
+	for _, contract := range attempt.Plan.Contracts {
+		planByResource[strings.ToLower(strings.TrimSpace(contract.Resource))] = contract
+	}
+	for _, contract := range contracts {
+		resource := strings.TrimSpace(contract.Details.Name)
+		planned := planByResource[strings.ToLower(resource)]
+		brief.Contracts = append(brief.Contracts, acceptanceContractBrief{
+			Resource: resource, Status: string(contract.Status), Revision: contract.Revision,
+			HardWaitDeclared: planned.HardWait, HardWaitCurrent: contract.HardWait,
+			SupersedesContractID: contract.Details.SupersedesContractID,
+		})
+	}
+	if d.integrationRunner != nil {
+		status := d.integrationRunner.Status()
+		brief.IntegrationStatus = string(status.Status)
+		brief.IntegrationFailure = status.FailureClass
+	}
+	brief.Files = d.acceptanceFileInventory(attempt, 200)
+	brief.OutputSchema = buildAcceptanceSchema(attempt.AttemptID)
+	return json.MarshalIndent(brief, "", "  ")
+}
+
+func (d *Daemon) acceptanceFileInventory(attempt *BuildSpecAttempt, limit int) []string {
+	if d == nil || attempt == nil || attempt.Plan == nil {
+		return nil
+	}
+	var files []string
+	for _, domain := range attempt.Plan.Domains {
+		for _, assigned := range domain.AssignedPaths {
+			root := filepath.Join(d.projectRoot, filepath.FromSlash(assigned))
+			_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+				if err != nil || len(files) >= limit {
+					return nil
+				}
+				if entry.IsDir() {
+					if entry.Name() == "__pycache__" || entry.Name() == ".aion" {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				relative, relErr := filepath.Rel(d.projectRoot, path)
+				if relErr == nil && !strings.HasPrefix(relative, "..") {
+					files = append(files, filepath.ToSlash(relative))
+				}
+				return nil
+			})
+		}
+	}
+	sort.Strings(files)
+	return files
 }
 
 func (d *Daemon) failedOrIncompleteNodes() []string {
@@ -282,6 +445,7 @@ func (d *Daemon) saveBuildSpecAttempt(attempt *BuildSpecAttempt) {
 
 func (d *Daemon) acceptanceAttention(attempt *BuildSpecAttempt, cause error) (bool, error) {
 	attempt.AcceptanceStatus = "attention"
+	attempt.AcceptanceFailureCode = acceptanceFailureCode(cause)
 	attempt.Status = BuildSpecAttemptPaused
 	attempt.FailureReason = "acceptance review requires attention: " + cause.Error()
 	d.saveBuildSpecAttempt(attempt)

@@ -146,7 +146,7 @@ func TestConfigDefaults(t *testing.T) {
 	if config.Coordination.LeaseTimeoutSec != 180 || config.Coordination.ArtifactTimeoutSec != 180 || config.Coordination.DeadlockTimeoutSec != 300 {
 		t.Fatalf("unexpected coordination timeout defaults: %#v", config.Coordination)
 	}
-	if config.Coordination.MaxSuccessorDepth != 2 || config.Coordination.MaxIntegrationRecoveries != 2 {
+	if config.Coordination.MaxSuccessorDepth != 2 || config.Coordination.MaxIntegrationRecoveries != 2 || config.Coordination.AcceptanceReviewTimeoutSec != 600 {
 		t.Fatalf("unexpected recovery limits: %#v", config.Coordination)
 	}
 	if config.Coordination.AllowAcceptanceWithoutIntegration {

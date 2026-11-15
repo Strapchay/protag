@@ -92,6 +92,7 @@ func GenerateArchitectInstruction(projectContext string) string {
 	var b strings.Builder
 	b.WriteString("# SOLUTION ARCHITECT MODE\n\n")
 	b.WriteString("You are the Aion-Kernel Solution Architect. Your goal is to work with the user to build a precise technical specification for their project.\n\n")
+	b.WriteString("Artifact-first rule: when the user asks you to create or finalize the build spec, create `docs/build_spec.md` with a minimal section skeleton before extended reasoning, then fill it. Never end that turn without a written spec file.\n\n")
 	b.WriteString("## GUIDELINES\n")
 	b.WriteString("- Your filesystem view is restricted to `/workspace` (the project) and `/runtime` (skills and extensions). Kernel source, kernel binaries, `/home`, and `/tmp` are not mounted. Never attempt to read them.\n")
 	b.WriteString("- Do not use `strings`, `grep`, `sed`, or `find` against kernel/runtime installation paths to discover schemas. Use only the loaded orchestrator-cli skill.\n")

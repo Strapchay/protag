@@ -44,6 +44,7 @@ type CoordinationConfig struct {
 	DeadlockTimeoutSec                int                  `yaml:"deadlock_timeout_sec"`
 	MaxSuccessorDepth                 int                  `yaml:"max_successor_depth"`
 	MaxIntegrationRecoveries          int                  `yaml:"max_integration_recoveries"`
+	AcceptanceReviewTimeoutSec        int                  `yaml:"acceptance_review_timeout_sec"`
 	AllowAcceptanceWithoutIntegration bool                 `yaml:"allow_acceptance_without_integration"`
 	Recovery                          RecoveryPolicyConfig `yaml:"recovery"`
 }
@@ -478,6 +479,9 @@ func applyDefaults(c *Config) {
 	if c.Coordination.MaxIntegrationRecoveries == 0 {
 		c.Coordination.MaxIntegrationRecoveries = 2
 	}
+	if c.Coordination.AcceptanceReviewTimeoutSec == 0 {
+		c.Coordination.AcceptanceReviewTimeoutSec = 600
+	}
 	applyRecoveryPolicyDefaults(&c.Coordination.Recovery)
 	if strings.TrimSpace(c.Isolation.Backend) == "" {
 		c.Isolation.Backend = "bubblewrap"
@@ -613,6 +617,9 @@ func validateConfig(c *Config) error {
 	}
 	if c.Coordination.MaxIntegrationRecoveries < 1 || c.Coordination.MaxIntegrationRecoveries > 5 {
 		return fmt.Errorf("coordination.max_integration_recoveries must be between 1 and 5")
+	}
+	if c.Coordination.AcceptanceReviewTimeoutSec < 120 || c.Coordination.AcceptanceReviewTimeoutSec > 1800 {
+		return fmt.Errorf("coordination.acceptance_review_timeout_sec must be between 120 and 1800")
 	}
 	if err := validateRecoveryPolicy(c.Coordination.Recovery); err != nil {
 		return err

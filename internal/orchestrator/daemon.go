@@ -1085,7 +1085,7 @@ func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunSta
 		PlannerArtifactTimeout:     time.Duration(config.Health.CoordinatorPlannerArtifactTimeoutSec) * time.Second,
 		PlannerTurnSettleTimeout:   time.Duration(config.Health.CoordinatorPlannerTurnSettleTimeoutSec) * time.Second,
 		ResolutionArtifactTimeout:  time.Duration(config.Coordination.ArtifactTimeoutSec) * time.Second,
-		ReviewArtifactTimeout:      time.Duration(config.Health.CoordinatorPlannerArtifactTimeoutSec) * time.Second,
+		ReviewArtifactTimeout:      time.Duration(config.Coordination.AcceptanceReviewTimeoutSec) * time.Second,
 	}
 	if config.GatewayEnabled() {
 		engine, err := newDomainIsolationEngine(config)
