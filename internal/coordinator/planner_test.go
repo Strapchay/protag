@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -249,5 +250,24 @@ func TestGenerateCoordinatorInstruction(t *testing.T) {
 	prompt := GenerateCoordinatorInstruction("workspace context")
 	if prompt == "" {
 		t.Fatal("expected prompt content")
+	}
+}
+
+func TestPlannedContractParsesStructuredHandshakeRequirement(t *testing.T) {
+	raw := []byte(`{"resource":"ledger-report","producer_node":"ledger-core","consumer_node":"report-core","kind":"interface","public_entrypoint":"ledger.snapshot","acceptance":["report reads snapshot"],"handshake_required":true}`)
+	var contract PlannedContract
+	if err := json.Unmarshal(raw, &contract); err != nil {
+		t.Fatalf("decode planned contract: %v", err)
+	}
+	if !contract.HandshakeRequired {
+		t.Fatal("handshake_required was not parsed")
+	}
+	without := []byte(`{"resource":"plain","producer_node":"a","consumer_node":"b","kind":"interface","public_entrypoint":"pkg.Plain","acceptance":["ok"]}`)
+	var plain PlannedContract
+	if err := json.Unmarshal(without, &plain); err != nil {
+		t.Fatalf("decode planned contract without handshake: %v", err)
+	}
+	if plain.HandshakeRequired {
+		t.Fatal("missing handshake_required defaulted to true")
 	}
 }

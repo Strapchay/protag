@@ -178,12 +178,6 @@ func TestMessageStatusWaitRejectsExcessiveTimeout(t *testing.T) {
 }
 
 func TestContractHandshakeHelpers(t *testing.T) {
-	if !nodeRequiresPeerHandshake("Send CONSUMER PLAN with --expects-ack before validation") {
-		t.Fatal("handshake task was not detected")
-	}
-	if nodeRequiresPeerHandshake("Implement the ledger package") {
-		t.Fatal("plain task was misclassified")
-	}
 	contract := &coordination.Contract{
 		ConsumerAgentID: "agent-report",
 		ProducerAgentID: "agent-ledger",

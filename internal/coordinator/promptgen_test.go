@@ -91,6 +91,8 @@ func TestGenerateCoordinatorPlanningInstructionUsesArtifactOnly(t *testing.T) {
 		"\"producer_node\":\"source-task-id\"",
 		"\"public_entrypoint\":\"exact consumer-visible import, package, route, or resource locator\"",
 		"never make an isolated consumer guess an import path",
+		"\"handshake_required\":false",
+		"Set `handshake_required` to true only when the build spec requires",
 		"Every target under `integration/directives/` must be a concrete file ending in `.json`",
 		"For every cross-domain contract, include at least one concrete `integration/directives/*.json` target in the consumer node",
 		"producer nodes publish the public descriptor and focused unit tests",

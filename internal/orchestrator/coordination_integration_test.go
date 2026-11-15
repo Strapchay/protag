@@ -12,6 +12,7 @@ import (
 	"aion-kernel/internal/dag"
 	"aion-kernel/internal/hub"
 	"aion-kernel/internal/locking"
+	"aion-kernel/internal/messaging"
 )
 
 type coordinationTestAgent struct {
@@ -464,5 +465,73 @@ func TestContractCommandsFailClosedWithoutCoordinationManager(t *testing.T) {
 	response := callCoordinationServer(t, server, "contract-list", capability, map[string]any{})
 	if response.Error != "coordination manager is unavailable" {
 		t.Fatalf("unexpected unavailable-manager response: %+v", response)
+	}
+}
+
+func TestContractValidationHandshakeGateUsesStructuredField(t *testing.T) {
+	producerAgent := "agent-provider"
+	consumerAgent := "agent-consumer"
+	fixture := newCoordinationKernelFixture(t,
+		coordinationNode("provider-node", "provider", producerAgent),
+		coordinationNode("consumer-node", "consumer", consumerAgent),
+	)
+	store, err := messaging.Open(filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	fixture.server.messageStore = store
+
+	create := func(id, resource string, handshake bool) coordination.Contract {
+		contract := coordinationContract(id, producerAgent, "provider-node", consumerAgent, "consumer-node")
+		contract.Details.Name = resource
+		contract.Details.HandshakeRequired = handshake
+		decodeCoordinationResult[coordination.Contract](t, callCoordinationServer(t, fixture.server, "contract-request", fixture.capabilities[consumerAgent], map[string]any{
+			"command_id": "request-" + id,
+			"contract":   contract,
+		}))
+		return decodeCoordinationResult[coordination.Contract](t, callCoordinationServer(t, fixture.server, "contract-publish", fixture.capabilities[producerAgent], map[string]any{
+			"command_id":        "publish-" + id,
+			"contract_id":       id,
+			"expected_revision": 0,
+			"content":           []byte("artifact " + id),
+		}))
+	}
+	validate := func(id string, params map[string]any) Response {
+		params["command_id"] = "validate-" + id
+		params["contract_id"] = id
+		params["revision"] = 1
+		return callCoordinationServer(t, fixture.server, "contract-validate", fixture.capabilities[consumerAgent], params)
+	}
+
+	create("contract-gated", "GatedBoundary", true)
+	if response := validate("contract-gated", map[string]any{}); response.Error == "" || !strings.Contains(response.Error, "--message-id") {
+		t.Fatalf("gated validation without a message was accepted: %+v", response)
+	}
+
+	if err := store.Submit(t.Context(), messaging.Message{
+		ID: "msg-handshake", FromAgent: consumerAgent, ToAgent: producerAgent,
+		Kind: messaging.KindRequest, Payload: "CONSUMER PLAN GatedBoundary",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if response := validate("contract-gated", map[string]any{"message_id": "msg-handshake"}); response.Error == "" {
+		t.Fatal("gated validation accepted an unacknowledged request")
+	}
+	ack := callCoordinationServer(t, fixture.server, "message-ack", fixture.capabilities[producerAgent], map[string]any{
+		"id": "msg-handshake", "state": messaging.ActorAcked, "note": "plan received",
+	})
+	if ack.Error != "" {
+		t.Fatalf("ack handshake request: %s", ack.Error)
+	}
+	fulfilled := decodeCoordinationResult[coordination.Contract](t, validate("contract-gated", map[string]any{"message_id": "msg-handshake"}))
+	if fulfilled.Status != coordination.StatusFulfilled {
+		t.Fatalf("gated contract status = %s", fulfilled.Status)
+	}
+
+	create("contract-ungated", "PlainBoundary", false)
+	ungated := decodeCoordinationResult[coordination.Contract](t, validate("contract-ungated", map[string]any{}))
+	if ungated.Status != coordination.StatusFulfilled {
+		t.Fatalf("ungated contract status = %s", ungated.Status)
 	}
 }

@@ -85,6 +85,7 @@ func TestInitializePlannedContractsMaterializesDurableWork(t *testing.T) {
 		Contracts: []coordinator.PlannedContract{{
 			Resource: "public-api", ProducerNode: "producer-node", ConsumerNode: "consumer-node",
 			Kind: "interface", PublicEntrypoint: "producer.api", Acceptance: []string{"call succeeds"}, HardWait: true,
+			HandshakeRequired: true,
 		}},
 	}
 	if err := daemon.initializePlannedContracts(context.Background(), plan, attempt); err != nil {
@@ -101,7 +102,7 @@ func TestInitializePlannedContractsMaterializesDurableWork(t *testing.T) {
 	if contract.ID != attempt.CreatedContractIDs[0] || contract.ProducerAgentID != "agent-producer" || contract.ConsumerAgentID != "agent-consumer" {
 		t.Fatalf("unexpected contract identity: %+v", contract)
 	}
-	if contract.Details.PublicEntrypoint != "producer.api" || !contract.HardWait {
+	if contract.Details.PublicEntrypoint != "producer.api" || !contract.HardWait || !contract.Details.HandshakeRequired {
 		t.Fatalf("unexpected contract details: %+v", contract)
 	}
 }

@@ -142,7 +142,7 @@ func (s *Server) handleContractValidate(req Request) Response {
 	if err != nil {
 		return Response{ID: req.ID, Error: err.Error()}
 	}
-	if taskSpec := s.contractConsumerTaskSpec(existing.ConsumerNodeID); nodeRequiresPeerHandshake(taskSpec) {
+	if existing.Details.HandshakeRequired {
 		if strings.TrimSpace(params.MessageID) == "" {
 			return Response{ID: req.ID, Error: "contract validation requires an acknowledged peer request; pass --message-id <id>"}
 		}
@@ -163,23 +163,6 @@ func (s *Server) handleContractValidate(req Request) Response {
 	}
 	s.afterCoordinationMutation("contract_fulfilled")
 	return Response{ID: req.ID, Result: contract}
-}
-
-func (s *Server) contractConsumerTaskSpec(nodeID string) string {
-	if s == nil || s.dagManager == nil || strings.TrimSpace(nodeID) == "" {
-		return ""
-	}
-	for _, node := range s.dagManager.Snapshot().Nodes {
-		if node.ID == nodeID {
-			return node.TaskSpec
-		}
-	}
-	return ""
-}
-
-func nodeRequiresPeerHandshake(taskSpec string) bool {
-	lower := strings.ToLower(taskSpec)
-	return strings.Contains(lower, "--expects-ack") || strings.Contains(lower, "consumer plan")
 }
 
 func messageSatisfiesContractHandshake(message messaging.Message, contract *coordination.Contract) bool {

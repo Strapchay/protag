@@ -542,11 +542,12 @@ func (d *Daemon) initializePlannedContracts(ctx context.Context, plan *coordinat
 				ConsumerNodeID:  consumer.ID,
 				HardWait:        planned.HardWait,
 				Details: coordinationruntime.ContractDetails{
-					Name:             strings.TrimSpace(planned.Resource),
-					Kind:             kind,
-					Language:         strings.TrimSpace(planned.Language),
-					PublicEntrypoint: strings.TrimSpace(planned.PublicEntrypoint),
-					Acceptance:       append([]string(nil), planned.Acceptance...),
+					Name:              strings.TrimSpace(planned.Resource),
+					Kind:              kind,
+					Language:          strings.TrimSpace(planned.Language),
+					PublicEntrypoint:  strings.TrimSpace(planned.PublicEntrypoint),
+					Acceptance:        append([]string(nil), planned.Acceptance...),
+					HandshakeRequired: planned.HandshakeRequired,
 				},
 			},
 		})

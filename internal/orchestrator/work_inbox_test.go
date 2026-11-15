@@ -570,22 +570,37 @@ func TestContractEnsureReturnsPlannerCreatedContract(t *testing.T) {
 	}
 }
 
-func TestContractValidationPromptIncludesNodeHandshake(t *testing.T) {
+func TestContractValidationPromptIncludesStructuredHandshake(t *testing.T) {
 	prompt := formatWorkItemPrompt(WorkItem{
-		ID:           "contract:contract-x:contract_validate",
-		Kind:         WorkItemContractValidate,
-		ContractID:   "contract-x",
-		Revision:     1,
-		NodeTaskSpec: "Send CONSUMER PLAN with --expects-ack and confirm message-status before validation.",
+		ID:         "contract:contract-x:contract_validate",
+		Kind:       WorkItemContractValidate,
+		ContractID: "contract-x",
+		Revision:   1,
+		Contract:   &coordination.ContractDetails{Name: "contract-x", HandshakeRequired: true},
 	})
 	for _, want := range []string{
-		"Related node task requirements",
-		"CONSUMER PLAN",
+		"This contract requires a peer handshake",
 		"--expects-ack",
+		"--message-id",
 		"awaiting_ack",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("validation prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestContractValidationPromptOmitsHandshakeWhenNotRequired(t *testing.T) {
+	prompt := formatWorkItemPrompt(WorkItem{
+		ID:         "contract:contract-y:contract_validate",
+		Kind:       WorkItemContractValidate,
+		ContractID: "contract-y",
+		Revision:   1,
+		Contract:   &coordination.ContractDetails{Name: "contract-y"},
+	})
+	for _, forbidden := range []string{"This contract requires a peer handshake", "--expects-ack", "--message-id"} {
+		if strings.Contains(prompt, forbidden) {
+			t.Fatalf("validation prompt should not contain %q:\n%s", forbidden, prompt)
 		}
 	}
 }
