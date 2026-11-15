@@ -197,3 +197,33 @@ func TestLiveRestartDuringAcceptance(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestLiveArchitectBuild(t *testing.T) {
+	if os.Getenv("AION_LIVE_SCENARIO") != "1" {
+		t.Skip("set AION_LIVE_SCENARIO=1 to run live model scenarios")
+	}
+	h := NewProcessHarness(t)
+	t.Cleanup(h.Stop)
+	h.Start()
+	prompt := "Create and finalize docs/build_spec.md for a compact Python 3.10+ project named Architect Live. Use exactly one domain alpha owning alpha/. Implement alpha/__init__.py exporting answer() returning 42, alpha/tests/test_answer.py, and alpha/README.md. All decisions are fixed; do not ask questions. Write the finalized spec file directly."
+	if _, err := h.Request("send-message", map[string]any{"agent_id": "orchestrator", "text": prompt}); err != nil {
+		t.Fatalf("architect prompt: %v", err)
+	}
+	specPath := filepath.Join(h.Root, "docs", "build_spec.md")
+	deadline := time.Now().Add(8 * time.Minute)
+	for time.Now().Before(deadline) {
+		if info, err := os.Stat(specPath); err == nil && info.Size() > 500 {
+			break
+		}
+		time.Sleep(3 * time.Second)
+	}
+	if info, err := os.Stat(specPath); err != nil || info.Size() <= 500 {
+		t.Fatalf("architect or fallback did not write the spec; log=%s", h.LogPath)
+	}
+	if _, err := h.Request("send-message", map[string]any{"agent_id": "orchestrator", "text": "/build-spec"}); err != nil {
+		t.Fatalf("trigger build: %v", err)
+	}
+	waitForBuildStatus(t, h, func(status map[string]any) bool {
+		return status["status"] == "completed"
+	}, 10*time.Minute)
+}
