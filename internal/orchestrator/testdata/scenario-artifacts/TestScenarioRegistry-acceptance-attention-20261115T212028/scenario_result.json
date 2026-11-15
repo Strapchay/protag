@@ -1,0 +1,7 @@
+{
+  "name": "TestScenarioRegistry/acceptance-attention",
+  "status": "failed",
+  "started_at": "2026-11-15T21:20:28.921377347Z",
+  "duration_ms": 23,
+  "artifacts": "testdata/scenario-artifacts/TestScenarioRegistry-acceptance-attention-20261115T212028"
+}

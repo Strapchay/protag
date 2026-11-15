@@ -366,6 +366,78 @@ func scenarioRegistry() []scenarioCase {
 				}
 			},
 		},
+		{
+			Name: "acceptance-attention",
+			Run: func(h *scenarioHarness) {
+				fixture := loadScenarioFixture(h.t, "acceptance-complete")
+				attempt := seedAcceptanceScenario(h, fixture)
+				h.daemon.coordinator = &scenarioCoordinator{reviews: []scenarioReview{{err: fmt.Errorf("resolution artifact was not written within 2m")}}}
+				complete, err := h.daemon.reviewBuildAcceptance(attempt)
+				if err == nil || complete {
+					h.t.Fatalf("attention complete=%v err=%v", complete, err)
+				}
+				loaded, loadErr := loadBuildSpecAttempt(h.daemon.runState.Root)
+				if loadErr != nil {
+					h.t.Fatal(loadErr)
+				}
+				if loaded.AcceptanceStatus != "attention" || loaded.AcceptanceFailureCode != "acceptance.timeout" {
+					h.t.Fatalf("acceptance state = %s/%s", loaded.AcceptanceStatus, loaded.AcceptanceFailureCode)
+				}
+				preflight := h.daemon.buildResumePreflight()
+				if !preflight.CanResume || preflight.AcceptanceStatus != "attention" {
+					h.t.Fatalf("preflight = %#v", preflight)
+				}
+			},
+		},
+		{
+			Name: "acceptance-retry-apply",
+			Run: func(h *scenarioHarness) {
+				fixture := loadScenarioFixture(h.t, "acceptance-complete")
+				attempt := seedAcceptanceScenario(h, fixture)
+				candidate := buildAcceptanceCandidate{
+					Type: "aion_build_acceptance", AttemptID: attempt.AttemptID, Verdict: "retry",
+					ContractImpact: "none", Summary: "The fixture node needs a missing release document.",
+					Requirements: []buildAcceptanceRequirement{{ID: "R2", Status: "missing", Evidence: "fixture release file is absent."}},
+					ReopenNodes:  []buildAcceptanceRework{{NodeID: "alpha-node", Instruction: "Create the missing fixture release document."}},
+				}
+				data, _ := json.Marshal(candidate)
+				patch, err := h.daemon.validateAcceptanceCandidate(attempt, data)
+				if err != nil {
+					h.t.Fatal(err)
+				}
+				if err := h.daemon.applyAcceptancePatch(attempt, patch); err != nil {
+					h.t.Fatal(err)
+				}
+				node, err := h.daemon.dagManager.GetNode("alpha-node")
+				if err != nil || node.Status != dag.StatusPending || !strings.Contains(node.TaskSpec, "ACCEPTANCE RETRY") {
+					h.t.Fatalf("retry node = %#v err=%v", node, err)
+				}
+			},
+		},
+		{
+			Name: "acceptance-repair",
+			Run: func(h *scenarioHarness) {
+				fixture := loadScenarioFixture(h.t, "acceptance-complete")
+				attempt := seedAcceptanceScenario(h, fixture)
+				valid := fixture.Reviews[0]
+				h.daemon.coordinator = &scenarioCoordinator{reviews: []scenarioReview{
+					{output: []byte(`{"type":"aion_build_acceptance"`)},
+					{output: valid},
+				}}
+				complete, err := h.daemon.reviewBuildAcceptance(attempt)
+				if err != nil || !complete {
+					h.t.Fatalf("repair complete=%v err=%v", complete, err)
+				}
+				coordinator, ok := h.daemon.coordinator.(*scenarioCoordinator)
+				if !ok || coordinator.reviewCall != 2 {
+					h.t.Fatalf("review calls = %#v", coordinator)
+				}
+				loaded, loadErr := loadBuildSpecAttempt(h.daemon.runState.Root)
+				if loadErr != nil || loaded.AcceptanceStatus != "passed" {
+					h.t.Fatalf("acceptance state = %#v err=%v", loaded, loadErr)
+				}
+			},
+		},
 	}
 }
 
@@ -384,6 +456,10 @@ func TestScenarioRegistry(t *testing.T) {
 			case "acceptance-complete":
 				loaded := loadScenarioFixture(t, "acceptance-complete")
 				runScenario(t, tc, scenarioCoordinatorFromFixture(loaded))
+			case "acceptance-attention", "acceptance-retry-apply":
+				runScenario(t, tc, &scenarioCoordinator{})
+			case "acceptance-repair":
+				runScenario(t, tc, &scenarioCoordinator{})
 			default:
 				runScenario(t, tc, &scenarioCoordinator{plan: &coordinator.PlanResponse{}})
 			}

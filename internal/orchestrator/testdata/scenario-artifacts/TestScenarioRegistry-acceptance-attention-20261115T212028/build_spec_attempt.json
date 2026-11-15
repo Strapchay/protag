@@ -1,0 +1,36 @@
+{
+  "attempt_id": "buildspec_20261115T212028.931826542Z",
+  "run_id": "run_20261115T212028.920776564Z",
+  "spec_path": "docs/build_spec.md",
+  "spec_hash": "37318e9204c8805e60ab88a9f546bd94bb766926f6012d7c65b228fcdc8ab489",
+  "status": "paused",
+  "started_at": "2026-11-15T21:20:28.931826542Z",
+  "updated_at": "2026-11-15T21:20:28.936876375Z",
+  "failure_reason": "acceptance review requires attention: acceptance review failed: acceptance output was not written",
+  "plan": {
+    "domains": [
+      {
+        "domain_id": "alpha",
+        "description": "fixture domain",
+        "assigned_paths": [
+          "alpha/"
+        ],
+        "agent_type": "domain"
+      }
+    ],
+    "nodes": [
+      {
+        "id": "alpha-node",
+        "domain_id": "alpha",
+        "task_spec": "fixture node",
+        "target_files": [
+          "alpha/file.py"
+        ],
+        "priority": 1
+      }
+    ],
+    "edges": []
+  },
+  "acceptance_status": "attention",
+  "acceptance_failure_code": "acceptance.error"
+}

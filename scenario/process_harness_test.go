@@ -23,6 +23,7 @@ type ProcessHarness struct {
 	LogPath string
 	cmd     *exec.Cmd
 	done    chan error
+	logFile *os.File
 }
 
 func NewProcessHarness(t *testing.T) *ProcessHarness {
@@ -51,6 +52,7 @@ func (h *ProcessHarness) Start() {
 	if err != nil {
 		h.t.Fatal(err)
 	}
+	h.logFile = logFile
 	h.cmd = exec.Command(h.Binary, "server", "--workdir", h.Root, "--config", h.Config, "--log-level", "debug")
 	h.cmd.Stdout = logFile
 	h.cmd.Stderr = logFile
@@ -97,6 +99,10 @@ func (h *ProcessHarness) Stop() {
 		<-h.done
 	}
 	h.cmd = nil
+	if h.logFile != nil {
+		_ = h.logFile.Close()
+		h.logFile = nil
+	}
 }
 
 func TestProcessScenarioSmoke(t *testing.T) {
