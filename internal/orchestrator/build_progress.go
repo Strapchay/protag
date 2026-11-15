@@ -13,18 +13,21 @@ import (
 )
 
 type BuildProgressSnapshot struct {
-	AttemptID      string                  `json:"attempt_id,omitempty"`
-	Status         string                  `json:"status"`
-	OverallPercent int                     `json:"overall_percent"`
-	DoneNodes      int                     `json:"done_nodes"`
-	TotalNodes     int                     `json:"total_nodes"`
-	Milestones     []MilestoneProgress     `json:"milestones"`
-	OpenRecoveries []RecoveryRecord        `json:"open_recoveries,omitempty"`
-	Integration    *IntegrationRunStatus   `json:"integration,omitempty"`
-	RecentEvents   []ExecutionJournalEvent `json:"recent_events,omitempty"`
-	Warnings       []string                `json:"warnings,omitempty"`
-	ClientSummary  string                  `json:"client_summary"`
-	UpdatedAt      time.Time               `json:"updated_at"`
+	AttemptID         string                  `json:"attempt_id,omitempty"`
+	Status            string                  `json:"status"`
+	OverallPercent    int                     `json:"overall_percent"`
+	DoneNodes         int                     `json:"done_nodes"`
+	TotalNodes        int                     `json:"total_nodes"`
+	Milestones        []MilestoneProgress     `json:"milestones"`
+	OpenRecoveries    []RecoveryRecord        `json:"open_recoveries,omitempty"`
+	Integration       *IntegrationRunStatus   `json:"integration,omitempty"`
+	RecentEvents      []ExecutionJournalEvent `json:"recent_events,omitempty"`
+	Warnings          []string                `json:"warnings,omitempty"`
+	AcceptanceStatus  string                  `json:"acceptance_status,omitempty"`
+	AcceptanceRounds  int                     `json:"acceptance_rounds,omitempty"`
+	AcceptanceSummary string                  `json:"acceptance_summary,omitempty"`
+	ClientSummary     string                  `json:"client_summary"`
+	UpdatedAt         time.Time               `json:"updated_at"`
 }
 
 type MilestoneProgress struct {
@@ -146,6 +149,9 @@ func computeBuildProgress(attempt *BuildSpecAttempt, snapshot *dag.DagData) *Bui
 	if attempt != nil {
 		progress.AttemptID = attempt.AttemptID
 		progress.Status = string(attempt.Status)
+		progress.AcceptanceStatus = attempt.AcceptanceStatus
+		progress.AcceptanceRounds = attempt.AcceptanceRounds
+		progress.AcceptanceSummary = attempt.AcceptanceSummary
 	}
 
 	for _, seed := range seeds {

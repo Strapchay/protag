@@ -60,6 +60,7 @@ type Daemon struct {
 	coordinationWG           sync.WaitGroup
 	coordinationResolutionMu sync.Mutex
 	coordinationResolutionOn bool
+	acceptanceMu             sync.Mutex
 	lastProgressSignature    string
 	staleMu                  sync.Mutex
 	staleReported            map[string]bool
@@ -999,6 +1000,7 @@ func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunSta
 		PlannerArtifactTimeout:     time.Duration(config.Health.CoordinatorPlannerArtifactTimeoutSec) * time.Second,
 		PlannerTurnSettleTimeout:   time.Duration(config.Health.CoordinatorPlannerTurnSettleTimeoutSec) * time.Second,
 		ResolutionArtifactTimeout:  time.Duration(config.Coordination.ArtifactTimeoutSec) * time.Second,
+		ReviewArtifactTimeout:      time.Duration(config.Health.CoordinatorPlannerArtifactTimeoutSec) * time.Second,
 	}
 	if config.GatewayEnabled() {
 		engine, err := newDomainIsolationEngine(config)
@@ -1131,6 +1133,7 @@ func configureResolutionCapability(piCoord *coordinator.PiCoordinator, server *S
 	}
 	piCoord.SetResolutionEnvFunc(resolutionCapabilityIssuer(server, config))
 	piCoord.SetArchitectEnvFunc(architectCapabilityIssuer(server, config))
+	piCoord.SetReviewEnvFunc(reviewCapabilityIssuer(server, config))
 }
 
 func architectCapabilityIssuer(server *Server, config *Config) func() ([]string, error) {
@@ -1165,6 +1168,29 @@ func withoutMountTarget(mounts []isolation.Mount, target string) []isolation.Mou
 		filtered = append(filtered, mount)
 	}
 	return filtered
+}
+
+func reviewCapabilityIssuer(server *Server, config *Config) func() ([]string, error) {
+	providerConfig := config.Inference.Coordinator
+	profileName := providerConfig.UseProfile
+	if profileName == "" {
+		profileName = config.InferenceGateway.TargetProfile
+	}
+	model := providerConfig.Model
+	if profile, ok := config.Inference.Models[providerConfig.UseProfile]; ok && profile.Model != "" {
+		model = profile.Model
+	}
+	provider := targetProviderForCoordinator(config, providerConfig)
+	return func() ([]string, error) {
+		capability, err := server.IssueAgentRuntimeCapability(AgentCapabilityPolicy{
+			AgentID: "coordinator-review", DomainID: "coordinator", Profile: profileName,
+			Provider: provider, Model: model,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []string{"AION_AGENT_CAPABILITY=" + capability}, nil
+	}
 }
 
 func resolutionCapabilityIssuer(server *Server, config *Config) func() ([]string, error) {

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	isolation "aion-isolation"
 )
 
 func TestPiCoordinator_PlanRequiresPlannerBinary(t *testing.T) {
@@ -342,5 +344,41 @@ func TestResolutionPromptUsesSealedTemplate(t *testing.T) {
 	repair := resolutionPrompt(ResolutionRequest{Repair: true, ValidationError: "bad candidate"})
 	if !strings.Contains(repair, "bad candidate") || !strings.Contains(repair, "resolution_template.json") {
 		t.Fatalf("repair prompt = %s", repair)
+	}
+}
+
+func TestReviewPromptUsesTemplateAndRejectsSourceWrites(t *testing.T) {
+	prompt := reviewPrompt(BuildReviewRequest{AttemptID: "buildspec_1"}, "/workspace/docs/aion/acceptance/buildspec_1")
+	for _, want := range []string{
+		"/workspace/docs/aion/acceptance/buildspec_1/acceptance_input.json",
+		"/workspace/docs/aion/acceptance/buildspec_1/acceptance_template.json",
+		"/workspace/docs/aion/acceptance/buildspec_1/acceptance_output.json",
+		"Do not modify source files",
+		"verdict complete",
+		"verdict rework",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("review prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	repair := reviewPrompt(BuildReviewRequest{AttemptID: "buildspec_1", Repair: true, ValidationError: "bad verdict"}, "/workspace/docs/aion/acceptance/buildspec_1")
+	if !strings.Contains(repair, "bad verdict") || !strings.Contains(repair, "acceptance_output.json") {
+		t.Fatalf("repair prompt = %s", repair)
+	}
+}
+
+func TestReviewPolicyMountHelpers(t *testing.T) {
+	mounts := []isolation.Mount{{Source: "/old", Target: "/state/pi"}, {Source: "/docs", Target: "/workspace/docs"}, {Source: "/bin", Target: "/runtime/bin/orchestrator-cli"}}
+	replaced := replaceMountSource(mounts, "/state/pi", "/new")
+	if replaced[0].Source != "/new" || replaced[1].Source != "/docs" {
+		t.Fatalf("replaceMountSource = %#v", replaced)
+	}
+	replaced = replaceMount(replaced, "/workspace/docs", "/audit", "/workspace/docs/aion/acceptance/a1")
+	if replaced[1].Source != "/audit" || replaced[1].Target != "/workspace/docs/aion/acceptance/a1" {
+		t.Fatalf("replaceMount = %#v", replaced)
+	}
+	dropped := dropMountTarget(replaced, "/runtime/bin/orchestrator-cli")
+	if len(dropped) != 2 || dropped[1].Target != "/workspace/docs/aion/acceptance/a1" {
+		t.Fatalf("dropMountTarget = %#v", dropped)
 	}
 }

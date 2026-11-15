@@ -28,6 +28,27 @@ type ResolutionCoordinator interface {
 	ResolveContract(ctx context.Context, req ResolutionRequest) (*ResolutionResult, error)
 }
 
+// BuildReviewer is the final acceptance phase of the same coordinator role. It
+// reviews a converged build against the accepted spec and execution evidence.
+// It is optional so simple coordinators and tests do not need to implement it.
+type BuildReviewer interface {
+	ReviewBuild(ctx context.Context, req BuildReviewRequest) (*BuildReviewResult, error)
+}
+
+type BuildReviewRequest struct {
+	AttemptID       string `json:"attempt_id"`
+	ArtifactDir     string `json:"artifact_dir"`
+	SandboxDir      string `json:"sandbox_dir"`
+	SessionDir      string `json:"session_dir"`
+	Repair          bool   `json:"repair,omitempty"`
+	ValidationError string `json:"validation_error,omitempty"`
+	Progress        func() `json:"-"`
+}
+
+type BuildReviewResult struct {
+	OutputPath string `json:"output_path"`
+}
+
 type ResolutionRequest struct {
 	ResolutionID    string `json:"resolution_id"`
 	ArtifactDir     string `json:"artifact_dir"`

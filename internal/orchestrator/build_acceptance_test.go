@@ -1,0 +1,160 @@
+package orchestrator
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"aion-kernel/internal/coordinator"
+	"aion-kernel/internal/dag"
+)
+
+type fakeBuildReviewer struct {
+	output buildAcceptanceCandidate
+	err    error
+}
+
+func (f *fakeBuildReviewer) Plan(context.Context, coordinator.PlanRequest) (*coordinator.PlanResponse, error) {
+	return nil, nil
+}
+func (f *fakeBuildReviewer) Replan(context.Context, coordinator.ReplanRequest) (*coordinator.ReplanResponse, error) {
+	return nil, nil
+}
+func (f *fakeBuildReviewer) Refine(context.Context, string) error { return nil }
+func (f *fakeBuildReviewer) GetArchitectAgent() interface{}       { return nil }
+func (f *fakeBuildReviewer) ReviewBuild(_ context.Context, req coordinator.BuildReviewRequest) (*coordinator.BuildReviewResult, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	data, _ := json.Marshal(f.output)
+	path := filepath.Join(req.ArtifactDir, "acceptance_output.json")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return nil, err
+	}
+	return &coordinator.BuildReviewResult{OutputPath: path}, nil
+}
+
+func acceptanceFixture(t *testing.T) (*Daemon, *BuildSpecAttempt) {
+	t.Helper()
+	daemon := testBuildSpecDaemon(t)
+	if err := os.MkdirAll(filepath.Join(daemon.projectRoot, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(daemon.projectRoot, "docs", "build_spec.md"), []byte("# Spec\nImplement alpha."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	attempt := newBuildSpecAttempt(daemon.runState.RunID, "docs/build_spec.md", []byte("# Spec\nImplement alpha."))
+	attempt.Status = BuildSpecAttemptActive
+	attempt.Plan = &coordinator.PlanResponse{
+		Domains: []coordinator.Domain{{DomainID: "alpha", AssignedPaths: []string{"alpha/"}}},
+		Nodes: []coordinator.TaskNode{{
+			ID: "alpha-core", DomainID: "alpha", TaskSpec: "Implement alpha.", TargetFiles: []string{"alpha/alpha.py"},
+		}},
+	}
+	if err := daemon.dagManager.AddNode(dag.DagNode{
+		ID: "alpha-core", DomainID: "alpha", TaskSpec: "Implement alpha.", Status: dag.StatusDone,
+		TargetFiles: []string{"alpha/alpha.py"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveBuildSpecAttempt(daemon.runState.Root, attempt); err != nil {
+		t.Fatal(err)
+	}
+	return daemon, attempt
+}
+
+func TestAcceptanceCandidateCompleteAndRework(t *testing.T) {
+	daemon, attempt := acceptanceFixture(t)
+	complete := buildAcceptanceCandidate{
+		Type: "aion_build_acceptance", AttemptID: attempt.AttemptID, Verdict: "complete", Summary: "All requirements are implemented.",
+		Requirements: []buildAcceptanceRequirement{{ID: "R1", Status: "met", Evidence: "alpha/alpha.py and integration passed."}},
+	}
+	data, _ := json.Marshal(complete)
+	patch, err := daemon.validateAcceptanceCandidate(attempt, data)
+	if err != nil || patch.candidate.Verdict != "complete" {
+		t.Fatalf("complete patch = %#v, err=%v", patch, err)
+	}
+
+	rework := buildAcceptanceCandidate{
+		Type: "aion_build_acceptance", AttemptID: attempt.AttemptID, Verdict: "rework", Summary: "The required error type is missing.",
+		Requirements: []buildAcceptanceRequirement{{ID: "R1", Status: "missing", Evidence: "alpha/alpha.py has no validation error type."}},
+		ReopenNodes: []buildAcceptanceRework{{
+			NodeID: "alpha-core", Instruction: "Add the missing validation error type and tests.",
+		}},
+	}
+	data, _ = json.Marshal(rework)
+	patch, err = daemon.validateAcceptanceCandidate(attempt, data)
+	if err != nil {
+		t.Fatalf("rework patch: %v", err)
+	}
+	if err := daemon.applyAcceptancePatch(attempt, patch); err != nil {
+		t.Fatalf("apply rework: %v", err)
+	}
+	node, err := daemon.dagManager.GetNode("alpha-core")
+	if err != nil || node.Status != dag.StatusPending {
+		t.Fatalf("reopened node = %#v, err=%v", node, err)
+	}
+	if !strings.Contains(node.TaskSpec, "ACCEPTANCE REWORK") || !strings.Contains(node.TaskSpec, "validation error type") {
+		t.Fatalf("rework task spec = %q", node.TaskSpec)
+	}
+}
+
+func TestAcceptanceCandidateRejectsOwnershipEscape(t *testing.T) {
+	daemon, attempt := acceptanceFixture(t)
+	rework := buildAcceptanceCandidate{
+		Type: "aion_build_acceptance", AttemptID: attempt.AttemptID, Verdict: "rework", Summary: "Needs work.",
+		Requirements: []buildAcceptanceRequirement{{ID: "R1", Status: "missing", Evidence: "missing."}},
+		AddNodes: []coordinator.TaskNode{{
+			ID: "escape", DomainID: "alpha", TaskSpec: "write elsewhere", TargetFiles: []string{"beta/escape.py"},
+		}},
+	}
+	data, _ := json.Marshal(rework)
+	if _, err := daemon.validateAcceptanceCandidate(attempt, data); err == nil {
+		t.Fatal("ownership escape was accepted")
+	}
+}
+
+func TestReviewBuildAcceptancePassesAndStoresVerdict(t *testing.T) {
+	daemon, attempt := acceptanceFixture(t)
+	daemon.coordinator = &fakeBuildReviewer{output: buildAcceptanceCandidate{
+		Type: "aion_build_acceptance", AttemptID: attempt.AttemptID, Verdict: "complete", Summary: "All requirements are implemented.",
+		Requirements: []buildAcceptanceRequirement{{ID: "R1", Status: "met", Evidence: "alpha/alpha.py and integration passed."}},
+	}}
+	complete, err := daemon.reviewBuildAcceptance(attempt)
+	if err != nil || !complete {
+		t.Fatalf("review complete=%v err=%v", complete, err)
+	}
+	loaded, err := loadBuildSpecAttempt(daemon.runState.Root)
+	if err != nil || loaded.AcceptanceStatus != "passed" {
+		t.Fatalf("stored attempt = %#v, err=%v", loaded, err)
+	}
+	if !strings.Contains(loaded.AcceptanceSummary, "implemented") {
+		t.Fatalf("summary = %q", loaded.AcceptanceSummary)
+	}
+}
+
+func TestAcceptanceInputIncludesExecutionEvidence(t *testing.T) {
+	daemon, attempt := acceptanceFixture(t)
+	daemon.coordinator = &fakeBuildReviewer{output: buildAcceptanceCandidate{
+		Type: "aion_build_acceptance", AttemptID: attempt.AttemptID, Verdict: "complete", Summary: "All requirements are implemented.",
+		Requirements: []buildAcceptanceRequirement{{ID: "R1", Status: "met", Evidence: "source and integration."}},
+	}}
+	if _, err := daemon.reviewBuildAcceptance(attempt); err != nil {
+		t.Fatal(err)
+	}
+	inputPath := filepath.Join(daemon.projectRoot, "docs", "aion", "acceptance", attempt.AttemptID, "acceptance_input.json")
+	data, err := os.ReadFile(inputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input buildAcceptanceInput
+	if err := json.Unmarshal(data, &input); err != nil {
+		t.Fatal(err)
+	}
+	if input.BuildSpec == "" || input.Plan == nil || len(input.DAG.Nodes) != 1 || len(input.ValidationRules) == 0 {
+		t.Fatalf("acceptance input = %#v", input)
+	}
+}

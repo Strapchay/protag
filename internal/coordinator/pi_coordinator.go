@@ -42,6 +42,8 @@ type PiCoordinator struct {
 	resolutionMu       sync.Mutex
 	resolutionProgress func()
 	resolutionEnvFn    func() ([]string, error)
+	reviewMu           sync.Mutex
+	reviewEnvFn        func() ([]string, error)
 	architectMu        sync.Mutex
 	architectEnvFn     func() ([]string, error)
 	lastUserText       string
@@ -69,6 +71,8 @@ type PiCoordinatorConfig struct {
 	ResolutionExtensionPaths   []string
 	ResolutionEnv              []string
 	ResolutionArtifactTimeout  time.Duration
+	ReviewEnv                  []string
+	ReviewArtifactTimeout      time.Duration
 
 	ArchitectIsolationEngine isolation.Engine
 	ArchitectPolicy          isolation.Policy
@@ -422,6 +426,28 @@ func (c *PiCoordinator) architectCapabilityEnv() ([]string, error) {
 func (c *PiCoordinator) architectProcessEnv() ([]string, error) {
 	env := append([]string(nil), c.config.ArchitectEnv...)
 	extra, err := c.architectCapabilityEnv()
+	if err != nil {
+		return nil, err
+	}
+	return append(env, extra...), nil
+}
+
+func (c *PiCoordinator) SetReviewEnvFunc(fn func() ([]string, error)) {
+	c.reviewMu.Lock()
+	c.reviewEnvFn = fn
+	c.reviewMu.Unlock()
+}
+
+func (c *PiCoordinator) reviewProcessEnv() ([]string, error) {
+	c.reviewMu.Lock()
+	fn := c.reviewEnvFn
+	c.reviewMu.Unlock()
+	env := append([]string(nil), c.config.ArchitectEnv...)
+	env = append(env, c.config.ReviewEnv...)
+	if fn == nil {
+		return env, nil
+	}
+	extra, err := fn()
 	if err != nil {
 		return nil, err
 	}

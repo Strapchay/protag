@@ -413,9 +413,6 @@ func (d *Daemon) finalizeBuildSpecAttemptConvergence() error {
 	if d == nil || d.runState == nil {
 		return nil
 	}
-	if d.allocator != nil {
-		d.allocator.StopAll()
-	}
 
 	attempt, err := loadBuildSpecAttempt(d.runState.Root)
 	if err != nil {
@@ -428,6 +425,19 @@ func (d *Daemon) finalizeBuildSpecAttemptConvergence() error {
 	case BuildSpecAttemptActive, BuildSpecAttemptPaused, BuildSpecAttemptAllocating:
 	default:
 		return nil
+	}
+	if attempt.AcceptanceStatus == "attention" {
+		return nil
+	}
+	complete, reviewErr := d.reviewBuildAcceptance(attempt)
+	if reviewErr != nil {
+		log.Printf("daemon: build acceptance review: %v", reviewErr)
+	}
+	if !complete {
+		return nil
+	}
+	if d.allocator != nil {
+		d.allocator.StopAll()
 	}
 
 	now := time.Now().UTC()
@@ -736,6 +746,11 @@ func (d *Daemon) continueBuildSpecAgents() error {
 	}
 	if attempt.Plan == nil {
 		return fmt.Errorf("no saved build-spec plan for the current attempt")
+	}
+	if attempt.AcceptanceStatus == "attention" {
+		attempt.AcceptanceStatus = ""
+		attempt.FailureReason = ""
+		_ = saveBuildSpecAttempt(d.runState.Root, attempt)
 	}
 	if attempt.Status != BuildSpecAttemptActive && attempt.Status != BuildSpecAttemptPaused && attempt.Status != BuildSpecAttemptAllocating {
 		return fmt.Errorf("build-spec agents are only resumable after allocation has started")
