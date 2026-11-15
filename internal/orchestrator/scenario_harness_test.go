@@ -177,6 +177,7 @@ func (h *scenarioHarness) Close() {
 		return
 	}
 	h.closed = true
+	h.daemon.stopBuildSpecExecutionMonitor()
 	_ = h.daemon.server.Stop()
 	if h.daemon.dagManager != nil {
 		_ = h.daemon.dagManager.Close()
@@ -570,6 +571,77 @@ func scenarioRegistry() []scenarioCase {
 			},
 		},
 		{
+			Name: "integration-directive-recovery",
+			Run: func(h *scenarioHarness) {
+				fixture := loadScenarioFixture(h.t, "acceptance-complete")
+				seedAcceptanceScenario(h, fixture)
+				runner := NewIntegrationRunner(h.daemon.config, h.daemon.projectRoot, h.daemon.runState, h.daemon.coordinationManager, nil, context.Background())
+				defer runner.Close()
+				h.daemon.integrationRunner = runner
+				h.daemon.handleIntegrationStatusChange(IntegrationRunStatus{
+					Status: IntegrationFailed, FailureClass: "directive_execution_failed",
+					Error: "directive failed", Results: []IntegrationDirectiveResult{{
+						DirectiveID: "fixture-directive", OwnerNodeIDs: []string{"alpha-node"}, Status: "failed", ExitCode: 1, FailureClass: "directive_execution_failed",
+					}},
+				})
+				loaded, err := loadBuildSpecAttempt(h.daemon.runState.Root)
+				if err != nil {
+					h.t.Fatal(err)
+				}
+				if loaded.IntegrationRecoveryRounds != 1 {
+					h.t.Fatalf("recovery rounds = %d", loaded.IntegrationRecoveryRounds)
+				}
+				node, err := h.daemon.dagManager.GetNode("alpha-node")
+				if err != nil || node.Status != dag.StatusInProgress {
+					h.t.Fatalf("node = %#v err=%v", node, err)
+				}
+				if runner.Status().Status != IntegrationPending {
+					h.t.Fatalf("runner status = %s", runner.Status().Status)
+				}
+			},
+		},
+		{
+			Name: "integration-recovery-budget",
+			Run: func(h *scenarioHarness) {
+				fixture := loadScenarioFixture(h.t, "acceptance-complete")
+				seedAcceptanceScenario(h, fixture)
+				runner := NewIntegrationRunner(h.daemon.config, h.daemon.projectRoot, h.daemon.runState, h.daemon.coordinationManager, nil, context.Background())
+				defer runner.Close()
+				h.daemon.integrationRunner = runner
+				status := IntegrationRunStatus{
+					Status: IntegrationFailed, FailureClass: "directive_execution_failed", Error: "directive failed",
+					Results: []IntegrationDirectiveResult{{DirectiveID: "fixture-directive", OwnerNodeIDs: []string{"alpha-node"}, Status: "failed", ExitCode: 1, FailureClass: "directive_execution_failed"}},
+				}
+				for i := 0; i < 3; i++ {
+					h.daemon.handleIntegrationStatusChange(status)
+				}
+				loaded, err := loadBuildSpecAttempt(h.daemon.runState.Root)
+				if err != nil {
+					h.t.Fatal(err)
+				}
+				if loaded.Status != BuildSpecAttemptPaused || !strings.Contains(loaded.FailureReason, "integration requires operator attention") {
+					h.t.Fatalf("attempt = %s/%s", loaded.Status, loaded.FailureReason)
+				}
+			},
+		},
+		{
+			Name: "integration-prepare-attention",
+			Run: func(h *scenarioHarness) {
+				fixture := loadScenarioFixture(h.t, "acceptance-complete")
+				seedAcceptanceScenario(h, fixture)
+				h.daemon.handleIntegrationStatusChange(IntegrationRunStatus{
+					Status: IntegrationFailed, FailureClass: "prepare_failed", Error: "invalid manifest",
+				})
+				loaded, err := loadBuildSpecAttempt(h.daemon.runState.Root)
+				if err != nil {
+					h.t.Fatal(err)
+				}
+				if loaded.Status != BuildSpecAttemptPaused || !strings.Contains(loaded.FailureReason, "prepare_failed") {
+					h.t.Fatalf("attempt = %s/%s", loaded.Status, loaded.FailureReason)
+				}
+			},
+		},
+		{
 			Name: "recovery-crash-budget",
 			Run: func(h *scenarioHarness) {
 				for i := 0; i < 3; i++ {
@@ -702,7 +774,8 @@ func TestScenarioRegistry(t *testing.T) {
 				"acceptance-surface-retry-rejected", "acceptance-complete-failed-node",
 				"acceptance-repair-fails", "acceptance-successor-depth-rejected",
 				"recovery-crash-budget", "recovery-supervisor-wait", "recovery-queue-dedup",
-				"recovery-restart-reconstruct", "recovery-failed-node-operator-retry":
+				"recovery-restart-reconstruct", "recovery-failed-node-operator-retry",
+				"integration-directive-recovery", "integration-recovery-budget", "integration-prepare-attention":
 				runScenario(t, tc, &scenarioCoordinator{})
 			case "acceptance-retry-cycle":
 				loaded := loadScenarioFixture(t, "acceptance-retry-cycle")
