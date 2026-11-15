@@ -19,7 +19,7 @@ func TestTermsNegotiationAndStandstillLifecycle(t *testing.T) {
 	contract, err := manager.Request(ctx, consumer, RequestCommand{Contract: Contract{
 		ID: "contract-1", ProducerAgentID: producer.AgentID, ProducerNodeID: "producer-node",
 		ConsumerAgentID: consumer.AgentID, ConsumerNodeID: "consumer-node",
-		Details: ContractDetails{Name: "Lookup", Kind: "api"}, Status: StatusRequested,
+		Details: ContractDetails{Name: "Lookup", Kind: "api", HandshakeRequired: true}, Status: StatusRequested,
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -80,6 +80,9 @@ func TestTermsNegotiationAndStandstillLifecycle(t *testing.T) {
 	history, err := manager.Terms(ctx, consumer, contract.ID)
 	if err != nil || len(history) != 3 || history[2].Status != TermsAgreed {
 		t.Fatalf("history = %#v, err=%v", history, err)
+	}
+	if !history[2].Details.HandshakeRequired {
+		t.Fatalf("reconciled terms dropped the required handshake: %#v", history[2].Details)
 	}
 }
 

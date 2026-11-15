@@ -302,6 +302,9 @@ func (m *Manager) FinalizeResolution(ctx context.Context, resolutionID, leaseTok
 		return nil, err
 	}
 	now := time.Now().UTC()
+	// The plan-declared handshake requirement is policy, not a negotiable
+	// artifact detail, so reconciliation may not silently drop it.
+	terms.Details.HandshakeRequired = terms.Details.HandshakeRequired || contract.Details.HandshakeRequired
 	terms.ContractID = contract.ID
 	terms.Revision = latest.Revision + 1
 	terms.ParentRevision = latest.Revision

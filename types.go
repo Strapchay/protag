@@ -47,6 +47,7 @@ type ContractDetails struct {
 	Compatibility      string          `json:"compatibility,omitempty"`
 	Acceptance         []string        `json:"acceptance,omitempty"`
 	IntegrationFixture json.RawMessage `json:"integration_fixture,omitempty"`
+	HandshakeRequired  bool            `json:"handshake_required,omitempty"`
 }
 
 type TermsStatus string
