@@ -28,6 +28,17 @@ type AgentRecoveryState struct {
 	UpdatedAt          time.Time `json:"updated_at"`
 }
 
+type RecoveryRequest struct {
+	ID          string    `json:"id"`
+	AgentID     string    `json:"agent_id"`
+	NodeID      string    `json:"node_id,omitempty"`
+	Action      string    `json:"action"`
+	Cause       string    `json:"cause"`
+	FailureCode string    `json:"failure_code,omitempty"`
+	Priority    int       `json:"priority,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
 type AgentResumePreflight struct {
 	AgentID    string             `json:"agent_id"`
 	DomainID   string             `json:"domain_id,omitempty"`
@@ -61,28 +72,31 @@ func (d *Daemon) observeAgentRecovery(agentID, domainID, state, reason string) {
 		return
 	}
 	now := time.Now().UTC()
+	code := agentFailureCode(state, reason)
+	action, maxAttempts := d.recoveryPolicyAction(code)
 	d.recoveryMu.Lock()
-	defer d.recoveryMu.Unlock()
 	if d.recoveryStates == nil {
 		d.recoveryStates = make(map[string]AgentRecoveryState)
 	}
 	recovery := d.recoveryStates[agentID]
 	if recovery.AgentID == "" {
-		recovery = AgentRecoveryState{AgentID: agentID, DomainID: domainID, Budget: agentRecoveryBudget, Epoch: 1}
+		recovery = AgentRecoveryState{AgentID: agentID, DomainID: domainID, Budget: maxAttempts, Epoch: 1}
 	}
 	recovery.DomainID = firstNonEmpty(domainID, recovery.DomainID)
 	recovery.LastError = reason
 	recovery.UpdatedAt = now
+	enqueue := false
 	switch strings.ToLower(strings.TrimSpace(state)) {
 	case "crashed":
 		recovery.Epoch++
 		recovery.Phase = "process_recovering"
 		recovery.Owner = "supervisor"
-		recovery.FailureCode = "agent.process_crashed"
+		recovery.FailureCode = code
 		recovery.FailureClass = "retry"
 		recovery.Cause = reason
 		recovery.Attempts++
 		recovery.SupervisorRestarts++
+		recovery.Budget = maxAttempts
 	case "running":
 		recovery.Phase = "idle"
 		recovery.Owner = ""
@@ -98,17 +112,201 @@ func (d *Daemon) observeAgentRecovery(agentID, domainID, state, reason string) {
 			recovery.Cause = ""
 			break
 		}
-		recovery.Phase = "work_recovery_pending"
-		recovery.Owner = "arbiter"
-		recovery.FailureCode = "agent.stopped"
-		recovery.FailureClass = "retry"
-		if recovery.Attempts >= recovery.Budget {
-			recovery.Phase = "awaiting_operator"
+		recovery.FailureCode = code
+		recovery.Budget = maxAttempts
+		recovery.Attempts++
+		switch action {
+		case "retry", "retry_turn", "reopen_node":
+			recovery.FailureClass = "retry"
+			if recovery.Attempts >= recovery.Budget {
+				recovery.Phase = "awaiting_operator"
+				recovery.FailureClass = "attention"
+				recovery.FailureCode = "supervisor.restart_budget_exhausted"
+			} else {
+				recovery.Phase = "work_recovery_pending"
+				recovery.Owner = "arbiter"
+				enqueue = true
+			}
+		case "wait":
+			recovery.FailureClass = "wait"
+			recovery.Phase = "work_recovery_pending"
+			recovery.Owner = "arbiter"
+		case "none":
+			recovery.FailureClass = "none"
+			recovery.Phase = "idle"
+		default:
 			recovery.FailureClass = "attention"
+			recovery.Phase = "awaiting_operator"
+			recovery.Owner = "arbiter"
 			recovery.FailureCode = "supervisor.restart_budget_exhausted"
 		}
 	}
 	d.recoveryStates[agentID] = recovery
+	d.recoveryMu.Unlock()
+	if enqueue {
+		d.enqueueRecovery(RecoveryRequest{
+			AgentID: agentID, Action: "revive", Cause: "agent." + strings.ToLower(strings.TrimSpace(state)),
+			FailureCode: code, Priority: 20, CreatedAt: now,
+		})
+	}
+}
+
+func agentFailureCode(state, reason string) string {
+	text := strings.ToLower(strings.TrimSpace(state + " " + reason))
+	switch {
+	case strings.Contains(text, "auth") || strings.Contains(text, "401") || strings.Contains(text, "403") || strings.Contains(text, "unauthorized") || strings.Contains(text, "forbidden"):
+		return "agent.auth_failed"
+	case strings.Contains(text, "context") && (strings.Contains(text, "length") || strings.Contains(text, "window") || strings.Contains(text, "too long")):
+		return "agent.context_window_exceeded"
+	case strings.Contains(text, "429") || strings.Contains(text, "rate limit"):
+		return "agent.provider_rate_limited"
+	case strings.Contains(text, "503") || strings.Contains(text, "unavailable") || strings.Contains(text, "overloaded"):
+		return "agent.provider_unavailable"
+	case strings.Contains(text, "timeout") || strings.Contains(text, "econnreset") || strings.Contains(text, "network"):
+		return "agent.transient_network"
+	case strings.Contains(text, "loop"):
+		return "agent.looping"
+	case strings.Contains(text, "boundary") || strings.Contains(text, "ownership"):
+		return "agent.domain_boundary_violation"
+	case strings.Contains(text, "incomplete"):
+		return "agent.incomplete_turn"
+	case strings.Contains(text, "crashed") || strings.Contains(text, "exited") || strings.Contains(text, "health timeout"):
+		return "agent.process_crashed"
+	default:
+		return "agent.stopped"
+	}
+}
+
+func (d *Daemon) recoveryPolicyAction(code string) (string, int) {
+	action := "attention"
+	maxAttempts := 2
+	if d != nil && d.config != nil {
+		policy := d.config.Coordination.Recovery
+		if strings.TrimSpace(policy.Actions[code]) != "" {
+			action = strings.TrimSpace(policy.Actions[code])
+		} else if strings.TrimSpace(policy.UnknownFailure) != "" {
+			action = strings.TrimSpace(policy.UnknownFailure)
+		}
+		if policy.MaxAttempts[code] > 0 {
+			maxAttempts = policy.MaxAttempts[code]
+		}
+	}
+	return action, maxAttempts
+}
+
+func (d *Daemon) integrationFailureAction(class string) string {
+	action, _ := d.recoveryPolicyAction("integration." + strings.TrimSpace(class))
+	return action
+}
+
+func (d *Daemon) enqueueRecovery(request RecoveryRequest) {
+	if d == nil || strings.TrimSpace(request.AgentID) == "" || strings.TrimSpace(request.Action) == "" {
+		return
+	}
+	if request.CreatedAt.IsZero() {
+		request.CreatedAt = time.Now().UTC()
+	}
+	request.ID = request.AgentID + "\x00" + request.NodeID + "\x00" + request.Action + "\x00" + request.Cause
+	d.recoveryMu.Lock()
+	for _, queued := range d.recoveryQueue {
+		if queued.ID == request.ID {
+			d.recoveryMu.Unlock()
+			return
+		}
+	}
+	d.recoveryQueue = append(d.recoveryQueue, request)
+	d.recoveryMu.Unlock()
+	go d.processRecoveryQueue()
+}
+
+func (d *Daemon) processRecoveryQueue() {
+	if d == nil {
+		return
+	}
+	d.recoveryMu.Lock()
+	if d.recoveryProcessing {
+		d.recoveryMu.Unlock()
+		return
+	}
+	d.recoveryProcessing = true
+	queue := append([]RecoveryRequest(nil), d.recoveryQueue...)
+	d.recoveryMu.Unlock()
+	defer func() {
+		d.recoveryMu.Lock()
+		d.recoveryProcessing = false
+		d.recoveryMu.Unlock()
+	}()
+	var remaining []RecoveryRequest
+	for _, request := range queue {
+		state := d.recoverySnapshot(request.AgentID)
+		if state.Phase == "process_recovering" || state.Phase == "awaiting_operator" {
+			remaining = append(remaining, request)
+			continue
+		}
+		switch request.Action {
+		case "revive", "retry", "retry_turn":
+			info, live := recoveryAgentInfo(d, request.AgentID)
+			if live && strings.EqualFold(strings.TrimSpace(info.State), "running") {
+				continue
+			}
+			d.setRecoveryPhase(request.AgentID, "work_recovering", "arbiter")
+			if err := d.allocator.ReviveAgent(d.ctx, request.AgentID); err != nil {
+				d.setRecoveryPhase(request.AgentID, "awaiting_operator", "arbiter")
+				continue
+			}
+		case "reopen_node":
+			if strings.TrimSpace(request.NodeID) == "" {
+				continue
+			}
+			if node, err := d.dagManager.GetNode(request.NodeID); err == nil && node != nil && node.Status == dag.StatusFailed {
+				_ = d.dagManager.UpdateNode(request.NodeID, dag.StatusPending)
+			}
+		}
+	}
+	d.recoveryMu.Lock()
+	d.recoveryQueue = remaining
+	d.recoveryMu.Unlock()
+	d.persistRecoveryQueue()
+}
+
+func recoveryAgentInfo(d *Daemon, agentID string) (AgentInfo, bool) {
+	if d == nil || d.allocator == nil {
+		return AgentInfo{}, false
+	}
+	for _, info := range d.allocator.AgentInfos() {
+		if info.AgentID == agentID {
+			return info, true
+		}
+	}
+	return AgentInfo{}, false
+}
+
+func (d *Daemon) setRecoveryPhase(agentID, phase, owner string) {
+	d.recoveryMu.Lock()
+	defer d.recoveryMu.Unlock()
+	state := d.recoveryStates[agentID]
+	if state.AgentID == "" {
+		return
+	}
+	state.Phase = phase
+	state.Owner = owner
+	state.UpdatedAt = time.Now().UTC()
+	d.recoveryStates[agentID] = state
+}
+
+func (d *Daemon) persistRecoveryQueue() {
+	if d == nil || d.runState == nil {
+		return
+	}
+	d.recoveryMu.Lock()
+	queue := append([]RecoveryRequest(nil), d.recoveryQueue...)
+	d.recoveryMu.Unlock()
+	attempt, err := loadBuildSpecAttempt(d.runState.Root)
+	if err != nil || attempt == nil {
+		return
+	}
+	attempt.RecoveryQueue = queue
+	d.saveBuildSpecAttempt(attempt)
 }
 
 func (d *Daemon) recoverySnapshot(agentID string) AgentRecoveryState {
@@ -158,9 +356,9 @@ func (d *Daemon) resumeBuildWorkAfterAcceptance(attempt *BuildSpecAttempt) error
 			}
 			switch strings.ToLower(strings.TrimSpace(info.State)) {
 			case "stopped", "crashed", "failed", "failed_terminal":
-				if err := d.allocator.ReviveAgent(d.ctx, info.AgentID); err != nil {
-					return fmt.Errorf("acceptance resume revive %s: %w", info.AgentID, err)
-				}
+				d.enqueueRecovery(RecoveryRequest{
+					AgentID: info.AgentID, Action: "revive", Cause: "acceptance_rework", Priority: 30, CreatedAt: time.Now().UTC(),
+				})
 			}
 		}
 	}
@@ -198,6 +396,7 @@ func (d *Daemon) initRecoveryArbiter() {
 	if d.recoveryStates == nil {
 		d.recoveryStates = make(map[string]AgentRecoveryState)
 	}
+	d.recoveryQueue = append([]RecoveryRequest(nil), attempt.RecoveryQueue...)
 	for agentID, persisted := range attempt.AgentStates {
 		state := AgentRecoveryState{
 			AgentID: agentID, DomainID: persisted.DomainID, Epoch: persisted.RecoveryEpoch,

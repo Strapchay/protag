@@ -63,6 +63,8 @@ type Daemon struct {
 	acceptanceMu             sync.Mutex
 	recoveryMu               sync.Mutex
 	recoveryStates           map[string]AgentRecoveryState
+	recoveryQueue            []RecoveryRequest
+	recoveryProcessing       bool
 	lastProgressSignature    string
 	staleMu                  sync.Mutex
 	staleReported            map[string]bool
@@ -810,7 +812,8 @@ func (d *Daemon) handleIntegrationStatusChange(status IntegrationRunStatus) {
 	if status.Status == IntegrationFailed {
 		attempt, _ := loadBuildSpecAttempt(d.runState.Root)
 		class := firstNonEmpty(status.FailureClass, "directive_execution_failed")
-		if integrationFailureDisposition(class) != "retry" {
+		action := d.integrationFailureAction(class)
+		if action != "retry" && action != "reopen_node" && action != "rerun_integration" {
 			d.integrationAttention(attempt, class, status.Error)
 			return
 		}

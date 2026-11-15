@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	coordination "aion-coordination"
 	"aion-kernel/internal/coordinator"
 	"aion-kernel/internal/dag"
 )
@@ -216,5 +217,44 @@ func TestAcceptanceCompleteRejectsFailedNode(t *testing.T) {
 	data, _ := json.Marshal(complete)
 	if _, err := daemon.validateAcceptanceCandidate(attempt, data); err == nil {
 		t.Fatal("complete with a failed node was accepted")
+	}
+}
+
+func TestAcceptanceSuccessorCreatesContract(t *testing.T) {
+	daemon, attempt := acceptanceFixture(t)
+	manager, err := coordination.Open(coordinationOptions(daemon.config, daemon.runState.CoordinationDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	daemon.coordinationManager = manager
+	attempt.Plan.Domains = append(attempt.Plan.Domains, coordinator.Domain{DomainID: "beta", AssignedPaths: []string{"beta/"}})
+	successor := buildAcceptanceCandidate{
+		Type: "aion_build_acceptance", AttemptID: attempt.AttemptID, Verdict: "successor", Summary: "Add a public follow-on contract.",
+		Requirements: []buildAcceptanceRequirement{{ID: "R2", Status: "missing", Evidence: "A new public result contract is required."}},
+		AddNodes: []coordinator.TaskNode{
+			{ID: "alpha-result", DomainID: "alpha", TaskSpec: "Publish the follow-on result.", TargetFiles: []string{"alpha/result.py"}, OriginNodeID: "alpha-core"},
+			{ID: "beta-result", DomainID: "beta", TaskSpec: "Consume the follow-on result.", TargetFiles: []string{"beta/result.py"}, OriginNodeID: "alpha-core"},
+		},
+		AddContracts: []coordinator.PlannedContract{{
+			Resource: "alpha-result-v2", ProducerNode: "alpha-result", ConsumerNode: "beta-result",
+			Kind: "interface", Language: "python", PublicEntrypoint: "alpha.result", Acceptance: []string{"consumer imports the follow-on result"},
+			SupersedesContractID: "contract-alpha-core-old",
+		}},
+	}
+	data, _ := json.Marshal(successor)
+	patch, err := daemon.validateAcceptanceCandidate(attempt, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := daemon.applyAcceptancePatch(attempt, patch); err != nil {
+		t.Fatal(err)
+	}
+	contracts, err := manager.List(context.Background(), coordination.Principal{Role: coordination.RoleAdmin})
+	if err != nil || len(contracts) != 1 {
+		t.Fatalf("contracts = %#v, err=%v", contracts, err)
+	}
+	if contracts[0].Details.SupersedesContractID != "contract-alpha-core-old" {
+		t.Fatalf("contract supersession = %#v", contracts[0].Details)
 	}
 }

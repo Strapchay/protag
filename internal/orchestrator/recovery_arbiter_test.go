@@ -89,3 +89,33 @@ func TestResumePreflightAndRetryFailedNode(t *testing.T) {
 		t.Fatalf("reopened node = %#v, err=%v", node, err)
 	}
 }
+
+func TestRecoveryPolicyActionUsesConfig(t *testing.T) {
+	daemon := testBuildSpecDaemon(t)
+	daemon.config.Coordination.Recovery.Actions = map[string]string{"agent.transient_network": "attention"}
+	daemon.config.Coordination.Recovery.MaxAttempts = map[string]int{"agent.transient_network": 4}
+	action, attempts := daemon.recoveryPolicyAction("agent.transient_network")
+	if action != "attention" || attempts != 4 {
+		t.Fatalf("policy = %s/%d", action, attempts)
+	}
+	action, attempts = daemon.recoveryPolicyAction("unknown.code")
+	if action != "attention" || attempts != 2 {
+		t.Fatalf("unknown policy = %s/%d", action, attempts)
+	}
+}
+
+func TestRecoveryQueueDeduplicates(t *testing.T) {
+	daemon := testBuildSpecDaemon(t)
+	daemon.recoveryMu.Lock()
+	daemon.recoveryProcessing = true
+	daemon.recoveryMu.Unlock()
+	daemon.enqueueRecovery(RecoveryRequest{AgentID: "agent-alpha", Action: "revive", Cause: "test"})
+	daemon.enqueueRecovery(RecoveryRequest{AgentID: "agent-alpha", Action: "revive", Cause: "test"})
+	daemon.recoveryMu.Lock()
+	queued := len(daemon.recoveryQueue)
+	daemon.recoveryProcessing = false
+	daemon.recoveryMu.Unlock()
+	if queued != 1 {
+		t.Fatalf("queue length = %d, want 1", queued)
+	}
+}

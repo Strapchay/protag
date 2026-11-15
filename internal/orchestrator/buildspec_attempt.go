@@ -68,6 +68,7 @@ type BuildSpecAttempt struct {
 	AcceptanceSummary         string                         `json:"acceptance_summary,omitempty"`
 	AcceptanceReviewPath      string                         `json:"acceptance_review_path,omitempty"`
 	IntegrationRecoveryRounds int                            `json:"integration_recovery_rounds,omitempty"`
+	RecoveryQueue             []RecoveryRequest              `json:"recovery_queue,omitempty"`
 }
 
 func newBuildSpecAttempt(runID, specPath string, specData []byte) *BuildSpecAttempt {

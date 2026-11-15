@@ -152,6 +152,9 @@ func TestConfigDefaults(t *testing.T) {
 	if config.Coordination.AllowAcceptanceWithoutIntegration {
 		t.Fatal("acceptance without integration should be disabled by default")
 	}
+	if config.Coordination.Recovery.UnknownFailure != "attention" || len(config.Coordination.Recovery.Actions) == 0 {
+		t.Fatalf("unexpected recovery policy defaults: %#v", config.Coordination.Recovery)
+	}
 }
 
 func TestConfigRejectsInvalidDeadlockTimeout(t *testing.T) {

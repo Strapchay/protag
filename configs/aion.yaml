@@ -70,6 +70,8 @@ coordination:
   max_successor_depth: ${AION_COORDINATION_MAX_SUCCESSOR_DEPTH}
   max_integration_recoveries: ${AION_COORDINATION_MAX_INTEGRATION_RECOVERIES}
   allow_acceptance_without_integration: ${AION_ALLOW_ACCEPTANCE_WITHOUT_INTEGRATION}
+  recovery:
+    unknown_failure: ${AION_RECOVERY_UNKNOWN_FAILURE}
 
 isolation:
   # Mandatory domain-agent sandbox backend; no production passthrough exists

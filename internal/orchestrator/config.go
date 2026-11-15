@@ -28,17 +28,24 @@ type Config struct {
 // CoordinationConfig bounds bilateral negotiation and coordinator-assisted
 // reconciliation. These limits are persisted into each resolution so restarts
 // cannot silently reset its retry budget.
+type RecoveryPolicyConfig struct {
+	UnknownFailure string            `yaml:"unknown_failure"`
+	Actions        map[string]string `yaml:"actions"`
+	MaxAttempts    map[string]int    `yaml:"max_attempts"`
+}
+
 type CoordinationConfig struct {
-	MaxNegotiationRounds              int  `yaml:"max_negotiation_rounds"`
-	MaxProcessAttempts                int  `yaml:"max_process_attempts"`
-	MaxRepairAttempts                 int  `yaml:"max_repair_attempts"`
-	MaxContextExpansions              int  `yaml:"max_context_expansions"`
-	LeaseTimeoutSec                   int  `yaml:"lease_timeout_sec"`
-	ArtifactTimeoutSec                int  `yaml:"artifact_timeout_sec"`
-	DeadlockTimeoutSec                int  `yaml:"deadlock_timeout_sec"`
-	MaxSuccessorDepth                 int  `yaml:"max_successor_depth"`
-	MaxIntegrationRecoveries          int  `yaml:"max_integration_recoveries"`
-	AllowAcceptanceWithoutIntegration bool `yaml:"allow_acceptance_without_integration"`
+	MaxNegotiationRounds              int                  `yaml:"max_negotiation_rounds"`
+	MaxProcessAttempts                int                  `yaml:"max_process_attempts"`
+	MaxRepairAttempts                 int                  `yaml:"max_repair_attempts"`
+	MaxContextExpansions              int                  `yaml:"max_context_expansions"`
+	LeaseTimeoutSec                   int                  `yaml:"lease_timeout_sec"`
+	ArtifactTimeoutSec                int                  `yaml:"artifact_timeout_sec"`
+	DeadlockTimeoutSec                int                  `yaml:"deadlock_timeout_sec"`
+	MaxSuccessorDepth                 int                  `yaml:"max_successor_depth"`
+	MaxIntegrationRecoveries          int                  `yaml:"max_integration_recoveries"`
+	AllowAcceptanceWithoutIntegration bool                 `yaml:"allow_acceptance_without_integration"`
+	Recovery                          RecoveryPolicyConfig `yaml:"recovery"`
 }
 
 // IsolationConfig configures the mandatory domain-agent process boundary.
@@ -471,6 +478,7 @@ func applyDefaults(c *Config) {
 	if c.Coordination.MaxIntegrationRecoveries == 0 {
 		c.Coordination.MaxIntegrationRecoveries = 2
 	}
+	applyRecoveryPolicyDefaults(&c.Coordination.Recovery)
 	if strings.TrimSpace(c.Isolation.Backend) == "" {
 		c.Isolation.Backend = "bubblewrap"
 	}
@@ -606,6 +614,9 @@ func validateConfig(c *Config) error {
 	if c.Coordination.MaxIntegrationRecoveries < 1 || c.Coordination.MaxIntegrationRecoveries > 5 {
 		return fmt.Errorf("coordination.max_integration_recoveries must be between 1 and 5")
 	}
+	if err := validateRecoveryPolicy(c.Coordination.Recovery); err != nil {
+		return err
+	}
 	if c.InferenceGateway.RetryBaseDelayMS < 1 {
 		return fmt.Errorf("inference_gateway.retry_base_delay_ms must be >= 1")
 	}
@@ -671,4 +682,65 @@ func (c *Config) GatewayEnabled() bool {
 		return false
 	}
 	return c.InferenceGateway.Enabled && strings.EqualFold(strings.TrimSpace(c.Execution.Mode), "gateway")
+}
+
+func applyRecoveryPolicyDefaults(policy *RecoveryPolicyConfig) {
+	if policy == nil {
+		return
+	}
+	if strings.TrimSpace(policy.UnknownFailure) == "" {
+		policy.UnknownFailure = "attention"
+	}
+	if len(policy.Actions) == 0 {
+		policy.Actions = map[string]string{
+			"agent.transient_network":                "retry",
+			"agent.provider_rate_limited":            "retry",
+			"agent.provider_unavailable":             "retry",
+			"agent.process_crashed":                  "retry",
+			"agent.incomplete_turn":                  "retry_turn",
+			"agent.auth_failed":                      "attention",
+			"agent.context_window_exceeded":          "attention",
+			"agent.looping":                          "attention",
+			"agent.no_effective_progress":            "attention",
+			"agent.domain_boundary_violation":        "attention",
+			"agent.tool_failure_cluster":             "attention",
+			"supervisor.restart_budget_exhausted":    "attention",
+			"integration.directive_execution_failed": "reopen_node",
+			"integration.directive_timeout":          "reopen_node",
+			"integration.prepare_failed":             "attention",
+			"integration.workspace_prepare_failed":   "attention",
+			"integration.manifest_invalid":           "attention",
+			"integration.contract_binding_invalid":   "attention",
+			"integration.missing_contract":           "attention",
+		}
+	}
+	if len(policy.MaxAttempts) == 0 {
+		policy.MaxAttempts = map[string]int{
+			"agent.transient_network":                2,
+			"agent.provider_rate_limited":            2,
+			"agent.provider_unavailable":             2,
+			"agent.process_crashed":                  3,
+			"agent.incomplete_turn":                  1,
+			"integration.directive_execution_failed": 2,
+			"integration.directive_timeout":          2,
+		}
+	}
+}
+
+func validateRecoveryPolicy(policy RecoveryPolicyConfig) error {
+	allowed := map[string]bool{"wait": true, "retry": true, "retry_turn": true, "reopen_node": true, "rerun_integration": true, "attention": true, "none": true}
+	for code, action := range policy.Actions {
+		if !allowed[strings.TrimSpace(action)] {
+			return fmt.Errorf("coordination.recovery.actions[%q] must be a known recovery action", code)
+		}
+	}
+	for code, attempts := range policy.MaxAttempts {
+		if attempts < 0 || attempts > 5 {
+			return fmt.Errorf("coordination.recovery.max_attempts[%q] must be between 0 and 5", code)
+		}
+	}
+	if !allowed[strings.TrimSpace(policy.UnknownFailure)] {
+		return fmt.Errorf("coordination.recovery.unknown_failure must be a known recovery action")
+	}
+	return nil
 }
