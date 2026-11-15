@@ -169,6 +169,17 @@ func (w *bubblewrapWorkspace) prepareWorkspaceRoot() error {
 	if err := os.MkdirAll(w.workspaceRoot, 0o700); err != nil {
 		return fmt.Errorf("isolation: create workspace root: %w", err)
 	}
+	if w.policy.WorkspaceSkeleton {
+		skip := make([]string, 0, len(w.mounts))
+		for _, mount := range w.mounts {
+			if pathWithin(mount.mount.Target, "/workspace") && mount.mount.Target != "/workspace" {
+				skip = append(skip, strings.TrimPrefix(mount.mount.Target, "/workspace/"))
+			}
+		}
+		if err := copyWorkspaceSkeleton(w.policy.SourceRoot, w.workspaceRoot, w.policy.DeniedSources, skip); err != nil {
+			return err
+		}
+	}
 	for _, mount := range w.mounts {
 		if !pathWithin(mount.mount.Target, "/workspace") || mount.mount.Target == "/workspace" {
 			continue
@@ -500,4 +511,78 @@ func (w *bubblewrapWorkspace) Close() error {
 		closeErr = errors.Join(closeErr, err)
 	}
 	return closeErr
+}
+
+// copyWorkspaceSkeleton materializes a read-only view of the project for
+// executors that must inspect the project without owning it. Denied sources and
+// workspace mount targets are omitted; writable mounts overlay the skeleton.
+func copyWorkspaceSkeleton(sourceRoot, destination string, denied []string, skipTargets []string) error {
+	sourceRoot = strings.TrimSpace(sourceRoot)
+	if sourceRoot == "" {
+		return fmt.Errorf("isolation: workspace skeleton requires source_root")
+	}
+	cleanDenied := make([]string, 0, len(denied))
+	for _, entry := range denied {
+		if entry = strings.TrimSpace(entry); entry != "" {
+			cleanDenied = append(cleanDenied, filepath.Clean(entry))
+		}
+	}
+	skip := make(map[string]bool, len(skipTargets))
+	for _, target := range skipTargets {
+		target = filepath.ToSlash(filepath.Clean(strings.TrimSpace(target)))
+		if target != "" && target != "." {
+			skip[target] = true
+		}
+	}
+	return filepath.WalkDir(sourceRoot, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return fmt.Errorf("isolation: walk workspace skeleton: %w", walkErr)
+		}
+		rel, err := filepath.Rel(sourceRoot, path)
+		if err != nil || rel == "." {
+			return nil
+		}
+		relSlash := filepath.ToSlash(rel)
+		for skipped := range skip {
+			if relSlash == skipped || strings.HasPrefix(relSlash, skipped+"/") {
+				if entry.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+		}
+		for _, deniedPath := range cleanDenied {
+			if pathWithin(path, deniedPath) {
+				if entry.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		target := filepath.Join(destination, filepath.FromSlash(relSlash))
+		if entry.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return fmt.Errorf("isolation: stat workspace skeleton %q: %w", path, err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("isolation: read workspace skeleton %q: %w", path, err)
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return fmt.Errorf("isolation: create workspace skeleton parent: %w", err)
+		}
+		if err := os.WriteFile(target, data, info.Mode().Perm()); err != nil {
+			return fmt.Errorf("isolation: write workspace skeleton %q: %w", target, err)
+		}
+		return nil
+	})
 }

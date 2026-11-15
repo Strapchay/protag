@@ -41,6 +41,7 @@ type Policy struct {
 	DeniedSources      []string          `json:"denied_sources,omitempty"`
 	Writable           []Mount           `json:"writable,omitempty"`
 	ReadOnly           []Mount           `json:"read_only,omitempty"`
+	WorkspaceSkeleton  bool              `json:"workspace_skeleton,omitempty"`
 	Environment        map[string]string `json:"environment,omitempty"`
 	InheritEnvironment []string          `json:"inherit_environment,omitempty"`
 }
