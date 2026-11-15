@@ -24,6 +24,9 @@ cd kernel && go build -o skills/orchestrator-cli/bin/orchestrator-cli ./cmd/orch
 | `contract-accept-terms` | `--contract-id`, `--revision` | Accept the latest terms revision |
 | `contract-terms` | `--contract-id` | Read terms proposal history |
 | `contract-standstill` | `--contract-id`, `--revision`, `--reason` | Request bounded Coordinator reconciliation |
+| `resolution-list` | none | Operator: list reconciliation lineages |
+| `resolution-show` | `--id` | Operator: inspect one reconciliation lineage |
+| `resolution-retry` | `--id` | Operator: retry an `AwaitingUser` lineage |
 | `contract-wait` | `--contract-id`; optional `--clear` | Declare or clear a hard wait |
 | `contract-status` | `--contract-id` | Read one durable contract |
 | `contract-list` | none | List visible durable contracts |

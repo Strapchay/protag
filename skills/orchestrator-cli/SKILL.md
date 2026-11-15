@@ -115,6 +115,17 @@ request's message ID with `--message-id`; the kernel rejects validation without
 an acknowledged request from the consumer to the producer naming the contract
 resource.
 
+The kernel automatically opens one reconciliation lineage when both contract
+participants stay idle without contract progress for the configured deadlock
+window. Agents do not call or manage that path.
+
+### Operator-only reconciliation commands
+
+`resolution-list`, `resolution-show --id <id>`, and
+`resolution-retry --id <id>` are host-operator commands. They are rejected when
+called with an agent capability. `resolution-retry` reopens an `AwaitingUser`
+lineage with a fresh bounded budget; agents must not use these commands.
+
 Every mutation is capability-authorized and idempotent. Use a stable `--command-id` when retrying after a transport failure. Publishing requires the revision you observed in `--expected-revision`; stale writers are rejected.
 Publication is also rejected while the latest terms revision is not accepted
 by both participants. A standstill pauses only the affected nodes while the

@@ -355,3 +355,68 @@ func (s *Server) afterCoordinationMutation(reason string) {
 		go s.progressChangedCb(reason)
 	}
 }
+
+func (s *Server) operatorResolutionRequest(req Request) error {
+	if s.capabilities == nil {
+		return nil
+	}
+	if agentID, ok := s.capabilities.resolve(req.Capability); ok && strings.TrimSpace(agentID) != "" {
+		return fmt.Errorf("resolution commands are operator-only; agent %s cannot manage reconciliation", agentID)
+	}
+	return nil
+}
+
+func (s *Server) handleResolutionList(req Request) Response {
+	if err := s.operatorResolutionRequest(req); err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	if s.coordination == nil {
+		return Response{ID: req.ID, Error: "coordination manager is unavailable"}
+	}
+	resolutions, err := s.coordination.ListResolutions(context.Background())
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	return Response{ID: req.ID, Result: map[string]interface{}{"resolutions": resolutions}}
+}
+
+func (s *Server) handleResolutionShow(req Request) Response {
+	if err := s.operatorResolutionRequest(req); err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	if s.coordination == nil {
+		return Response{ID: req.ID, Error: "coordination manager is unavailable"}
+	}
+	var params struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.ID) == "" {
+		return Response{ID: req.ID, Error: "resolution-show requires --id <resolution-id>"}
+	}
+	resolution, err := s.coordination.GetResolution(context.Background(), params.ID)
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	return Response{ID: req.ID, Result: resolution}
+}
+
+func (s *Server) handleResolutionRetry(req Request) Response {
+	if err := s.operatorResolutionRequest(req); err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	if s.coordination == nil {
+		return Response{ID: req.ID, Error: "coordination manager is unavailable"}
+	}
+	var params struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.ID) == "" {
+		return Response{ID: req.ID, Error: "resolution-retry requires --id <resolution-id>"}
+	}
+	resolution, err := s.coordination.RetryResolution(context.Background(), params.ID)
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	s.afterCoordinationMutation("coordination_resolution_retry")
+	return Response{ID: req.ID, Result: resolution}
+}

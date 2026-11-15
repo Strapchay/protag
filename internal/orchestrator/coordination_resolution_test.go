@@ -246,3 +246,30 @@ func validResolutionOutput(id string) resolutionOutputArtifact {
 		Terms: resolutionTermsOutput{Details: coordination.ContractDetails{Name: "Lookup", Kind: "api"}},
 	}
 }
+
+func TestResolutionTemplateCarriesContractDetails(t *testing.T) {
+	input := &resolutionInputArtifact{
+		Resolution: coordination.Resolution{ID: "res_template"},
+		Contract: coordination.Contract{Details: coordination.ContractDetails{
+			Name: "alpha-public-api", Kind: "interface", Language: "python",
+			PublicEntrypoint: "from alpha import Ledger", HandshakeRequired: true,
+		}},
+	}
+	data, err := resolutionTemplateData(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var candidate resolutionOutputArtifact
+	if err := json.Unmarshal(data, &candidate); err != nil {
+		t.Fatalf("template is not valid JSON: %v", err)
+	}
+	if candidate.Type != "aion_contract_resolution" || candidate.ResolutionID != "res_template" {
+		t.Fatalf("template identity = %#v", candidate)
+	}
+	if candidate.Terms.Details.Name != "alpha-public-api" || !candidate.Terms.Details.HandshakeRequired {
+		t.Fatalf("template details = %#v", candidate.Terms.Details)
+	}
+	if len(candidate.Evidence) == 0 || len(candidate.Actions) == 0 {
+		t.Fatalf("template placeholders = %#v", candidate)
+	}
+}

@@ -326,3 +326,21 @@ func TestPiCoordinator_Refine_NotStarted(t *testing.T) {
 		t.Error("expected error when refining without starting architect")
 	}
 }
+
+func TestResolutionPromptUsesSealedTemplate(t *testing.T) {
+	prompt := resolutionPrompt(ResolutionRequest{})
+	for _, want := range []string{
+		"/workspace/artifacts/resolution_input.json",
+		"/workspace/artifacts/resolution_template.json",
+		"/workspace/artifacts/resolution_output.json",
+		"Keep the exact type, resolution_id, and terms.details",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("resolution prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	repair := resolutionPrompt(ResolutionRequest{Repair: true, ValidationError: "bad candidate"})
+	if !strings.Contains(repair, "bad candidate") || !strings.Contains(repair, "resolution_template.json") {
+		t.Fatalf("repair prompt = %s", repair)
+	}
+}

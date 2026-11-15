@@ -66,6 +66,7 @@ coordination:
   max_context_expansions: ${AION_COORDINATION_MAX_CONTEXT_EXPANSIONS}
   lease_timeout_sec: ${AION_COORDINATION_LEASE_TIMEOUT_SEC}
   artifact_timeout_sec: ${AION_COORDINATION_ARTIFACT_TIMEOUT_SEC}
+  deadlock_timeout_sec: ${AION_COORDINATION_DEADLOCK_TIMEOUT_SEC}
 
 isolation:
   # Mandatory domain-agent sandbox backend; no production passthrough exists

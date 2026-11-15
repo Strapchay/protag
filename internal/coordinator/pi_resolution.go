@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	resolutionSandboxRoot    = "/workspace"
-	resolutionSandboxSession = "/state/pi"
+	resolutionSandboxRoot      = "/workspace"
+	resolutionSandboxArtifacts = "/workspace/artifacts"
+	resolutionSandboxSession   = "/state/pi"
 )
 
 // ResolveContract runs one short-lived, source-blind coordinator turn. The
@@ -49,11 +50,15 @@ func (c *PiCoordinator) ResolveContract(ctx context.Context, req ResolutionReque
 
 	policy := cloneIsolationPolicy(c.config.ResolutionPolicy)
 	policy.ID = "resolution-" + sanitizeResolutionID(req.ResolutionID)
-	policy.WorkingDir = resolutionSandboxRoot
+	policy.WorkingDir = resolutionSandboxArtifacts
 	policy.Hostname = "coordinator-resolution"
 	policy.Network = isolation.NetworkIsolated
+	// Workspace mounts must be strict descendants of a source root; the
+	// sandbox owns /workspace itself and exposes only the sealed artifact
+	// directory beneath it.
+	policy.SourceRoot = filepath.Dir(artifactDir)
 	policy.Writable = append(policy.Writable,
-		isolation.Mount{Source: artifactDir, Target: resolutionSandboxRoot, Kind: isolation.MountDirectory},
+		isolation.Mount{Source: artifactDir, Target: resolutionSandboxArtifacts, Kind: isolation.MountDirectory},
 		isolation.Mount{Source: sessionDir, Target: resolutionSandboxSession, Kind: isolation.MountDirectory},
 	)
 
@@ -71,7 +76,7 @@ func (c *PiCoordinator) ResolveContract(ctx context.Context, req ResolutionReque
 		IsolationPolicy:  policy,
 		PiAgent: supervisor.PiAgentConfig{
 			Binary: c.config.ResolutionBinary, SessionDir: resolutionSandboxSession, HostSessionDir: sessionDir,
-			WorkingDir: resolutionSandboxRoot, Provider: "aion-gateway", Endpoint: "http://unix",
+			WorkingDir: resolutionSandboxArtifacts, Provider: "aion-gateway", Endpoint: "http://unix",
 			Model: c.config.Model, SkillPaths: c.config.ResolutionSkillPaths,
 			ExtensionPaths: c.config.ResolutionExtensionPaths,
 			Env: append(processEnv,
@@ -105,9 +110,9 @@ func resolutionPrompt(req ResolutionRequest) string {
 		return fmt.Sprintf(`The prior resolution artifact failed deterministic validation:
 %s
 
-Read /workspace/resolution_input.json and overwrite /workspace/resolution_output.json with one valid JSON object matching its output_schema. Do not answer in chat. Do not inspect paths outside /workspace.`, strings.TrimSpace(req.ValidationError))
+The artifact directory contains /workspace/artifacts/resolution_input.json and /workspace/artifacts/resolution_template.json. Read both, then overwrite /workspace/artifacts/resolution_output.json with the template copied and its placeholder fields replaced by concrete values. Keep the exact type, resolution_id, and terms.details from the template. Do not explore other paths. Do not answer in chat. Write the file immediately.`, strings.TrimSpace(req.ValidationError))
 	}
-	return `Read /workspace/resolution_input.json. Produce exactly one reconciliation candidate at /workspace/resolution_output.json matching output_schema. Use only the public artifacts in that input. Ownership is immutable: do not reassign domains, agents, or existing paths. Do not answer in chat.`
+	return `The artifact directory contains /workspace/artifacts/resolution_input.json and /workspace/artifacts/resolution_template.json. Read both with the read tool. Copy the template to /workspace/artifacts/resolution_output.json and replace its placeholder rationale, evidence, actions, producer/consumer obligations, tradeoffs, and risks with concrete values from the input. Keep the exact type, resolution_id, and terms.details from the template. Ownership is immutable. Do not explore other paths. Do not answer in chat. Write the file immediately.`
 }
 
 func waitForStableResolutionArtifact(ctx context.Context, path string, timeout time.Duration) error {

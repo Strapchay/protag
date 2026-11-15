@@ -122,6 +122,11 @@ func (d *Daemon) runNextCoordinationResolution() error {
 	if err := os.WriteFile(inputPath, inputData, 0o600); err != nil {
 		return d.failResolutionProcess(resolution, err)
 	}
+	if templateData, templateErr := resolutionTemplateData(input); templateErr == nil {
+		if err := os.WriteFile(filepath.Join(artifactDir, "resolution_template.json"), templateData, 0o600); err != nil {
+			return d.failResolutionProcess(resolution, err)
+		}
+	}
 	if _, err := d.coordinationManager.RecordResolutionInput(d.ctx, resolution.ID, resolution.LeaseToken, inputData); err != nil {
 		return d.failResolutionProcess(resolution, err)
 	}
@@ -318,6 +323,27 @@ func resolutionOutputSchema() map[string]interface{} {
 		},
 		"add_nodes": []interface{}{}, "add_edges": []interface{}{}, "remove_edges": []interface{}{}, "risks": []string{},
 	}
+}
+
+func resolutionTemplateData(input *resolutionInputArtifact) ([]byte, error) {
+	if input == nil {
+		return nil, fmt.Errorf("coordination: resolution input is required")
+	}
+	template := resolutionOutputArtifact{
+		Type:         "aion_contract_resolution",
+		ResolutionID: input.Resolution.ID,
+		Rationale:    "Replace with one sentence describing the reconciliation decision.",
+		Evidence:     []string{"Replace with one item of public evidence from the sealed input."},
+		Actions:      []resolutionAction{{Kind: "decide", Summary: "Replace with one observable action summary."}},
+		Terms: resolutionTermsOutput{
+			Details:             input.Contract.Details,
+			ProducerObligations: []string{"Replace with the producer obligation."},
+			ConsumerObligations: []string{"Replace with the consumer obligation."},
+			Tradeoffs:           []string{"Replace with the accepted tradeoff."},
+		},
+		Risks: []string{"Replace with one residual risk."},
+	}
+	return json.MarshalIndent(template, "", "  ")
 }
 
 func (d *Daemon) validateResolutionCandidate(resolution *coordination.Resolution, data []byte) (*resolutionOutputArtifact, *dag.DagData, error) {

@@ -450,6 +450,16 @@ func parseCommand(command string, args []string) (map[string]interface{}, error)
 		}
 		return map[string]interface{}{"contract_id": flags["contract-id"]}, nil
 
+	case "resolution-list":
+		return nil, nil
+
+	case "resolution-show", "resolution-retry":
+		id := flags["id"]
+		if id == "" {
+			return nil, fmt.Errorf("%s requires --id <resolution-id>", command)
+		}
+		return map[string]interface{}{"id": id}, nil
+
 	case "contract-standstill":
 		contractID := flags["contract-id"]
 		revision, err := requiredPositiveRevision(flags, "contract-standstill")
@@ -904,6 +914,9 @@ Commands:
 	contract-accept-terms  --contract-id <id> --revision <N>
 	contract-terms         --contract-id <id>
 	contract-standstill    --contract-id <id> --revision <N> --reason <text> [--terminal] [--evidence '["..."]']
+	resolution-list        List coordinator reconciliation lineages
+	resolution-show        --id <resolution-id> Show one reconciliation lineage
+	resolution-retry       --id <resolution-id> Retry an AwaitingUser reconciliation
 	contract-wait     --contract-id <id> [--clear]
 	contract-cancel   --contract-id <id> [--reason <text>]
 	contract-fail     --contract-id <id> [--reason <text>]

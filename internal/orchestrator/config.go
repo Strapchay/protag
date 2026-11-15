@@ -35,6 +35,7 @@ type CoordinationConfig struct {
 	MaxContextExpansions int `yaml:"max_context_expansions"`
 	LeaseTimeoutSec      int `yaml:"lease_timeout_sec"`
 	ArtifactTimeoutSec   int `yaml:"artifact_timeout_sec"`
+	DeadlockTimeoutSec   int `yaml:"deadlock_timeout_sec"`
 }
 
 // IsolationConfig configures the mandatory domain-agent process boundary.
@@ -458,6 +459,9 @@ func applyDefaults(c *Config) {
 	if c.Coordination.ArtifactTimeoutSec == 0 {
 		c.Coordination.ArtifactTimeoutSec = 180
 	}
+	if c.Coordination.DeadlockTimeoutSec == 0 {
+		c.Coordination.DeadlockTimeoutSec = 300
+	}
 	if strings.TrimSpace(c.Isolation.Backend) == "" {
 		c.Isolation.Backend = "bubblewrap"
 	}
@@ -583,6 +587,9 @@ func validateConfig(c *Config) error {
 	}
 	if c.Coordination.LeaseTimeoutSec < 30 || c.Coordination.ArtifactTimeoutSec < 30 {
 		return fmt.Errorf("coordination lease and artifact timeouts must be at least 30 seconds")
+	}
+	if c.Coordination.DeadlockTimeoutSec < 10 || c.Coordination.DeadlockTimeoutSec > 3600 {
+		return fmt.Errorf("coordination.deadlock_timeout_sec must be between 10 and 3600")
 	}
 	if c.InferenceGateway.RetryBaseDelayMS < 1 {
 		return fmt.Errorf("inference_gateway.retry_base_delay_ms must be >= 1")

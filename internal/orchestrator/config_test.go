@@ -143,8 +143,19 @@ func TestConfigDefaults(t *testing.T) {
 	if config.InferenceGateway.UpstreamTimeoutSec != 300 {
 		t.Fatalf("unexpected gateway upstream timeout default: %d", config.InferenceGateway.UpstreamTimeoutSec)
 	}
-	if config.Coordination.LeaseTimeoutSec != 180 || config.Coordination.ArtifactTimeoutSec != 180 {
+	if config.Coordination.LeaseTimeoutSec != 180 || config.Coordination.ArtifactTimeoutSec != 180 || config.Coordination.DeadlockTimeoutSec != 300 {
 		t.Fatalf("unexpected coordination timeout defaults: %#v", config.Coordination)
+	}
+}
+
+func TestConfigRejectsInvalidDeadlockTimeout(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "invalid-deadlock.yaml")
+	if err := os.WriteFile(path, []byte("coordination:\n  deadlock_timeout_sec: 5\n"), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("expected deadlock_timeout_sec validation error")
 	}
 }
 

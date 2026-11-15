@@ -857,6 +857,12 @@ func (s *Server) handleRequest(req Request) Response {
 		return s.handleContractTerms(req)
 	case "contract-standstill":
 		return s.handleContractStandstill(req)
+	case "resolution-list":
+		return s.handleResolutionList(req)
+	case "resolution-show":
+		return s.handleResolutionShow(req)
+	case "resolution-retry":
+		return s.handleResolutionRetry(req)
 	case "contract-wait":
 		return s.handleContractWait(req)
 	case "contract-cancel":

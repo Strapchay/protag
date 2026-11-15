@@ -24,12 +24,17 @@ func (d *Daemon) startCoordinationEffectLoop() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		d.drainCoordinationEffects()
+		tick := 0
 		for {
 			select {
 			case <-d.ctx.Done():
 				return
 			case <-ticker.C:
+				tick++
 				d.expireCoordinationContracts()
+				if tick%coordinationDeadlockScanTicks == 0 {
+					d.scanCoordinationDeadlocks(time.Now().UTC())
+				}
 				d.drainCoordinationEffects()
 				d.processNextCoordinationResolution()
 			}
