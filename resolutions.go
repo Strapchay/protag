@@ -665,3 +665,106 @@ func randomToken() (string, error) {
 	}
 	return hex.EncodeToString(buffer), nil
 }
+
+// EscalateDeadlock creates one kernel-initiated resolution when a contract has
+// made no progress and its participants are idle. It intentionally differs
+// from DeclareStandstill: the kernel is not a contract participant, terms may
+// already be agreed, and the negotiation round limit is irrelevant. Automatic
+// escalation is one-shot per contract lineage; any existing resolution is
+// returned so a resolved or operator-cancelled lineage cannot loop.
+func (m *Manager) EscalateDeadlock(ctx context.Context, contractID, reason string, evidence []string, now time.Time) (*Resolution, bool, error) {
+	contractID = strings.TrimSpace(contractID)
+	reason = strings.TrimSpace(reason)
+	if contractID == "" || reason == "" {
+		return nil, false, fmt.Errorf("coordination: contract ID and deadlock reason are required")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("coordination: begin deadlock escalation: %w", err)
+	}
+	defer tx.Rollback()
+	contract, err := getContractTx(ctx, tx, contractID)
+	if err != nil {
+		return nil, false, err
+	}
+	if contract.Status.Terminal() {
+		return nil, false, fmt.Errorf("coordination: terminal contract %s cannot enter reconciliation", contract.ID)
+	}
+	var existing Resolution
+	scanErr := scanResolution(tx.QueryRowContext(ctx, `SELECT `+resolutionColumns+` FROM resolutions
+		WHERE contract_id=? ORDER BY created_at DESC, resolution_id DESC LIMIT 1`, contract.ID), &existing)
+	if scanErr == nil {
+		return &existing, false, nil
+	}
+	if !errors.Is(scanErr, sql.ErrNoRows) {
+		return nil, false, scanErr
+	}
+	terms, err := latestTermsTx(ctx, tx, contract.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	resolution := Resolution{
+		ID: resolutionIdentity(contract.ID, terms.Revision), ContractID: contract.ID,
+		TermsRevision: terms.Revision, Status: ResolutionPending,
+		Reason: reason, Evidence: cleanStrings(evidence),
+		AffectedNodeIDs:  cleanStrings([]string{contract.ProducerNodeID, contract.ConsumerNodeID}),
+		SemanticAttempts: 1, MaxProcessAttempts: m.options.MaxProcessAttempts,
+		MaxRepairAttempts: m.options.MaxRepairAttempts, MaxContextExpansions: m.options.MaxContextExpansions,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := insertResolution(ctx, tx, resolution); err != nil {
+		return nil, false, err
+	}
+	payload, _ := json.Marshal(resolution)
+	if err := insertEffect(ctx, tx, Effect{ID: effectID("deadlock:"+resolution.ID, EffectResolutionRequested, resolution.ID),
+		ContractID: contract.ID, Type: EffectResolutionRequested, Payload: payload, CreatedAt: now, NextAttemptAt: now}); err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, fmt.Errorf("coordination: commit deadlock escalation: %w", err)
+	}
+	return &resolution, true, nil
+}
+
+// RetryResolution grants an operator-directed retry to an AwaitingUser
+// resolution. All bounded process, repair, and expansion budgets are reset so
+// the retry cannot immediately fall back into user review.
+func (m *Manager) RetryResolution(ctx context.Context, resolutionID string) (*Resolution, error) {
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var resolution Resolution
+	if err := scanResolution(tx.QueryRowContext(ctx, `SELECT `+resolutionColumns+` FROM resolutions WHERE resolution_id=?`,
+		strings.TrimSpace(resolutionID)), &resolution); err != nil {
+		return nil, err
+	}
+	if resolution.Status != ResolutionAwaitingUser {
+		return nil, fmt.Errorf("coordination: resolution %s is %s, not AwaitingUser", resolution.ID, resolution.Status)
+	}
+	now := time.Now().UTC()
+	resolution.Status = ResolutionPending
+	resolution.ProcessAttempts = 0
+	resolution.RepairAttempts = 0
+	resolution.ContextExpansions = 0
+	resolution.ValidationError = ""
+	resolution.TerminalReason = ""
+	resolution.LeaseToken = ""
+	resolution.LeaseExpiresAt = nil
+	resolution.UpdatedAt = now
+	if _, err := tx.ExecContext(ctx, `UPDATE resolutions SET status=?, process_attempts=0, repair_attempts=0,
+        context_expansions=0, lease_token=NULL, lease_expires_at=NULL, validation_error=NULL,
+        terminal_reason=NULL, updated_at=? WHERE resolution_id=?`, ResolutionPending, formatTime(now), resolution.ID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &resolution, nil
+}
