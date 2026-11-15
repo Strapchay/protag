@@ -1,4 +1,4 @@
-.PHONY: build test test-scenarios test-scenarios-shard test-scenarios-process test-scenarios-race test-scenarios-live clean proto flatbuf install-tools lint vet
+.PHONY: build test test-scenarios test-scenarios-shard test-scenarios-process test-scenarios-race test-scenarios-live test-scenarios-flake clean proto flatbuf install-tools lint vet
 
 # Binary output
 BIN_DIR := bin
@@ -65,6 +65,9 @@ test-scenarios-race:
 
 test-scenarios-live: build
 	AION_LIVE_SCENARIO=1 AION_KERNEL_BIN=$(CURDIR)/bin/aion-kernel AION_KERNEL_CONFIG=$(CURDIR)/configs/aion.yaml $(GOTEST) -tags=scenario_live ./scenario -run '^TestLive' -timeout 20m -count=1
+
+test-scenarios-flake:
+	RUNS=$${RUNS:-3} MODE=$${MODE:-deterministic} RACE=$${RACE:-0} ./scripts/scenario-flake.sh
 
 test-coverage:
 	$(GOTEST) -coverprofile=coverage.out ./...
