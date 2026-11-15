@@ -58,7 +58,7 @@ test-scenarios-shard:
 	AION_SCENARIO_SHARD=$${SHARD:-0} AION_SCENARIO_SHARDS=$${SHARDS:-1} $(GOTEST) -tags=scenario ./internal/orchestrator -run '^TestScenario' -count=1
 
 test-scenarios-process: build
-	AION_PROCESS_SCENARIO=1 AION_KERNEL_BIN=$(CURDIR)/bin/aion-kernel AION_KERNEL_CONFIG=$(CURDIR)/configs/aion.yaml $(GOTEST) -tags=scenario_process ./scenario -run '^TestProcessScenario' -count=1
+	AION_PROCESS_SCENARIO=1 AION_KERNEL_BIN=$(CURDIR)/bin/aion-kernel AION_KERNEL_CONFIG=$(CURDIR)/configs/aion.yaml $(GOTEST) -tags=scenario_process ./scenario -run '^TestProcess' -count=1
 
 test-scenarios-race:
 	$(GOTEST) -race -tags=scenario ./internal/orchestrator -run '^TestScenario' -count=1
