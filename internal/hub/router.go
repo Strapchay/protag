@@ -248,3 +248,18 @@ func (r *Router) RegisteredAgentCount() int {
 	defer r.mu.RUnlock()
 	return len(r.agents)
 }
+
+// Deliver routes one message without dead-letter buffering or internal retries.
+// The durable message registry owns retry and recovery for peer messages.
+func (r *Router) Deliver(msg Message) error {
+	if msg.ToAgent == "" {
+		return fmt.Errorf("hub: message type %s requires a target agent", msg.Type)
+	}
+	r.mu.RLock()
+	deliverer, ok := r.agents[msg.ToAgent]
+	r.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("hub: agent %s is not available", msg.ToAgent)
+	}
+	return deliverer.DeliverContext(msg)
+}

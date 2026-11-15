@@ -22,6 +22,7 @@ import (
 	"aion-kernel/internal/hub"
 	"aion-kernel/internal/locking"
 	"aion-kernel/internal/memory"
+	"aion-kernel/internal/messaging"
 )
 
 // Request represents a JSON-RPC-style request from orchestrator-cli.
@@ -51,6 +52,9 @@ type Server struct {
 	logsDir      string
 
 	hubCallback                func(hub.Message) // called when hub messages need routing
+	messageStore               *messaging.Store
+	messageDeliver             func(hub.Message) error
+	messageWake                chan struct{}
 	replanCb                   func()
 	reviveCb                   func(string) error
 	resetAgentSessionCb        func(string, string) error
@@ -165,6 +169,46 @@ func (s *Server) SetLogLevel(level string) {
 // SetHubCallback sets the function called when hub messages need routing.
 func (s *Server) SetHubCallback(cb func(hub.Message)) {
 	s.hubCallback = cb
+}
+
+// SetMessageStore installs the durable peer-message registry.
+func (s *Server) SetMessageStore(store *messaging.Store) {
+	s.mu.Lock()
+	s.messageStore = store
+	s.mu.Unlock()
+}
+
+// SetMessageDeliverer installs the synchronous delivery function used by the
+// durable message loop.
+func (s *Server) SetMessageDeliverer(fn func(hub.Message) error) {
+	s.mu.Lock()
+	s.messageDeliver = fn
+	s.mu.Unlock()
+}
+
+// DeliverMessage invokes the configured durable-message deliverer.
+func (s *Server) DeliverMessage(msg hub.Message) error {
+	s.mu.Lock()
+	fn := s.messageDeliver
+	s.mu.Unlock()
+	if fn == nil {
+		return fmt.Errorf("message delivery is not configured")
+	}
+	return fn(msg)
+}
+
+// WakeMessageDelivery nudges the outbox without waiting for its next tick.
+func (s *Server) WakeMessageDelivery() {
+	s.mu.Lock()
+	wake := s.messageWake
+	s.mu.Unlock()
+	if wake == nil {
+		return
+	}
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
 }
 
 func (s *Server) SetReplanCallback(cb func()) {
@@ -846,6 +890,14 @@ func (s *Server) handleRequest(req Request) Response {
 		return s.handleQueryMemory(req)
 	case "send-message":
 		return s.handleSendMessage(req)
+	case "message-status":
+		return s.handleMessageStatus(req)
+	case "message-list":
+		return s.handleMessageList(req)
+	case "message-inbox":
+		return s.handleMessageInbox(req)
+	case "message-ack", "message-update":
+		return s.handleMessageAck(req)
 	case "architect-status":
 		return s.handleArchitectStatus(req)
 	case "architect-retry":
@@ -1018,15 +1070,21 @@ func (s *Server) ClearHubHistory() {
 
 func (s *Server) handleSendMessage(req Request) Response {
 	var params struct {
-		AgentID string `json:"agent_id"`
-		Text    string `json:"text"`
+		AgentID    string `json:"agent_id"`
+		Text       string `json:"text"`
+		ExpectsAck bool   `json:"expects_ack,omitempty"`
+		ReplyTo    string `json:"reply_to,omitempty"`
 	}
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return Response{ID: req.ID, Error: err.Error()}
 	}
+	target := strings.TrimSpace(params.AgentID)
+	if target == "" {
+		return Response{ID: req.ID, Error: "send-message requires --agent-id"}
+	}
 
-	// Intercept /build-spec command if addressed to orchestrator
-	if params.AgentID == "orchestrator" {
+	// Intercept /build-spec command if addressed to orchestrator.
+	if target == "orchestrator" {
 		const prefix = "/build-spec"
 		if strings.HasPrefix(params.Text, prefix) {
 			if s.buildSpecCb != nil {
@@ -1035,8 +1093,6 @@ func (s *Server) handleSendMessage(req Request) Response {
 				return Response{ID: req.ID, Result: map[string]string{"status": "build_initiated"}}
 			}
 		}
-
-		// Otherwise, it's a refinement message
 		if s.refineCb != nil {
 			log.Printf("server: user message sent to architect: %s", params.Text)
 			go s.refineCb(params.Text)
@@ -1044,12 +1100,153 @@ func (s *Server) handleSendMessage(req Request) Response {
 		}
 	}
 
+	sender := "user"
+	if agentID, ok := s.capabilities.resolve(req.Capability); ok && strings.TrimSpace(agentID) != "" {
+		sender = agentID
+	}
+	kind := messaging.KindNotify
+	if strings.TrimSpace(params.ReplyTo) != "" {
+		kind = messaging.KindAck
+	} else if params.ExpectsAck {
+		kind = messaging.KindRequest
+	}
+	message := messaging.Message{
+		ID:        fmt.Sprintf("msg-%d", time.Now().UnixNano()),
+		FromAgent: sender,
+		ToAgent:   target,
+		Kind:      kind,
+		ReplyTo:   strings.TrimSpace(params.ReplyTo),
+		Payload:   params.Text,
+	}
+	if s.messageStore != nil {
+		if err := s.messageStore.Submit(context.Background(), message); err != nil {
+			return Response{ID: req.ID, Error: err.Error()}
+		}
+		s.WakeMessageDelivery()
+		return Response{ID: req.ID, Result: map[string]string{
+			"status": "queued", "message_id": message.ID, "from_agent": sender,
+			"to_agent": target, "kind": kind, "transport_state": messaging.TransportQueued,
+		}}
+	}
+
 	if s.hubCallback != nil {
-		log.Printf("server: user intervention sent to agent %s: %s", params.AgentID, params.Text)
-		msg, _ := hub.NewMessage(hub.MsgContextShare, "user", params.AgentID, params.Text)
+		msg, _ := hub.NewMessage(hub.MsgContextShare, sender, target, params.Text)
+		msg.ID = message.ID
 		s.hubCallback(*msg)
 	}
-	return Response{ID: req.ID, Result: map[string]string{"status": "sent"}}
+	return Response{ID: req.ID, Result: map[string]string{
+		"status": "sent", "message_id": message.ID, "from_agent": sender, "to_agent": target, "kind": kind,
+	}}
+}
+
+func (s *Server) handleMessageStatus(req Request) Response {
+	var params struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.ID) == "" {
+		return Response{ID: req.ID, Error: "message-status requires --id"}
+	}
+	if s.messageStore == nil {
+		return Response{ID: req.ID, Error: "message store is unavailable"}
+	}
+	message, err := s.messageStore.Status(context.Background(), params.ID)
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	return Response{ID: req.ID, Result: message}
+}
+
+func (s *Server) handleMessageList(req Request) Response {
+	var params struct {
+		FromMe         bool   `json:"from_me"`
+		ToMe           bool   `json:"to_me"`
+		AgentID        string `json:"agent_id"`
+		State          string `json:"state"`
+		TransportState string `json:"transport_state"`
+		Limit          int    `json:"limit"`
+	}
+	_ = json.Unmarshal(req.Params, &params)
+	if s.messageStore == nil {
+		return Response{ID: req.ID, Error: "message store is unavailable"}
+	}
+	agentID, ok := s.capabilities.resolve(req.Capability)
+	filter := messaging.ListFilter{
+		FromAgent:      strings.TrimSpace(params.AgentID),
+		ActorState:     strings.TrimSpace(params.State),
+		TransportState: strings.TrimSpace(params.TransportState),
+		Limit:          params.Limit,
+	}
+	if ok && strings.TrimSpace(agentID) != "" {
+		if params.FromMe || (!params.ToMe && filter.FromAgent == "") {
+			filter.FromAgent = agentID
+		}
+		if params.ToMe {
+			filter.FromAgent = ""
+			filter.ToAgent = agentID
+		}
+	}
+	messages, err := s.messageStore.List(context.Background(), filter)
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	return Response{ID: req.ID, Result: map[string]any{"messages": messages}}
+}
+
+func (s *Server) handleMessageInbox(req Request) Response {
+	if s.messageStore == nil {
+		return Response{ID: req.ID, Error: "message store is unavailable"}
+	}
+	agentID, ok := s.capabilities.resolve(req.Capability)
+	if !ok || strings.TrimSpace(agentID) == "" {
+		return Response{ID: req.ID, Error: "message-inbox requires an agent capability"}
+	}
+	var params struct {
+		State string `json:"state"`
+	}
+	_ = json.Unmarshal(req.Params, &params)
+	state := strings.TrimSpace(params.State)
+	if state == "" {
+		state = messaging.ActorAwaitingAck
+	}
+	messages, err := s.messageStore.List(context.Background(), messaging.ListFilter{
+		ToAgent: agentID, ActorState: state, Limit: 100,
+	})
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	return Response{ID: req.ID, Result: map[string]any{"messages": messages}}
+}
+
+func (s *Server) handleMessageAck(req Request) Response {
+	var params struct {
+		ID    string `json:"id"`
+		State string `json:"state"`
+		Note  string `json:"note"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.ID) == "" {
+		return Response{ID: req.ID, Error: "message-ack requires --id"}
+	}
+	if s.messageStore == nil {
+		return Response{ID: req.ID, Error: "message store is unavailable"}
+	}
+	agentID, ok := s.capabilities.resolve(req.Capability)
+	if !ok || strings.TrimSpace(agentID) == "" {
+		return Response{ID: req.ID, Error: "message-ack requires an agent capability"}
+	}
+	message, err := s.messageStore.Status(context.Background(), params.ID)
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	if message.ToAgent != agentID {
+		return Response{ID: req.ID, Error: "message-ack target does not match the caller"}
+	}
+	if message.Kind != messaging.KindRequest {
+		return Response{ID: req.ID, Error: "only request messages require an actor acknowledgement"}
+	}
+	if err := s.messageStore.Ack(context.Background(), params.ID, params.State, params.Note); err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	return Response{ID: req.ID, Result: map[string]string{"status": "updated", "message_id": params.ID, "actor_state": params.State}}
 }
 
 func (s *Server) handleArchitectStatus(req Request) Response {

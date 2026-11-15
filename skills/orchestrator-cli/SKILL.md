@@ -230,3 +230,35 @@ reading outside the workspace.
 8. **Escalate bounded standstills.** Counter or accept terms until the configured limit; use `contract-standstill` only with concrete evidence. Never request ownership changes.
 9. **Honor the work inbox.** Process only `work-inbox --current`; never reorder work from transcript memory.
 10. **Yield hard waits.** Ensure the contract, checkpoint the consumer item, and end the turn rather than polling.
+
+### Peer message status and acknowledgement
+
+`send-message` returns a durable `message_id`. Messages are either `notify`
+(transport only) or `request` (`--expects-ack`). A request is not complete until
+the recipient explicitly acknowledges it.
+
+Sender commands:
+
+```bash
+orchestrator-cli send-message --agent-id agent-ledger --text "..." --expects-ack
+orchestrator-cli message-status --id <message-id>
+orchestrator-cli message-list --from-me --state awaiting_ack
+```
+
+Recipient commands:
+
+```bash
+orchestrator-cli message-inbox --state awaiting_ack
+orchestrator-cli message-ack --id <message-id> --state acknowledged --note "received"
+orchestrator-cli message-update --id <message-id> --state in_progress|completed|failed --note "..."
+```
+
+When a delivered ContextShare has `kind=request`, acknowledge it with
+`message-ack` before ending the turn or starting the requested work. Use
+`message-update` for later progress and completion. If an agent respawns,
+recover inbound requests with `message-inbox` and outbound requests with
+`message-list --from-me`; do not rely on transcript memory.
+
+Peer messages are durable for the lifetime of the run. There is no wall-clock
+TTL; terminal rows are pruned by count, so a paused or hibernated run does not
+lose open requests.

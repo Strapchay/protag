@@ -42,6 +42,8 @@ type PiCoordinator struct {
 	resolutionMu       sync.Mutex
 	resolutionProgress func()
 	resolutionEnvFn    func() ([]string, error)
+	architectMu        sync.Mutex
+	architectEnvFn     func() ([]string, error)
 	lastUserText       string
 }
 
@@ -250,20 +252,27 @@ func (c *PiCoordinator) StartArchitect(ctx context.Context) error {
 		},
 	}
 	if c.config.ArchitectIsolationEngine != nil {
+		processEnv, err := c.architectProcessEnv()
+		if err != nil {
+			return fmt.Errorf("pi_coordinator: issue architect credential: %w", err)
+		}
 		agentConfig.IsolationEngine = c.config.ArchitectIsolationEngine
 		agentConfig.IsolationPolicy = c.config.ArchitectPolicy
+		agentConfig.PrepareGenerationEnv = func(uint64) ([]string, error) {
+			return c.architectCapabilityEnv()
+		}
 		agentConfig.PiAgent = supervisor.PiAgentConfig{
 			Binary:         c.config.ArchitectBinary,
 			SessionDir:     "/state/pi",
 			HostSessionDir: agentDir,
 			ResumeSession:  start.Resumed,
 			WorkingDir:     "/workspace",
-			Provider:       c.config.Provider,
+			Provider:       "aion-gateway",
 			Model:          c.config.Model,
-			Endpoint:       c.config.Endpoint,
+			Endpoint:       "http://unix",
 			SkillPaths:     c.config.ArchitectSkillPaths,
 			ExtensionPaths: c.config.ArchitectExtensionPaths,
-			Env: append(c.config.ArchitectEnv,
+			Env: append(processEnv,
 				"AION_AGENT_ID=orchestrator",
 				"AION_DOMAIN_ID=architect",
 			),
@@ -390,6 +399,33 @@ func (c *PiCoordinator) SetResolutionEnvFunc(fn func() ([]string, error)) {
 	c.resolutionMu.Lock()
 	c.resolutionEnvFn = fn
 	c.resolutionMu.Unlock()
+}
+
+// SetArchitectEnvFunc installs the kernel-owned credential issuer for the
+// isolated Solution Architect process.
+func (c *PiCoordinator) SetArchitectEnvFunc(fn func() ([]string, error)) {
+	c.architectMu.Lock()
+	c.architectEnvFn = fn
+	c.architectMu.Unlock()
+}
+
+func (c *PiCoordinator) architectCapabilityEnv() ([]string, error) {
+	c.architectMu.Lock()
+	fn := c.architectEnvFn
+	c.architectMu.Unlock()
+	if fn == nil {
+		return nil, nil
+	}
+	return fn()
+}
+
+func (c *PiCoordinator) architectProcessEnv() ([]string, error) {
+	env := append([]string(nil), c.config.ArchitectEnv...)
+	extra, err := c.architectCapabilityEnv()
+	if err != nil {
+		return nil, err
+	}
+	return append(env, extra...), nil
 }
 
 func (c *PiCoordinator) resolutionProcessEnv() ([]string, error) {

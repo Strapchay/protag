@@ -585,7 +585,61 @@ func parseCommand(command string, args []string) (map[string]interface{}, error)
 		if text == "" {
 			return nil, fmt.Errorf("send-message requires --text <message>")
 		}
-		return map[string]interface{}{"agent_id": agentID, "text": text}, nil
+		params := map[string]interface{}{"agent_id": agentID, "text": text}
+		if hasFlag(os.Args[2:], "--expects-ack") {
+			params["expects_ack"] = true
+		}
+		if replyTo := flags["reply-to"]; replyTo != "" {
+			params["reply_to"] = replyTo
+		}
+		return params, nil
+
+	case "message-status":
+		id := flags["id"]
+		if id == "" {
+			return nil, fmt.Errorf("message-status requires --id <message-id>")
+		}
+		return map[string]interface{}{"id": id}, nil
+
+	case "message-list":
+		params := map[string]interface{}{}
+		for _, name := range []string{"agent-id", "state", "transport-state"} {
+			if value := flags[name]; value != "" {
+				params[strings.ReplaceAll(name, "-", "_")] = value
+			}
+		}
+		if limit := flags["limit"]; limit != "" {
+			var parsed int
+			if _, err := fmt.Sscanf(limit, "%d", &parsed); err == nil {
+				params["limit"] = parsed
+			}
+		}
+		if hasFlag(os.Args[2:], "--from-me") {
+			params["from_me"] = true
+		}
+		if hasFlag(os.Args[2:], "--to-me") {
+			params["to_me"] = true
+		}
+		return params, nil
+
+	case "message-inbox":
+		params := map[string]interface{}{}
+		if state := flags["state"]; state != "" {
+			params["state"] = state
+		}
+		return params, nil
+
+	case "message-ack", "message-update":
+		id := flags["id"]
+		state := flags["state"]
+		if id == "" || state == "" {
+			return nil, fmt.Errorf("%s requires --id <message-id> --state <state>", command)
+		}
+		params := map[string]interface{}{"id": id, "state": state}
+		if note := flags["note"]; note != "" {
+			params["note"] = note
+		}
+		return params, nil
 
 	case "debug-status":
 		return map[string]interface{}{}, nil
@@ -839,6 +893,11 @@ Commands:
   split-node      --node-id <uuid> --into '<json>'
   read-dag        [--node-id <uuid>]
   heartbeat       --agent-id <uuid>
+  message-status  --id <message-id>
+  message-list    [--from-me|--to-me] [--state <state>] [--limit N]
+  message-inbox   [--state <state>]
+  message-ack     --id <message-id> --state <state> [--note <text>]
+  message-update  --id <message-id> --state <state> [--note <text>]
   query-memory    --text <query> [--top-k N]
   debug-status    Print server/run/hub/DAG/agent diagnostics [--pretty|-p] [--key <field>]
   build-progress  Print current build-spec progress projection

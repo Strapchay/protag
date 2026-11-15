@@ -20,6 +20,7 @@ import (
 	"aion-kernel/internal/hub"
 	"aion-kernel/internal/locking"
 	"aion-kernel/internal/memory"
+	"aion-kernel/internal/messaging"
 	"aion-kernel/internal/supervisor"
 )
 
@@ -30,6 +31,7 @@ type Daemon struct {
 	dagManager               *dag.Manager
 	lockManager              *locking.Manager
 	coordinationManager      *coordinationruntime.Manager
+	messages                 *messaging.Store
 	workInbox                *WorkInboxService
 	hubRouter                *hub.Router
 	allocator                *Allocator
@@ -167,8 +169,18 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 		})
 	}
 
+	messageStore, err := messaging.Open(filepath.Join(runState.Root, "messaging", "messages.db"))
+	if err != nil {
+		_ = coordinationManager.Close()
+		_ = dagMgr.Close()
+		return nil, fmt.Errorf("daemon: init message registry: %w", err)
+	}
+	_ = messageStore.PruneTerminal(context.Background(), 1000)
+
 	// Initialize Server
 	server := NewServer(dagMgr, lockMgr, coordinationManager, memStore)
+	server.SetMessageStore(messageStore)
+	server.SetMessageDeliverer(func(msg hub.Message) error { return hubRouter.Deliver(msg) })
 	server.SetWorkInboxService(workInbox)
 	server.SetLogsDir(runState.LogsDir)
 	server.SetLogLevel(config.Orchestrator.LogLevel)
@@ -203,6 +215,7 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 		dagManager:          dagMgr,
 		lockManager:         lockMgr,
 		coordinationManager: coordinationManager,
+		messages:            messageStore,
 		workInbox:           workInbox,
 		hubRouter:           hubRouter,
 		allocator:           alloc,
@@ -1049,16 +1062,22 @@ func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunSta
 		architectReadOnly := append([]isolation.Mount{}, binaryMounts...)
 		architectReadOnly = append(architectReadOnly, skillMounts...)
 		architectReadOnly = append(architectReadOnly, extensionMounts...)
+		architectReadOnly = append(architectReadOnly, isolation.Mount{Source: ipcDir, Target: agentIPCMountPath, Kind: isolation.MountDirectory})
+		architectReadOnly = withoutMountTarget(architectReadOnly, "/runtime/bin/orchestrator-cli")
 		piConfig.ArchitectIsolationEngine = engine
 		piConfig.ArchitectPolicy = isolation.Policy{
-			ID:         "architect",
-			WorkingDir: "/workspace",
-			Hostname:   "architect",
-			Network:    isolation.NetworkShared,
-			SourceRoot: projectRoot,
+			ID:                "architect",
+			WorkingDir:        "/workspace",
+			Hostname:          "architect",
+			Network:           isolation.NetworkIsolated,
+			SourceRoot:        projectRoot,
+			WorkspaceSkeleton: true,
 			DeniedSources: []string{
 				filepath.Join(projectRoot, ".aion"),
 				filepath.Join(projectRoot, ".git"),
+				filepath.Join(projectRoot, ".agents"),
+				filepath.Join(projectRoot, ".codex"),
+				filepath.Join(projectRoot, ".env"),
 			},
 			Writable: []isolation.Mount{
 				docsMount,
@@ -1076,17 +1095,13 @@ func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunSta
 			architectProfile = config.InferenceGateway.TargetProfile
 		}
 		architectProvider := targetProviderForCoordinator(config, infConfig)
-		architectGatewayURL := config.InferenceGateway.PublicBaseURL
-		if architectGatewayURL == "" {
-			architectGatewayURL = "http://" + config.InferenceGateway.ListenAddr
-		}
 		piConfig.ArchitectBinary = binary
 		piConfig.ArchitectSkillPaths = skills
 		piConfig.ArchitectExtensionPaths = extensions
 		piConfig.ArchitectEnv = []string{
 			"AION_INFERENCE_GATEWAY_ENABLED=true",
-			"AION_INFERENCE_GATEWAY_URL=" + architectGatewayURL,
-			"AION_INFERENCE_GATEWAY_KEY=" + config.InferenceGateway.GatewayKey,
+			"AION_INFERENCE_SOCKET=" + agentInferenceSocket,
+			"AION_INFERENCE_GATEWAY_KEY=unix-capability",
 			"AION_TARGET_PROVIDER=" + architectProvider,
 			"AION_TARGET_PROFILE=" + architectProfile,
 			"AION_TARGET_MODEL=" + model,
@@ -1111,6 +1126,41 @@ func configureResolutionCapability(piCoord *coordinator.PiCoordinator, server *S
 		return
 	}
 	piCoord.SetResolutionEnvFunc(resolutionCapabilityIssuer(server, config))
+	piCoord.SetArchitectEnvFunc(architectCapabilityIssuer(server, config))
+}
+
+func architectCapabilityIssuer(server *Server, config *Config) func() ([]string, error) {
+	providerConfig := config.Inference.Coordinator
+	profileName := providerConfig.UseProfile
+	if profileName == "" {
+		profileName = config.InferenceGateway.TargetProfile
+	}
+	model := providerConfig.Model
+	if profile, ok := config.Inference.Models[providerConfig.UseProfile]; ok && profile.Model != "" {
+		model = profile.Model
+	}
+	provider := targetProviderForCoordinator(config, providerConfig)
+	return func() ([]string, error) {
+		capability, err := server.IssueAgentRuntimeCapability(AgentCapabilityPolicy{
+			AgentID: "orchestrator", DomainID: "architect", Profile: profileName,
+			Provider: provider, Model: model,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []string{"AION_AGENT_CAPABILITY=" + capability}, nil
+	}
+}
+
+func withoutMountTarget(mounts []isolation.Mount, target string) []isolation.Mount {
+	filtered := mounts[:0]
+	for _, mount := range mounts {
+		if mount.Target == target {
+			continue
+		}
+		filtered = append(filtered, mount)
+	}
+	return filtered
 }
 
 func resolutionCapabilityIssuer(server *Server, config *Config) func() ([]string, error) {
@@ -1212,6 +1262,7 @@ func (d *Daemon) Start() error {
 		}
 	}
 
+	go d.messageDeliveryLoop(d.ctx)
 	log.Printf("daemon: aion-kernel ready")
 	return nil
 }
@@ -1338,6 +1389,18 @@ func (d *Daemon) ResetCurrentRun() error {
 	d.hubRouter = hubRouter
 	d.allocator = alloc
 	d.coordinator = coord
+	if d.messages != nil {
+		_ = d.messages.Close()
+	}
+	newMessages, err := messaging.Open(filepath.Join(newRun.Root, "messaging", "messages.db"))
+	if err != nil {
+		d.coordinationEffectMu.Unlock()
+		return fmt.Errorf("daemon: reset message registry: %w", err)
+	}
+	_ = newMessages.PruneTerminal(context.Background(), 1000)
+	d.messages = newMessages
+	d.server.SetMessageStore(newMessages)
+	d.server.SetMessageDeliverer(func(msg hub.Message) error { return hubRouter.Deliver(msg) })
 	d.runState = newRun
 	d.auditor.dagManager = dagMgr
 	d.auditor.lockManager = lockMgr
@@ -1422,6 +1485,11 @@ func (d *Daemon) Shutdown() {
 	if d.coordinationManager != nil {
 		if err := d.coordinationManager.Close(); err != nil {
 			log.Printf("daemon: close coordination manager: %v", err)
+		}
+	}
+	if d.messages != nil {
+		if err := d.messages.Close(); err != nil {
+			log.Printf("daemon: close message registry: %v", err)
 		}
 	}
 
@@ -1674,5 +1742,59 @@ func (d *Daemon) handleReplan(msg hub.Message) {
 		if err := d.dagManager.AddEdge(newEdge); err != nil {
 			log.Printf("daemon: replan apply edge error: %v", err)
 		}
+	}
+}
+
+const maxMessageAttempts = 5
+
+func (d *Daemon) messageDeliveryLoop(ctx context.Context) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.deliverPendingMessages(ctx)
+		}
+	}
+}
+
+func (d *Daemon) deliverPendingMessages(ctx context.Context) {
+	if d == nil || d.messages == nil || d.server == nil {
+		return
+	}
+	pending, err := d.messages.Pending(ctx, 50)
+	if err != nil {
+		log.Printf("daemon: list pending messages: %v", err)
+		return
+	}
+	for _, message := range pending {
+		payload := map[string]string{
+			"text":       message.Payload,
+			"kind":       message.Kind,
+			"reply_to":   message.ReplyTo,
+			"message_id": message.ID,
+		}
+		hubMessage, err := hub.NewMessage(hub.MsgContextShare, message.FromAgent, message.ToAgent, payload)
+		if err != nil {
+			_ = d.messages.DeadLetter(ctx, message.ID, err)
+			continue
+		}
+		hubMessage.ID = message.ID
+		if err := d.server.DeliverMessage(*hubMessage); err != nil {
+			if message.Attempts+1 >= maxMessageAttempts {
+				_ = d.messages.DeadLetter(ctx, message.ID, err)
+				continue
+			}
+			shift := message.Attempts
+			if shift > 5 {
+				shift = 5
+			}
+			backoff := time.Duration(1<<shift) * time.Second
+			_ = d.messages.MarkRetry(ctx, message.ID, time.Now().UTC().Add(backoff), err)
+			continue
+		}
+		_ = d.messages.MarkDelivered(ctx, message.ID)
 	}
 }
