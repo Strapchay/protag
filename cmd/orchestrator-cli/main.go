@@ -378,6 +378,9 @@ func parseCommand(command string, args []string) (map[string]interface{}, error)
 			return nil, fmt.Errorf("contract-validate requires --contract-id <id> --revision <N>")
 		}
 		result := map[string]interface{}{"contract_id": contractID, "revision": revision}
+		if messageID := flags["message-id"]; messageID != "" {
+			result["message_id"] = messageID
+		}
 		if evidence := flags["evidence"]; evidence != "" {
 			var decoded interface{}
 			if err := json.Unmarshal([]byte(evidence), &decoded); err != nil {
@@ -895,7 +898,7 @@ Commands:
 	contract-ensure   --producer-node <id> --consumer-node <id> --resource <name> [--details '<json>'|--details-file <path>] [--wait]
 	contract-publish  --contract-id <id> --artifact-file <path> [--expected-revision N]
 	contract-fetch    --contract-id <id> [--revision N] --output <file-path>
-	contract-validate --contract-id <id> --revision <N> [--evidence '<json>']
+	contract-validate --contract-id <id> --revision <N> [--evidence '<json>'] [--message-id <id>]
 	contract-correct  --contract-id <id> --revision <N> --reason <text>
 	contract-propose-terms --contract-id <id> --revision <N> --terms '<json>' --rationale <text>
 	contract-accept-terms  --contract-id <id> --revision <N>

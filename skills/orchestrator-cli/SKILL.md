@@ -84,7 +84,7 @@ orchestrator-cli contract-publish --contract-id <id> --artifact-file <path> --ex
 orchestrator-cli contract-fetch --contract-id <id> --revision 1 --output /tmp/aion-contract-<id>-r1.json
 
 # Consumer accepts it or requests a corrected revision.
-orchestrator-cli contract-validate --contract-id <id> --revision 1 --evidence '{"tests":"passed"}'
+orchestrator-cli contract-validate --contract-id <id> --revision 1 --evidence '{"tests":"passed"}' --message-id <acknowledged-request-id>
 orchestrator-cli contract-correct --contract-id <id> --revision 1 --reason <text>
 
 # Either participant can propose a bounded tradeoff before publication.
@@ -109,6 +109,11 @@ orchestrator-cli contract-list
 orchestrator-cli contract-fail --contract-id <id> --reason <text>
 orchestrator-cli contract-cancel --contract-id <id> --reason <text>
 ```
+
+If the consumer node task requires a peer handshake, pass the acknowledged
+request's message ID with `--message-id`; the kernel rejects validation without
+an acknowledged request from the consumer to the producer naming the contract
+resource.
 
 Every mutation is capability-authorized and idempotent. Use a stable `--command-id` when retrying after a transport failure. Publishing requires the revision you observed in `--expected-revision`; stale writers are rejected.
 Publication is also rejected while the latest terms revision is not accepted

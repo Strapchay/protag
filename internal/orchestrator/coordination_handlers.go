@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	coordination "aion-coordination"
+	"aion-kernel/internal/messaging"
 )
 
 func (s *Server) coordinationPrincipal(agentID string) coordination.Principal {
@@ -128,16 +129,76 @@ func (s *Server) handleContractValidate(req Request) Response {
 	if err != nil {
 		return Response{ID: req.ID, Error: err.Error()}
 	}
-	var command coordination.ValidateCommand
-	if err := json.Unmarshal(req.Params, &command); err != nil {
+	var params struct {
+		coordination.ValidateCommand
+		MessageID string `json:"message_id,omitempty"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return Response{ID: req.ID, Error: fmt.Sprintf("invalid params: %v", err)}
 	}
-	contract, err := s.coordination.Validate(context.Background(), principal, command)
+	command := params.ValidateCommand
+	ctx := context.Background()
+	existing, err := s.coordination.Get(ctx, principal, command.ContractID)
+	if err != nil {
+		return Response{ID: req.ID, Error: err.Error()}
+	}
+	if taskSpec := s.contractConsumerTaskSpec(existing.ConsumerNodeID); nodeRequiresPeerHandshake(taskSpec) {
+		if strings.TrimSpace(params.MessageID) == "" {
+			return Response{ID: req.ID, Error: "contract validation requires an acknowledged peer request; pass --message-id <id>"}
+		}
+		if s.messageStore == nil {
+			return Response{ID: req.ID, Error: "contract validation handshake gate is unavailable"}
+		}
+		message, err := s.messageStore.Status(ctx, params.MessageID)
+		if err != nil {
+			return Response{ID: req.ID, Error: "contract validation handshake: " + err.Error()}
+		}
+		if !messageSatisfiesContractHandshake(message, existing) {
+			return Response{ID: req.ID, Error: "contract validation requires an acknowledged request from the consumer to the producer naming this contract resource"}
+		}
+	}
+	contract, err := s.coordination.Validate(ctx, principal, command)
 	if err != nil {
 		return Response{ID: req.ID, Error: err.Error()}
 	}
 	s.afterCoordinationMutation("contract_fulfilled")
 	return Response{ID: req.ID, Result: contract}
+}
+
+func (s *Server) contractConsumerTaskSpec(nodeID string) string {
+	if s == nil || s.dagManager == nil || strings.TrimSpace(nodeID) == "" {
+		return ""
+	}
+	for _, node := range s.dagManager.Snapshot().Nodes {
+		if node.ID == nodeID {
+			return node.TaskSpec
+		}
+	}
+	return ""
+}
+
+func nodeRequiresPeerHandshake(taskSpec string) bool {
+	lower := strings.ToLower(taskSpec)
+	return strings.Contains(lower, "--expects-ack") || strings.Contains(lower, "consumer plan")
+}
+
+func messageSatisfiesContractHandshake(message messaging.Message, contract *coordination.Contract) bool {
+	if contract == nil || message.Kind != messaging.KindRequest {
+		return false
+	}
+	if message.FromAgent != contract.ConsumerAgentID || message.ToAgent != contract.ProducerAgentID {
+		return false
+	}
+	switch message.ActorState {
+	case messaging.ActorAcked, messaging.ActorInProgress, messaging.ActorCompleted:
+	default:
+		return false
+	}
+	resource := strings.ToLower(strings.TrimSpace(contract.Details.Name))
+	if resource == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(message.Payload), resource)
 }
 
 func (s *Server) handleContractCorrect(req Request) Response {

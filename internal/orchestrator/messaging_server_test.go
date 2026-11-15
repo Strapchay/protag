@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	coordination "aion-coordination"
 	"aion-kernel/internal/messaging"
 )
 
@@ -173,5 +174,30 @@ func TestMessageStatusWaitRejectsExcessiveTimeout(t *testing.T) {
 	response := server.handleMessageStatus(Request{ID: "status-timeout", Params: params})
 	if response.Error == "" {
 		t.Fatal("excessive message wait was accepted")
+	}
+}
+
+func TestContractHandshakeHelpers(t *testing.T) {
+	if !nodeRequiresPeerHandshake("Send CONSUMER PLAN with --expects-ack before validation") {
+		t.Fatal("handshake task was not detected")
+	}
+	if nodeRequiresPeerHandshake("Implement the ledger package") {
+		t.Fatal("plain task was misclassified")
+	}
+	contract := &coordination.Contract{
+		ConsumerAgentID: "agent-report",
+		ProducerAgentID: "agent-ledger",
+		Details:         coordination.ContractDetails{Name: "ledger-validation-rules"},
+	}
+	message := messaging.Message{
+		Kind: messaging.KindRequest, FromAgent: "agent-report", ToAgent: "agent-ledger",
+		ActorState: messaging.ActorAcked, Payload: "CONSUMER PLAN | ledger-validation-rules",
+	}
+	if !messageSatisfiesContractHandshake(message, contract) {
+		t.Fatal("valid handshake was rejected")
+	}
+	message.ActorState = messaging.ActorAwaitingAck
+	if messageSatisfiesContractHandshake(message, contract) {
+		t.Fatal("unacknowledged handshake was accepted")
 	}
 }
