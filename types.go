@@ -36,18 +36,19 @@ type Principal struct {
 }
 
 type ContractDetails struct {
-	Name               string          `json:"name"`
-	Kind               string          `json:"kind"`
-	Language           string          `json:"language,omitempty"`
-	PublicEntrypoint   string          `json:"public_entrypoint,omitempty"`
-	Signature          json.RawMessage `json:"signature,omitempty"`
-	Preconditions      []string        `json:"preconditions,omitempty"`
-	Postconditions     []string        `json:"postconditions,omitempty"`
-	ErrorBehavior      []string        `json:"error_behavior,omitempty"`
-	Compatibility      string          `json:"compatibility,omitempty"`
-	Acceptance         []string        `json:"acceptance,omitempty"`
-	IntegrationFixture json.RawMessage `json:"integration_fixture,omitempty"`
-	HandshakeRequired  bool            `json:"handshake_required,omitempty"`
+	Name                 string          `json:"name"`
+	Kind                 string          `json:"kind"`
+	Language             string          `json:"language,omitempty"`
+	PublicEntrypoint     string          `json:"public_entrypoint,omitempty"`
+	Signature            json.RawMessage `json:"signature,omitempty"`
+	Preconditions        []string        `json:"preconditions,omitempty"`
+	Postconditions       []string        `json:"postconditions,omitempty"`
+	ErrorBehavior        []string        `json:"error_behavior,omitempty"`
+	Compatibility        string          `json:"compatibility,omitempty"`
+	Acceptance           []string        `json:"acceptance,omitempty"`
+	IntegrationFixture   json.RawMessage `json:"integration_fixture,omitempty"`
+	HandshakeRequired    bool            `json:"handshake_required,omitempty"`
+	SupersedesContractID string          `json:"supersedes_contract_id,omitempty"`
 }
 
 type TermsStatus string
