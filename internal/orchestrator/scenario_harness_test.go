@@ -63,8 +63,9 @@ func (c *scenarioCoordinator) ReviewBuild(_ context.Context, req coordinator.Bui
 	if review.err != nil {
 		return nil, review.err
 	}
+	output := []byte(strings.ReplaceAll(string(review.output), "__ATTEMPT_ID__", req.AttemptID))
 	path := filepath.Join(req.ArtifactDir, "acceptance_output.json")
-	if err := os.WriteFile(path, review.output, 0o644); err != nil {
+	if err := os.WriteFile(path, output, 0o644); err != nil {
 		return nil, err
 	}
 	return &coordinator.BuildReviewResult{OutputPath: path}, nil
@@ -193,6 +194,7 @@ func (h *scenarioHarness) Close() {
 		}
 		target := filepath.Join(root, sanitizeScenarioName(h.result.Name)+"-"+time.Now().UTC().Format("20060102T150405"))
 		if err := copyScenarioDir(h.daemon.runState.Root, target); err == nil {
+			_ = copyScenarioDir(filepath.Join(h.daemon.projectRoot, "docs", "aion"), filepath.Join(target, "docs-aion"))
 			h.result.Artifacts = target
 			h.writeReportAt(target)
 		}
@@ -274,6 +276,27 @@ func loadScenarioFixture(t *testing.T, name string) scenarioFixture {
 	return fixture
 }
 
+func seedAcceptanceScenario(h *scenarioHarness, fixture scenarioFixture) *BuildSpecAttempt {
+	h.t.Helper()
+	h.WriteBuildSpec(fixture.BuildSpec)
+	attempt := newBuildSpecAttempt(h.daemon.runState.RunID, "docs/build_spec.md", []byte(fixture.BuildSpec))
+	attempt.Status = BuildSpecAttemptActive
+	attempt.Plan = fixture.Plan
+	for _, node := range fixture.Plan.Nodes {
+		h.t.Helper()
+		if err := h.daemon.dagManager.AddNode(dag.DagNode{
+			ID: node.ID, DomainID: node.DomainID, TaskSpec: node.TaskSpec, Status: dag.StatusDone,
+			TargetFiles: node.TargetFiles, Priority: node.Priority,
+		}); err != nil {
+			h.t.Fatal(err)
+		}
+	}
+	if err := saveBuildSpecAttempt(h.daemon.runState.Root, attempt); err != nil {
+		h.t.Fatal(err)
+	}
+	return attempt
+}
+
 func eventually(t *testing.T, timeout, interval time.Duration, condition func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -322,6 +345,27 @@ func scenarioRegistry() []scenarioCase {
 				}
 			},
 		},
+		{
+			Name: "acceptance-complete",
+			Run: func(h *scenarioHarness) {
+				fixture := loadScenarioFixture(h.t, "acceptance-complete")
+				attempt := seedAcceptanceScenario(h, fixture)
+				complete, err := h.daemon.reviewBuildAcceptance(attempt)
+				if err != nil || !complete {
+					h.t.Fatalf("acceptance complete=%v err=%v", complete, err)
+				}
+				loaded, err := loadBuildSpecAttempt(h.daemon.runState.Root)
+				if err != nil {
+					h.t.Fatal(err)
+				}
+				if loaded.AcceptanceStatus != "passed" {
+					h.t.Fatalf("acceptance status = %s", loaded.AcceptanceStatus)
+				}
+				if _, err := os.Stat(loaded.AcceptanceReviewPath); err != nil {
+					h.t.Fatalf("acceptance review artifact: %v", err)
+				}
+			},
+		},
 	}
 }
 
@@ -333,12 +377,16 @@ func TestScenarioRegistry(t *testing.T) {
 			continue
 		}
 		t.Run(tc.Name, func(t *testing.T) {
-			if tc.Name == "fixture-smoke" {
+			switch tc.Name {
+			case "fixture-smoke":
 				loaded := loadScenarioFixture(t, "smoke")
 				runScenario(t, tc, scenarioCoordinatorFromFixture(loaded))
-				return
+			case "acceptance-complete":
+				loaded := loadScenarioFixture(t, "acceptance-complete")
+				runScenario(t, tc, scenarioCoordinatorFromFixture(loaded))
+			default:
+				runScenario(t, tc, &scenarioCoordinator{plan: &coordinator.PlanResponse{}})
 			}
-			runScenario(t, tc, &scenarioCoordinator{plan: &coordinator.PlanResponse{}})
 		})
 	}
 }

@@ -1,0 +1,26 @@
+{
+  "build_spec": "# Acceptance Complete\n\nOne domain fixture.\n",
+  "plan": {
+    "domains": [
+      {"domain_id": "alpha", "description": "fixture domain", "assigned_paths": ["alpha/"], "agent_type": "domain"}
+    ],
+    "nodes": [
+      {"id": "alpha-node", "domain_id": "alpha", "task_spec": "fixture node", "target_files": ["alpha/file.py"], "priority": 1}
+    ],
+    "edges": [],
+    "contracts": []
+  },
+  "reviews": [
+    {
+      "type": "aion_build_acceptance",
+      "attempt_id": "__ATTEMPT_ID__",
+      "verdict": "complete",
+      "contract_impact": "none",
+      "summary": "All fixture requirements are implemented and evidenced.",
+      "requirements": [
+        {"id": "R1", "status": "met", "evidence": "fixture node is Done and the source fixture is present.", "node_ids": ["alpha-node"]}
+      ],
+      "risks": []
+    }
+  ]
+}
