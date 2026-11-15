@@ -1,4 +1,4 @@
-.PHONY: build test clean proto flatbuf install-tools lint vet
+.PHONY: build test test-scenarios clean proto flatbuf install-tools lint vet
 
 # Binary output
 BIN_DIR := bin
@@ -50,6 +50,9 @@ test-unit:
 
 test-integration:
 	$(GOTEST) -run Integration ./...
+
+test-scenarios:
+	$(GOTEST) -tags=scenario ./internal/orchestrator -run '^TestScenario' -count=1
 
 test-coverage:
 	$(GOTEST) -coverprofile=coverage.out ./...
