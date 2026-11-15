@@ -343,6 +343,9 @@ func (d *Daemon) resumeBuildWorkAfterAcceptance(attempt *BuildSpecAttempt) error
 	if d == nil || attempt == nil {
 		return nil
 	}
+	if d.workResumeFn != nil {
+		return d.workResumeFn(attempt)
+	}
 	attempt.Status = BuildSpecAttemptActive
 	live := d.allocator.AgentInfos()
 	if len(live) == 0 {

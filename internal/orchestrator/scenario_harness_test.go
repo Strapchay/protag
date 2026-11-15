@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	coordination "aion-coordination"
 	"aion-kernel/internal/coordinator"
 	"aion-kernel/internal/dag"
 	"aion-kernel/internal/hub"
@@ -133,11 +134,15 @@ func newScenarioHarness(t *testing.T, coordinatorImpl coordinator.Coordinator) *
 		t.Fatal(err)
 	}
 	router := hub.NewRouter(run.LogsDir)
+	manager, err := coordination.Open(coordination.Options{StateDir: filepath.Join(root, "coordination")})
+	if err != nil {
+		t.Fatal(err)
+	}
 	allocator := NewAllocator(cfg, root, router, dagManager)
-	server := NewServer(dagManager, nil, nil, nil)
+	server := NewServer(dagManager, nil, manager, nil)
 	daemon := &Daemon{
 		config: cfg, dagManager: dagManager, allocator: allocator, server: server,
-		hubRouter: router, projectRoot: root, runState: run, ctx: context.Background(),
+		coordinationManager: manager, hubRouter: router, projectRoot: root, runState: run, ctx: context.Background(),
 	}
 	if coordinatorImpl != nil {
 		daemon.coordinator = coordinatorImpl
@@ -175,6 +180,9 @@ func (h *scenarioHarness) Close() {
 	_ = h.daemon.server.Stop()
 	if h.daemon.dagManager != nil {
 		_ = h.daemon.dagManager.Close()
+	}
+	if h.daemon.coordinationManager != nil {
+		_ = h.daemon.coordinationManager.Close()
 	}
 	if h.daemon.hubRouter != nil {
 		h.daemon.hubRouter.Close()
@@ -367,6 +375,109 @@ func scenarioRegistry() []scenarioCase {
 			},
 		},
 		{
+			Name: "acceptance-retry-cycle",
+			Run: func(h *scenarioHarness) {
+				fixture := loadScenarioFixture(h.t, "acceptance-retry-cycle")
+				attempt := seedAcceptanceScenario(h, fixture)
+				h.daemon.workResumeFn = func(*BuildSpecAttempt) error {
+					return h.daemon.dagManager.UpdateNode("alpha-node", dag.StatusDone)
+				}
+				complete, err := h.daemon.reviewBuildAcceptance(attempt)
+				if err != nil || complete {
+					h.t.Fatalf("first retry review complete=%v err=%v", complete, err)
+				}
+				if attempt.AcceptanceStatus != "retry" || attempt.AcceptanceRounds != 1 {
+					h.t.Fatalf("retry state = %s/%d", attempt.AcceptanceStatus, attempt.AcceptanceRounds)
+				}
+				complete, err = h.daemon.reviewBuildAcceptance(attempt)
+				if err != nil || !complete {
+					h.t.Fatalf("second review complete=%v err=%v", complete, err)
+				}
+				if attempt.AcceptanceStatus != "passed" {
+					h.t.Fatalf("final acceptance = %s", attempt.AcceptanceStatus)
+				}
+				coordinator, ok := h.daemon.coordinator.(*scenarioCoordinator)
+				if !ok || coordinator.reviewCall != 2 {
+					h.t.Fatalf("review calls = %#v", coordinator)
+				}
+			},
+		},
+		{
+			Name: "acceptance-successor-contract",
+			Run: func(h *scenarioHarness) {
+				fixture := loadScenarioFixture(h.t, "acceptance-complete")
+				attempt := seedAcceptanceScenario(h, fixture)
+				attempt.Plan.Domains = append(attempt.Plan.Domains, coordinator.Domain{DomainID: "beta", AssignedPaths: []string{"beta/"}})
+				if err := saveBuildSpecAttempt(h.daemon.runState.Root, attempt); err != nil {
+					h.t.Fatal(err)
+				}
+				candidate := buildAcceptanceCandidate{
+					Type: "aion_build_acceptance", AttemptID: attempt.AttemptID, Verdict: "successor",
+					Summary:      "Add the follow-on result contract.",
+					Requirements: []buildAcceptanceRequirement{{ID: "R3", Status: "missing", Evidence: "A follow-on contract is required."}},
+					AddNodes: []coordinator.TaskNode{
+						{ID: "alpha-result", DomainID: "alpha", TaskSpec: "Publish result", TargetFiles: []string{"alpha/result.py"}, OriginNodeID: "alpha-node", Priority: 1},
+						{ID: "beta-result", DomainID: "beta", TaskSpec: "Consume result", TargetFiles: []string{"beta/result.py"}, OriginNodeID: "alpha-node", Priority: 1},
+					},
+					AddContracts: []coordinator.PlannedContract{{
+						Resource: "alpha-result-v2", ProducerNode: "alpha-result", ConsumerNode: "beta-result",
+						Kind: "interface", Language: "python", PublicEntrypoint: "alpha.result",
+						Acceptance: []string{"consumer imports the result"}, SupersedesContractID: "contract-alpha-old",
+					}},
+				}
+				data, _ := json.Marshal(candidate)
+				patch, err := h.daemon.validateAcceptanceCandidate(attempt, data)
+				if err != nil {
+					h.t.Fatal(err)
+				}
+				if err := h.daemon.applyAcceptancePatch(attempt, patch); err != nil {
+					h.t.Fatal(err)
+				}
+				contracts, err := h.daemon.coordinationManager.List(context.Background(), coordination.Principal{Role: coordination.RoleAdmin})
+				if err != nil || len(contracts) != 1 {
+					h.t.Fatalf("contracts = %#v err=%v", contracts, err)
+				}
+				if contracts[0].Details.SupersedesContractID != "contract-alpha-old" {
+					h.t.Fatalf("supersedes = %#v", contracts[0].Details)
+				}
+			},
+		},
+		{
+			Name: "acceptance-surface-retry-rejected",
+			Run: func(h *scenarioHarness) {
+				fixture := loadScenarioFixture(h.t, "acceptance-complete")
+				attempt := seedAcceptanceScenario(h, fixture)
+				candidate := buildAcceptanceCandidate{
+					Type: "aion_build_acceptance", AttemptID: attempt.AttemptID, Verdict: "retry",
+					ContractImpact: "surface", Summary: "Surface change cannot use retry.",
+					Requirements: []buildAcceptanceRequirement{{ID: "R3", Status: "missing", Evidence: "public surface."}},
+					ReopenNodes:  []buildAcceptanceRework{{NodeID: "alpha-node", Instruction: "Change the public surface."}},
+				}
+				data, _ := json.Marshal(candidate)
+				if _, err := h.daemon.validateAcceptanceCandidate(attempt, data); err == nil {
+					h.t.Fatal("surface retry was accepted")
+				}
+			},
+		},
+		{
+			Name: "acceptance-complete-failed-node",
+			Run: func(h *scenarioHarness) {
+				fixture := loadScenarioFixture(h.t, "acceptance-complete")
+				attempt := seedAcceptanceScenario(h, fixture)
+				if err := h.daemon.dagManager.UpdateNode("alpha-node", dag.StatusFailed); err != nil {
+					h.t.Fatal(err)
+				}
+				complete, err := h.daemon.reviewBuildAcceptance(attempt)
+				if err == nil || complete {
+					h.t.Fatalf("failed-node acceptance complete=%v err=%v", complete, err)
+				}
+				loaded, loadErr := loadBuildSpecAttempt(h.daemon.runState.Root)
+				if loadErr != nil || loaded.AcceptanceStatus != "attention" {
+					h.t.Fatalf("acceptance = %#v err=%v", loaded, loadErr)
+				}
+			},
+		},
+		{
 			Name: "acceptance-attention",
 			Run: func(h *scenarioHarness) {
 				fixture := loadScenarioFixture(h.t, "acceptance-complete")
@@ -415,6 +526,137 @@ func scenarioRegistry() []scenarioCase {
 			},
 		},
 		{
+			Name: "acceptance-repair-fails",
+			Run: func(h *scenarioHarness) {
+				fixture := loadScenarioFixture(h.t, "acceptance-complete")
+				attempt := seedAcceptanceScenario(h, fixture)
+				h.daemon.coordinator = &scenarioCoordinator{reviews: []scenarioReview{
+					{output: []byte(`{"bad":`)},
+					{output: []byte(`{"still":"bad"}`)},
+				}}
+				complete, err := h.daemon.reviewBuildAcceptance(attempt)
+				if err == nil || complete {
+					h.t.Fatalf("repair-fails complete=%v err=%v", complete, err)
+				}
+				loaded, loadErr := loadBuildSpecAttempt(h.daemon.runState.Root)
+				if loadErr != nil || loaded.AcceptanceStatus != "attention" || loaded.AcceptanceFailureCode != "acceptance.invalid_report" {
+					h.t.Fatalf("acceptance = %#v err=%v", loaded, loadErr)
+				}
+			},
+		},
+		{
+			Name: "acceptance-successor-depth-rejected",
+			Run: func(h *scenarioHarness) {
+				fixture := loadScenarioFixture(h.t, "acceptance-complete")
+				attempt := seedAcceptanceScenario(h, fixture)
+				attempt.Plan.Nodes = append(attempt.Plan.Nodes,
+					coordinator.TaskNode{ID: "alpha-second", DomainID: "alpha", TaskSpec: "second", TargetFiles: []string{"alpha/second.py"}, OriginNodeID: "alpha-node"},
+					coordinator.TaskNode{ID: "alpha-third", DomainID: "alpha", TaskSpec: "third", TargetFiles: []string{"alpha/third.py"}, OriginNodeID: "alpha-second"},
+				)
+				for _, id := range []string{"alpha-second", "alpha-third"} {
+					if err := h.daemon.dagManager.AddNode(dag.DagNode{ID: id, DomainID: "alpha", TaskSpec: id, Status: dag.StatusDone, TargetFiles: []string{"alpha/" + id + ".py"}}); err != nil {
+						h.t.Fatal(err)
+					}
+				}
+				candidate := buildAcceptanceCandidate{
+					Type: "aion_build_acceptance", AttemptID: attempt.AttemptID, Verdict: "successor",
+					Summary: "Too deep successor.", Requirements: []buildAcceptanceRequirement{{ID: "R4", Status: "missing", Evidence: "deep."}},
+					AddNodes: []coordinator.TaskNode{{ID: "alpha-fourth", DomainID: "alpha", TaskSpec: "fourth", TargetFiles: []string{"alpha/fourth.py"}, OriginNodeID: "alpha-third"}},
+				}
+				data, _ := json.Marshal(candidate)
+				if _, err := h.daemon.validateAcceptanceCandidate(attempt, data); err == nil {
+					h.t.Fatal("successor depth was not enforced")
+				}
+			},
+		},
+		{
+			Name: "recovery-crash-budget",
+			Run: func(h *scenarioHarness) {
+				for i := 0; i < 3; i++ {
+					h.daemon.observeAgentRecovery("agent-alpha", "alpha", "Crashed", "process exited")
+				}
+				h.daemon.observeAgentRecovery("agent-alpha", "alpha", "Stopped", "supervisor exhausted retries")
+				state := h.daemon.recoverySnapshot("agent-alpha")
+				if state.Phase != "awaiting_operator" || state.FailureCode != "supervisor.restart_budget_exhausted" {
+					h.t.Fatalf("recovery state = %#v", state)
+				}
+			},
+		},
+		{
+			Name: "recovery-supervisor-wait",
+			Run: func(h *scenarioHarness) {
+				h.daemon.observeAgentRecovery("agent-alpha", "alpha", "Crashed", "process exited")
+				h.daemon.recoveryMu.Lock()
+				h.daemon.recoveryProcessing = true
+				h.daemon.recoveryMu.Unlock()
+				h.daemon.enqueueRecovery(RecoveryRequest{AgentID: "agent-alpha", Action: "revive", Cause: "test"})
+				h.daemon.recoveryMu.Lock()
+				h.daemon.recoveryProcessing = false
+				queued := len(h.daemon.recoveryQueue)
+				h.daemon.recoveryMu.Unlock()
+				if queued != 1 {
+					h.t.Fatalf("queue = %d", queued)
+				}
+			},
+		},
+		{
+			Name: "recovery-queue-dedup",
+			Run: func(h *scenarioHarness) {
+				h.daemon.recoveryMu.Lock()
+				h.daemon.recoveryProcessing = true
+				h.daemon.recoveryMu.Unlock()
+				h.daemon.enqueueRecovery(RecoveryRequest{AgentID: "agent-alpha", Action: "revive", Cause: "duplicate"})
+				h.daemon.enqueueRecovery(RecoveryRequest{AgentID: "agent-alpha", Action: "revive", Cause: "duplicate"})
+				h.daemon.recoveryMu.Lock()
+				queued := len(h.daemon.recoveryQueue)
+				h.daemon.recoveryProcessing = false
+				h.daemon.recoveryMu.Unlock()
+				if queued != 1 {
+					h.t.Fatalf("queue = %d", queued)
+				}
+			},
+		},
+		{
+			Name: "recovery-restart-reconstruct",
+			Run: func(h *scenarioHarness) {
+				fixture := loadScenarioFixture(h.t, "acceptance-complete")
+				attempt := seedAcceptanceScenario(h, fixture)
+				attempt.AgentStates = map[string]BuildSpecAgentState{
+					"agent-alpha": {AgentID: "agent-alpha", DomainID: "alpha", State: "Crashed", RecoveryEpoch: 2, RecoveryPhase: "process_recovering", RecoveryOwner: "supervisor", RecoveryAttempts: 1, RecoveryBudget: 3},
+				}
+				if err := saveBuildSpecAttempt(h.daemon.runState.Root, attempt); err != nil {
+					h.t.Fatal(err)
+				}
+				h.daemon.initRecoveryArbiter()
+				state := h.daemon.recoverySnapshot("agent-alpha")
+				if state.Phase != "work_recovery_pending" || state.Epoch != 3 {
+					h.t.Fatalf("reconstructed state = %#v", state)
+				}
+			},
+		},
+		{
+			Name: "recovery-failed-node-operator-retry",
+			Run: func(h *scenarioHarness) {
+				fixture := loadScenarioFixture(h.t, "acceptance-complete")
+				attempt := seedAcceptanceScenario(h, fixture)
+				if err := h.daemon.dagManager.UpdateNode("alpha-node", dag.StatusFailed); err != nil {
+					h.t.Fatal(err)
+				}
+				preflight := h.daemon.buildResumePreflight()
+				if !preflight.CanResume {
+					h.t.Fatalf("preflight = %#v", preflight)
+				}
+				if err := h.daemon.reopenFailedNodesForResume(); err != nil {
+					h.t.Fatal(err)
+				}
+				node, err := h.daemon.dagManager.GetNode("alpha-node")
+				if err != nil || node.Status != dag.StatusPending {
+					h.t.Fatalf("node = %#v err=%v", node, err)
+				}
+				_ = attempt
+			},
+		},
+		{
 			Name: "acceptance-repair",
 			Run: func(h *scenarioHarness) {
 				fixture := loadScenarioFixture(h.t, "acceptance-complete")
@@ -456,8 +698,15 @@ func TestScenarioRegistry(t *testing.T) {
 			case "acceptance-complete":
 				loaded := loadScenarioFixture(t, "acceptance-complete")
 				runScenario(t, tc, scenarioCoordinatorFromFixture(loaded))
-			case "acceptance-attention", "acceptance-retry-apply":
+			case "acceptance-attention", "acceptance-retry-apply", "acceptance-successor-contract",
+				"acceptance-surface-retry-rejected", "acceptance-complete-failed-node",
+				"acceptance-repair-fails", "acceptance-successor-depth-rejected",
+				"recovery-crash-budget", "recovery-supervisor-wait", "recovery-queue-dedup",
+				"recovery-restart-reconstruct", "recovery-failed-node-operator-retry":
 				runScenario(t, tc, &scenarioCoordinator{})
+			case "acceptance-retry-cycle":
+				loaded := loadScenarioFixture(t, "acceptance-retry-cycle")
+				runScenario(t, tc, scenarioCoordinatorFromFixture(loaded))
 			case "acceptance-repair":
 				runScenario(t, tc, &scenarioCoordinator{})
 			default:
