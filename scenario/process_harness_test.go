@@ -3,12 +3,14 @@
 package scenario
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -192,5 +194,25 @@ func TestProcessScenarioPreflightGating(t *testing.T) {
 	}
 	if _, err := h.Request("build-spec-continue-agents", map[string]any{"confirm": true}); err == nil {
 		t.Fatal("continuation without a resumable attempt should fail")
+	}
+}
+
+func TestProcessProjectLock(t *testing.T) {
+	if os.Getenv("AION_PROCESS_SCENARIO") != "1" {
+		t.Skip("set AION_PROCESS_SCENARIO=1 to run process-level scenarios")
+	}
+	h := NewProcessHarness(t)
+	t.Cleanup(h.Stop)
+	h.Start()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, h.Binary, "server", "--workdir", h.Root, "--config", h.Config, "--log-level", "debug")
+	cmd.Env = append(os.Environ(), "AION_INFERENCE_GATEWAY_ENABLED=false", "AION_ORCHESTRATOR_PORT=0")
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatal("second server on the same project was accepted")
+	}
+	if !strings.Contains(string(output), "already owned by another kernel") {
+		t.Fatalf("unexpected second-server output: %s", output)
 	}
 }

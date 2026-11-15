@@ -42,6 +42,7 @@ type Daemon struct {
 	integrationRunner        *IntegrationRunner
 	ipcPaths                 daemonIPCPaths
 	projectRoot              string
+	projectLock              *projectLock
 	auditor                  *Auditor
 	runState                 *RunState
 	ctx                      context.Context
@@ -79,6 +80,16 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	if err := os.MkdirAll(aionDir, 0755); err != nil {
 		return nil, fmt.Errorf("daemon: create .aion dir: %w", err)
 	}
+	lock, err := acquireProjectLock(projectRoot)
+	if err != nil {
+		return nil, err
+	}
+	lockHeld := true
+	defer func() {
+		if lockHeld {
+			lock.Close()
+		}
+	}()
 
 	runState, err := LoadOrCreateCurrentRun(projectRoot, config)
 	if err != nil {
@@ -236,6 +247,7 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 		auditor:             aud,
 		runState:            runState,
 		projectRoot:         projectRoot,
+		projectLock:         lock,
 		ctx:                 ctx,
 		cancel:              cancel,
 		staleReported:       make(map[string]bool),
@@ -466,6 +478,7 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 
 	daemon.configureAllocatorCallbacks()
 	daemon.reconcilePersistedRecoveries()
+	lockHeld = false
 
 	return daemon, nil
 }
@@ -1611,6 +1624,10 @@ func (d *Daemon) Shutdown() {
 		if err := d.messages.Close(); err != nil {
 			log.Printf("daemon: close message registry: %v", err)
 		}
+	}
+	if d.projectLock != nil {
+		d.projectLock.Close()
+		d.projectLock = nil
 	}
 
 	log.Println("daemon: shutdown complete")
