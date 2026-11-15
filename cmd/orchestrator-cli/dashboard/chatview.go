@@ -45,6 +45,7 @@ type ChatModel struct {
 	inputBlurred     bool
 	deferRender      bool
 	pendingTrimLines int
+	renderPending    bool
 }
 
 type architectCommand struct {
@@ -123,7 +124,7 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Button == tea.MouseButtonWheelUp {
 			m.autoScroll = false
 		} else if msg.Button == tea.MouseButtonWheelDown && m.viewport.AtBottom() {
-			m.autoScroll = true
+			m.resumeAutoScroll()
 		}
 	case tea.KeyMsg:
 		if m.logger != nil {
@@ -173,7 +174,7 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.viewport.LineDown(1)
 			if m.viewport.AtBottom() {
-				m.autoScroll = true
+				m.resumeAutoScroll()
 			}
 			if m.FocusHistory {
 				return m, nil
@@ -185,7 +186,7 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "alt+down", "ctrl+down":
 			m.viewport.LineDown(1)
 			if m.viewport.AtBottom() {
-				m.autoScroll = true
+				m.resumeAutoScroll()
 			}
 			return m, nil
 		case "pgup":
@@ -203,7 +204,7 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.viewport.ViewDown()
 			if m.viewport.AtBottom() {
-				m.autoScroll = true
+				m.resumeAutoScroll()
 			}
 			if m.FocusHistory {
 				return m, nil
@@ -222,14 +223,15 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.syncInputHeight()
 				m.syncViewportSize()
 				if v != "" {
+					m.resumeAutoScroll()
 					m.AddMessage("user", "User", v, lipgloss.NewStyle().Foreground(lipgloss.Color("82")), "text")
 					go m.executeCommand(v)
 					if strings.HasPrefix(v, "/build-spec") {
 						m.buildSpecActive = true
 					}
+				} else {
+					m.resumeAutoScroll()
 				}
-				// Force autoscroll on new message
-				m.autoScroll = true
 				return m, nil
 			case tea.KeyEsc:
 				if m.buildSpecActive {
@@ -311,7 +313,7 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	if mouseMsg, ok := msg.(tea.MouseMsg); ok && mouseMsg.Button == tea.MouseButtonWheelDown && m.viewport.AtBottom() {
-		m.autoScroll = true
+		m.resumeAutoScroll()
 	}
 
 	// Update placeholder based on scroll state
@@ -427,9 +429,7 @@ func (m *ChatModel) addStreamMessage(agentID, author, text string, style lipglos
 			if merged {
 				last.CachedRender = "" // Invalidate cache
 				m.MeasureLine(last)
-				if !m.deferRender {
-					m.renderHistory()
-				}
+				m.renderOrDefer()
 				return
 			}
 		}
@@ -468,9 +468,7 @@ func (m *ChatModel) addStreamMessage(agentID, author, text string, style lipglos
 	if removed := m.trimHistory(); removed > 0 {
 		m.pendingTrimLines += removed
 	}
-	if !m.deferRender {
-		m.renderHistory()
-	}
+	m.renderOrDefer()
 }
 
 // trimHistory drops the oldest messages once the history exceeds the render
@@ -491,6 +489,27 @@ func (m *ChatModel) trimHistory() int {
 	}
 	m.history = m.history[cut:]
 	return removed
+}
+
+// renderOrDefer freezes the viewport while the user is reading older content.
+// Streaming updates continue to update the in-memory history, but the visible
+// viewport is not rebuilt until auto-scroll resumes.
+func (m *ChatModel) renderOrDefer() {
+	if m.deferRender {
+		return
+	}
+	if !m.autoScroll {
+		m.renderPending = true
+		return
+	}
+	m.renderHistory()
+}
+
+func (m *ChatModel) resumeAutoScroll() {
+	m.autoScroll = true
+	if m.renderPending {
+		m.renderHistory()
+	}
 }
 
 func (m *ChatModel) MeasureLine(line *chatLine) {
@@ -651,6 +670,7 @@ func (m *ChatModel) renderHistory() {
 		m.pendingTrimLines = 0
 	}
 
+	m.renderPending = false
 	m.viewport.SetContent(contentStr)
 	if m.autoScroll {
 		m.viewport.GotoBottom()

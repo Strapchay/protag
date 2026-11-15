@@ -378,3 +378,34 @@ func TestChatIgnoresSGRMouseReport(t *testing.T) {
 		t.Fatalf("mouse report entered the composer: %q", got)
 	}
 }
+
+func TestChatDefersStreamingRenderWhileScrolledUp(t *testing.T) {
+	m := NewChatModel("127.0.0.1:0")
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 20})
+	m.autoScroll = false
+	before := m.viewport.TotalLineCount()
+
+	m.addTUIEvent(tuiEventMsg{
+		AgentID: "orchestrator", Author: "Architect", Kind: tuiKindText,
+		Content: "streaming content", Stream: tuiStreamSnapshot, Block: "orchestrator-1",
+	})
+
+	if len(m.history) != 1 {
+		t.Fatalf("history=%d", len(m.history))
+	}
+	if !m.renderPending {
+		t.Fatal("streaming render was not deferred while scrolled up")
+	}
+	if got := m.viewport.TotalLineCount(); got != before {
+		t.Fatalf("viewport changed while frozen: %d -> %d", before, got)
+	}
+
+	m.autoScroll = true
+	m.renderHistory()
+	if m.renderPending {
+		t.Fatal("pending render was not cleared")
+	}
+	if got := m.viewport.TotalLineCount(); got <= before {
+		t.Fatalf("viewport did not render after resuming: %d -> %d", before, got)
+	}
+}
