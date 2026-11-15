@@ -1,4 +1,4 @@
-.PHONY: build test test-scenarios clean proto flatbuf install-tools lint vet
+.PHONY: build test test-scenarios test-scenarios-process clean proto flatbuf install-tools lint vet
 
 # Binary output
 BIN_DIR := bin
@@ -53,6 +53,9 @@ test-integration:
 
 test-scenarios:
 	$(GOTEST) -tags=scenario ./internal/orchestrator -run '^TestScenario' -count=1
+
+test-scenarios-process: build
+	AION_PROCESS_SCENARIO=1 AION_KERNEL_BIN=$(CURDIR)/bin/aion-kernel AION_KERNEL_CONFIG=$(CURDIR)/configs/aion.yaml $(GOTEST) -tags=scenario_process ./scenario -run '^TestProcessScenario' -count=1
 
 test-coverage:
 	$(GOTEST) -coverprofile=coverage.out ./...

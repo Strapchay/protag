@@ -1,0 +1,14 @@
+{
+  "build_spec": "# Fixture Smoke\n\nOne domain scenario fixture.\n",
+  "plan": {
+    "domains": [
+      {"domain_id": "alpha", "description": "fixture domain", "assigned_paths": ["alpha/"], "agent_type": "domain"}
+    ],
+    "nodes": [
+      {"id": "alpha-node", "domain_id": "alpha", "task_spec": "fixture node", "target_files": ["alpha/file.py"], "priority": 1}
+    ],
+    "edges": [],
+    "contracts": []
+  },
+  "reviews": []
+}
