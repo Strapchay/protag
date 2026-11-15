@@ -29,13 +29,16 @@ type Config struct {
 // reconciliation. These limits are persisted into each resolution so restarts
 // cannot silently reset its retry budget.
 type CoordinationConfig struct {
-	MaxNegotiationRounds int `yaml:"max_negotiation_rounds"`
-	MaxProcessAttempts   int `yaml:"max_process_attempts"`
-	MaxRepairAttempts    int `yaml:"max_repair_attempts"`
-	MaxContextExpansions int `yaml:"max_context_expansions"`
-	LeaseTimeoutSec      int `yaml:"lease_timeout_sec"`
-	ArtifactTimeoutSec   int `yaml:"artifact_timeout_sec"`
-	DeadlockTimeoutSec   int `yaml:"deadlock_timeout_sec"`
+	MaxNegotiationRounds              int  `yaml:"max_negotiation_rounds"`
+	MaxProcessAttempts                int  `yaml:"max_process_attempts"`
+	MaxRepairAttempts                 int  `yaml:"max_repair_attempts"`
+	MaxContextExpansions              int  `yaml:"max_context_expansions"`
+	LeaseTimeoutSec                   int  `yaml:"lease_timeout_sec"`
+	ArtifactTimeoutSec                int  `yaml:"artifact_timeout_sec"`
+	DeadlockTimeoutSec                int  `yaml:"deadlock_timeout_sec"`
+	MaxSuccessorDepth                 int  `yaml:"max_successor_depth"`
+	MaxIntegrationRecoveries          int  `yaml:"max_integration_recoveries"`
+	AllowAcceptanceWithoutIntegration bool `yaml:"allow_acceptance_without_integration"`
 }
 
 // IsolationConfig configures the mandatory domain-agent process boundary.
@@ -462,6 +465,12 @@ func applyDefaults(c *Config) {
 	if c.Coordination.DeadlockTimeoutSec == 0 {
 		c.Coordination.DeadlockTimeoutSec = 300
 	}
+	if c.Coordination.MaxSuccessorDepth == 0 {
+		c.Coordination.MaxSuccessorDepth = 2
+	}
+	if c.Coordination.MaxIntegrationRecoveries == 0 {
+		c.Coordination.MaxIntegrationRecoveries = 2
+	}
 	if strings.TrimSpace(c.Isolation.Backend) == "" {
 		c.Isolation.Backend = "bubblewrap"
 	}
@@ -590,6 +599,12 @@ func validateConfig(c *Config) error {
 	}
 	if c.Coordination.DeadlockTimeoutSec < 10 || c.Coordination.DeadlockTimeoutSec > 3600 {
 		return fmt.Errorf("coordination.deadlock_timeout_sec must be between 10 and 3600")
+	}
+	if c.Coordination.MaxSuccessorDepth < 1 || c.Coordination.MaxSuccessorDepth > 5 {
+		return fmt.Errorf("coordination.max_successor_depth must be between 1 and 5")
+	}
+	if c.Coordination.MaxIntegrationRecoveries < 1 || c.Coordination.MaxIntegrationRecoveries > 5 {
+		return fmt.Errorf("coordination.max_integration_recoveries must be between 1 and 5")
 	}
 	if c.InferenceGateway.RetryBaseDelayMS < 1 {
 		return fmt.Errorf("inference_gateway.retry_base_delay_ms must be >= 1")

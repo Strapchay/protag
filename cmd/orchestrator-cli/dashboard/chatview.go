@@ -59,7 +59,8 @@ var architectCommands = []architectCommand{
 	{Name: "/resume", Description: "reconcile live Architect context from persisted session state"},
 	{Name: "/retry", Description: "retry the last safe failed/timed-out Architect request"},
 	{Name: "/continue", Description: "ask the Architect to continue from current restored context"},
-	{Name: "/continue-agents", Description: "resume persisted domain agents after build-spec allocation"},
+	{Name: "/resume-preflight", Description: "show the read-only state and resume plan before continuing"},
+	{Name: "/continue-agents", Description: "show preflight; add confirm to resume agents"},
 	{Name: "/resume-agents", Description: "alias for /continue-agents"},
 	{Name: "/stop-agents", Description: "pause active domain agents without failing their DAG tasks"},
 	{Name: "/gateway-capacity", Description: "change runtime inference request concurrency"},
@@ -722,8 +723,16 @@ func (m *ChatModel) executeCommand(cmdStr string) {
 		methodName = "architect-resume"
 		params = map[string]interface{}{}
 		showResponse = true
+	case "/resume-preflight":
+		methodName = "build-spec-resume-preflight"
+		params = map[string]interface{}{}
+		showResponse = true
 	case "/continue-agents", "/resume-agents", "/countine-agents":
-		methodName = "build-spec-continue-agents"
+		if len(parts) > 1 && strings.EqualFold(strings.TrimSpace(parts[1]), "confirm") {
+			methodName = "build-spec-continue-agents"
+		} else {
+			methodName = "build-spec-resume-preflight"
+		}
 		params = map[string]interface{}{}
 		showResponse = true
 	case "/stop-agents":
@@ -1089,8 +1098,8 @@ func (m *ChatModel) commandSuggestionMatches() []architectCommand {
 	if len(matches) == 0 {
 		return nil
 	}
-	if len(matches) > 6 {
-		matches = matches[:6]
+	if len(matches) > 8 {
+		matches = matches[:8]
 	}
 	return matches
 }

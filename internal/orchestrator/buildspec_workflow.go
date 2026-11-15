@@ -491,12 +491,14 @@ func (d *Daemon) commitPlan(plan *coordinator.PlanResponse, attempt *BuildSpecAt
 
 	for _, rawNode := range plan.Nodes {
 		n := dag.DagNode{
-			ID:          rawNode.ID,
-			DomainID:    rawNode.DomainID,
-			TaskSpec:    rawNode.TaskSpec,
-			Status:      dag.StatusPending,
-			TargetFiles: rawNode.TargetFiles,
-			Priority:    rawNode.Priority,
+			ID:                   rawNode.ID,
+			DomainID:             rawNode.DomainID,
+			TaskSpec:             rawNode.TaskSpec,
+			Status:               dag.StatusPending,
+			TargetFiles:          rawNode.TargetFiles,
+			Priority:             rawNode.Priority,
+			OriginNodeID:         rawNode.OriginNodeID,
+			SupersedesContractID: rawNode.SupersedesContractID,
 		}
 		if err := d.dagManager.AddNode(n); err != nil {
 			return fmt.Errorf("commit node %s: %w", n.ID, err)
@@ -552,12 +554,13 @@ func (d *Daemon) initializePlannedContracts(ctx context.Context, plan *coordinat
 				ConsumerNodeID:  consumer.ID,
 				HardWait:        planned.HardWait,
 				Details: coordinationruntime.ContractDetails{
-					Name:              strings.TrimSpace(planned.Resource),
-					Kind:              kind,
-					Language:          strings.TrimSpace(planned.Language),
-					PublicEntrypoint:  strings.TrimSpace(planned.PublicEntrypoint),
-					Acceptance:        append([]string(nil), planned.Acceptance...),
-					HandshakeRequired: planned.HandshakeRequired,
+					Name:                 strings.TrimSpace(planned.Resource),
+					Kind:                 kind,
+					Language:             strings.TrimSpace(planned.Language),
+					PublicEntrypoint:     strings.TrimSpace(planned.PublicEntrypoint),
+					Acceptance:           append([]string(nil), planned.Acceptance...),
+					HandshakeRequired:    planned.HandshakeRequired,
+					SupersedesContractID: planned.SupersedesContractID,
 				},
 			},
 		})
@@ -730,6 +733,10 @@ func (d *Daemon) resetBuildSpecArtifactsLocked() error {
 }
 
 func (d *Daemon) continueBuildSpecAgents() error {
+	preflight := d.buildResumePreflight()
+	if !preflight.CanResume {
+		return fmt.Errorf("resume blocked: %s", strings.Join(preflight.BlockingReasons, "; "))
+	}
 	d.buildSpecMu.Lock()
 	armed := d.buildSpecContinueArmed
 	d.buildSpecMu.Unlock()
@@ -751,6 +758,11 @@ func (d *Daemon) continueBuildSpecAgents() error {
 		attempt.AcceptanceStatus = ""
 		attempt.FailureReason = ""
 		_ = saveBuildSpecAttempt(d.runState.Root, attempt)
+	}
+	for agentID, state := range attempt.AgentStates {
+		if state.RecoveryPhase == "awaiting_operator" {
+			d.resetRecoveryEpochForOperator(agentID)
+		}
 	}
 	if attempt.Status != BuildSpecAttemptActive && attempt.Status != BuildSpecAttemptPaused && attempt.Status != BuildSpecAttemptAllocating {
 		return fmt.Errorf("build-spec agents are only resumable after allocation has started")

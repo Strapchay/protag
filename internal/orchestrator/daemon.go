@@ -61,6 +61,8 @@ type Daemon struct {
 	coordinationResolutionMu sync.Mutex
 	coordinationResolutionOn bool
 	acceptanceMu             sync.Mutex
+	recoveryMu               sync.Mutex
+	recoveryStates           map[string]AgentRecoveryState
 	lastProgressSignature    string
 	staleMu                  sync.Mutex
 	staleReported            map[string]bool
@@ -323,6 +325,9 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 		return resumable.Resume(daemon.ctx)
 	})
 
+	server.SetBuildSpecResumePreflightCallback(func() ResumePreflight {
+		return daemon.buildResumePreflight()
+	})
 	server.SetBuildSpecContinueCallback(func() error {
 		daemon.buildSpecMu.Lock()
 		daemon.buildSpecContinueArmed = true
@@ -534,6 +539,7 @@ func (d *Daemon) configureAllocatorCallbacks() {
 		d.server.BroadcastAgentStatus(agentID, text, level)
 	})
 	d.allocator.SetAgentStateFunc(func(agentID, domainID, state, reason string) {
+		d.observeAgentRecovery(agentID, domainID, state, reason)
 		d.recordBuildSpecAgentState(agentID, domainID, state, reason)
 		d.recordAgentLifecycleProgress(agentID, domainID, state, reason)
 		level := "info"
@@ -693,6 +699,18 @@ func (d *Daemon) recordBuildSpecAgentState(agentID, domainID, state, reason stri
 	}
 
 	attempt.RecordAgentState(agentID, domainID, state, reason)
+	if recovered, ok := attempt.AgentStates[agentID]; ok {
+		snapshot := d.recoverySnapshot(agentID)
+		recovered.RecoveryEpoch = snapshot.Epoch
+		recovered.RecoveryPhase = snapshot.Phase
+		recovered.RecoveryOwner = snapshot.Owner
+		recovered.FailureCode = snapshot.FailureCode
+		recovered.FailureClass = snapshot.FailureClass
+		recovered.RecoveryAttempts = snapshot.Attempts
+		recovered.RecoveryBudget = snapshot.Budget
+		recovered.SupervisorRestarts = snapshot.SupervisorRestarts
+		attempt.AgentStates[agentID] = recovered
+	}
 	_ = saveBuildSpecAttempt(d.runState.Root, attempt)
 }
 
@@ -720,6 +738,16 @@ func (d *Daemon) recordRecovery(record RecoveryRecord) {
 	if attempt != nil {
 		record.AttemptID = attempt.AttemptID
 	}
+	if record.AgentID != "" && record.RecoveryEpoch == 0 {
+		recovery := d.recoverySnapshot(record.AgentID)
+		record.RecoveryEpoch = recovery.Epoch
+		record.RecoveryPhase = recovery.Phase
+		record.RecoveryOwner = recovery.Owner
+		record.FailureCode = firstNonEmpty(record.FailureCode, recovery.FailureCode)
+		record.FailureClass = firstNonEmpty(record.FailureClass, recovery.FailureClass)
+		record.RecoveryAttempts = recovery.Attempts
+		record.RecoveryBudget = recovery.Budget
+	}
 	_ = upsertRecoveryRecord(d.runState.Root, record)
 }
 
@@ -744,9 +772,14 @@ func (d *Daemon) handleIntegrationStatusChange(status IntegrationRunStatus) {
 		summary = fmt.Sprintf("Integration validation passed (%d directive(s)).", status.DirectiveCount)
 		d.resolveRecovery("integration_failed", "", "integration-runner")
 		d.clearIntegrationNodeRecoveries(status)
+		if attempt, _ := loadBuildSpecAttempt(d.runState.Root); attempt != nil && attempt.IntegrationRecoveryRounds != 0 {
+			attempt.IntegrationRecoveryRounds = 0
+			d.saveBuildSpecAttempt(attempt)
+		}
 	case IntegrationFailed:
 		level = "error"
 		summary = "Integration validation failed: " + strings.TrimSpace(status.Error)
+		class := firstNonEmpty(status.FailureClass, "directive_execution_failed")
 		d.recordRecovery(RecoveryRecord{
 			FailureID:        recoveryID("integration_failed", "", "integration-runner"),
 			Kind:             "integration_failed",
@@ -757,6 +790,8 @@ func (d *Daemon) handleIntegrationStatusChange(status IntegrationRunStatus) {
 			Summary:          summary,
 			LastError:        status.Error,
 			SuggestedCommand: "orchestrator-cli integration-run",
+			FailureCode:      class,
+			FailureClass:     integrationFailureDisposition(class),
 		})
 	case IntegrationSkipped:
 		level = "warn"
@@ -773,18 +808,65 @@ func (d *Daemon) handleIntegrationStatusChange(status IntegrationRunStatus) {
 	}
 	d.refreshBuildProgress("integration_" + string(status.Status))
 	if status.Status == IntegrationFailed {
+		attempt, _ := loadBuildSpecAttempt(d.runState.Root)
+		class := firstNonEmpty(status.FailureClass, "directive_execution_failed")
+		if integrationFailureDisposition(class) != "retry" {
+			d.integrationAttention(attempt, class, status.Error)
+			return
+		}
+		if attempt == nil || attempt.IntegrationRecoveryRounds >= d.maxIntegrationRecoveries() {
+			d.integrationAttention(attempt, class, "integration recovery budget exhausted: "+status.Error)
+			return
+		}
 		reopened, err := d.prepareIntegrationFailureRecovery(status)
 		if err != nil {
 			log.Printf("integration: prepare owner-node recovery: %v", err)
+			d.integrationAttention(attempt, class, err.Error())
 			return
 		}
-		if len(reopened) > 0 {
-			if err := d.integrationRunner.Retry(); err != nil {
-				log.Printf("integration: schedule owner-node retry: %v", err)
-				return
-			}
-			d.startBuildSpecExecutionMonitor()
+		if len(reopened) == 0 {
+			d.integrationAttention(attempt, class, status.Error)
+			return
 		}
+		if attempt != nil {
+			attempt.IntegrationRecoveryRounds++
+			d.saveBuildSpecAttempt(attempt)
+		}
+		if err := d.integrationRunner.Retry(); err != nil {
+			log.Printf("integration: schedule owner-node retry: %v", err)
+			return
+		}
+		d.startBuildSpecExecutionMonitor()
+	}
+}
+
+func integrationFailureDisposition(class string) string {
+	switch class {
+	case "directive_execution_failed", "directive_timeout":
+		return "retry"
+	default:
+		return "attention"
+	}
+}
+
+func (d *Daemon) maxIntegrationRecoveries() int {
+	if d != nil && d.config != nil && d.config.Coordination.MaxIntegrationRecoveries > 0 {
+		return d.config.Coordination.MaxIntegrationRecoveries
+	}
+	return 2
+}
+
+func (d *Daemon) integrationAttention(attempt *BuildSpecAttempt, class, reason string) {
+	if attempt != nil {
+		attempt.Status = BuildSpecAttemptPaused
+		attempt.FailureReason = "integration requires operator attention (" + class + "): " + strings.TrimSpace(reason)
+		d.saveBuildSpecAttempt(attempt)
+	}
+	if d.allocator != nil {
+		d.allocator.StopAll()
+	}
+	if d.server != nil {
+		d.server.BroadcastAgentStatus("integration-runner", "Integration requires operator attention: "+firstNonEmpty(reason, class), "error")
 	}
 }
 
@@ -1246,6 +1328,7 @@ func (d *Daemon) Start() error {
 		return fmt.Errorf("daemon: reconcile interrupted build-spec attempt: %w", err)
 	}
 
+	d.initRecoveryArbiter()
 	// Start Auditor
 	d.auditor.Start(d.ctx)
 	d.startCoordinationEffectLoop()

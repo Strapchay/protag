@@ -79,7 +79,7 @@ func TestAcceptanceCandidateCompleteAndRework(t *testing.T) {
 	}
 
 	rework := buildAcceptanceCandidate{
-		Type: "aion_build_acceptance", AttemptID: attempt.AttemptID, Verdict: "rework", Summary: "The required error type is missing.",
+		Type: "aion_build_acceptance", AttemptID: attempt.AttemptID, Verdict: "retry", Summary: "The required error type is missing.",
 		Requirements: []buildAcceptanceRequirement{{ID: "R1", Status: "missing", Evidence: "alpha/alpha.py has no validation error type."}},
 		ReopenNodes: []buildAcceptanceRework{{
 			NodeID: "alpha-core", Instruction: "Add the missing validation error type and tests.",
@@ -97,7 +97,7 @@ func TestAcceptanceCandidateCompleteAndRework(t *testing.T) {
 	if err != nil || node.Status != dag.StatusPending {
 		t.Fatalf("reopened node = %#v, err=%v", node, err)
 	}
-	if !strings.Contains(node.TaskSpec, "ACCEPTANCE REWORK") || !strings.Contains(node.TaskSpec, "validation error type") {
+	if !strings.Contains(node.TaskSpec, "ACCEPTANCE RETRY") || !strings.Contains(node.TaskSpec, "validation error type") {
 		t.Fatalf("rework task spec = %q", node.TaskSpec)
 	}
 }
@@ -105,7 +105,7 @@ func TestAcceptanceCandidateCompleteAndRework(t *testing.T) {
 func TestAcceptanceCandidateRejectsOwnershipEscape(t *testing.T) {
 	daemon, attempt := acceptanceFixture(t)
 	rework := buildAcceptanceCandidate{
-		Type: "aion_build_acceptance", AttemptID: attempt.AttemptID, Verdict: "rework", Summary: "Needs work.",
+		Type: "aion_build_acceptance", AttemptID: attempt.AttemptID, Verdict: "retry", Summary: "Needs work.",
 		Requirements: []buildAcceptanceRequirement{{ID: "R1", Status: "missing", Evidence: "missing."}},
 		AddNodes: []coordinator.TaskNode{{
 			ID: "escape", DomainID: "alpha", TaskSpec: "write elsewhere", TargetFiles: []string{"beta/escape.py"},
@@ -156,5 +156,65 @@ func TestAcceptanceInputIncludesExecutionEvidence(t *testing.T) {
 	}
 	if input.BuildSpec == "" || input.Plan == nil || len(input.DAG.Nodes) != 1 || len(input.ValidationRules) == 0 {
 		t.Fatalf("acceptance input = %#v", input)
+	}
+}
+
+func TestAcceptanceSuccessorRequiresDoneOriginAndDepth(t *testing.T) {
+	daemon, attempt := acceptanceFixture(t)
+	daemon.config.Coordination.MaxSuccessorDepth = 2
+	successor := buildAcceptanceCandidate{
+		Type: "aion_build_acceptance", AttemptID: attempt.AttemptID, Verdict: "successor", Summary: "Add the follow-on normalization behavior.",
+		Requirements: []buildAcceptanceRequirement{{ID: "R2", Status: "missing", Evidence: "The completed alpha package lacks normalization."}},
+		AddNodes: []coordinator.TaskNode{{
+			ID: "alpha-normalize", DomainID: "alpha", TaskSpec: "Add normalization as a successor to alpha-core.",
+			TargetFiles: []string{"alpha/normalize.py"}, OriginNodeID: "alpha-core",
+		}},
+	}
+	data, _ := json.Marshal(successor)
+	patch, err := daemon.validateAcceptanceCandidate(attempt, data)
+	if err != nil {
+		t.Fatalf("successor patch: %v", err)
+	}
+	if err := daemon.applyAcceptancePatch(attempt, patch); err != nil {
+		t.Fatal(err)
+	}
+	node, err := daemon.dagManager.GetNode("alpha-normalize")
+	if err != nil || node.OriginNodeID != "alpha-core" || node.Status != dag.StatusPending {
+		t.Fatalf("successor node = %#v, err=%v", node, err)
+	}
+	foundEdge := false
+	for _, edge := range daemon.dagManager.Snapshot().Edges {
+		if edge.FromNode == "alpha-core" && edge.ToNode == "alpha-normalize" {
+			foundEdge = true
+		}
+	}
+	if !foundEdge {
+		t.Fatal("successor origin edge was not added")
+	}
+	deep := buildAcceptanceCandidate{
+		Type: "aion_build_acceptance", AttemptID: attempt.AttemptID, Verdict: "successor", Summary: "Too deep.",
+		Requirements: []buildAcceptanceRequirement{{ID: "R3", Status: "missing", Evidence: "deep."}},
+		AddNodes: []coordinator.TaskNode{{
+			ID: "alpha-too-deep", DomainID: "alpha", TaskSpec: "too deep", TargetFiles: []string{"alpha/deep.py"}, OriginNodeID: "alpha-normalize",
+		}},
+	}
+	data, _ = json.Marshal(deep)
+	if _, err := daemon.validateAcceptanceCandidate(attempt, data); err == nil {
+		t.Fatal("successor depth limit was not enforced")
+	}
+}
+
+func TestAcceptanceCompleteRejectsFailedNode(t *testing.T) {
+	daemon, attempt := acceptanceFixture(t)
+	if err := daemon.dagManager.UpdateNode("alpha-core", dag.StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	complete := buildAcceptanceCandidate{
+		Type: "aion_build_acceptance", AttemptID: attempt.AttemptID, Verdict: "complete", Summary: "Everything is complete.",
+		Requirements: []buildAcceptanceRequirement{{ID: "R1", Status: "met", Evidence: "claimed."}},
+	}
+	data, _ := json.Marshal(complete)
+	if _, err := daemon.validateAcceptanceCandidate(attempt, data); err == nil {
+		t.Fatal("complete with a failed node was accepted")
 	}
 }

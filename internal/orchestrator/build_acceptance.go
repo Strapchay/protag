@@ -45,23 +45,26 @@ type buildAcceptanceRework struct {
 }
 
 type buildAcceptanceCandidate struct {
-	Type         string                       `json:"type"`
-	AttemptID    string                       `json:"attempt_id"`
-	Verdict      string                       `json:"verdict"`
-	Summary      string                       `json:"summary"`
-	Requirements []buildAcceptanceRequirement `json:"requirements"`
-	ReopenNodes  []buildAcceptanceRework      `json:"reopen_nodes"`
-	AddNodes     []coordinator.TaskNode       `json:"add_nodes"`
-	AddEdges     []coordinator.TaskEdge       `json:"add_edges"`
-	Risks        []string                     `json:"risks"`
+	Type           string                        `json:"type"`
+	AttemptID      string                        `json:"attempt_id"`
+	Verdict        string                        `json:"verdict"`
+	ContractImpact string                        `json:"contract_impact,omitempty"`
+	Summary        string                        `json:"summary"`
+	Requirements   []buildAcceptanceRequirement  `json:"requirements"`
+	ReopenNodes    []buildAcceptanceRework       `json:"reopen_nodes,omitempty"`
+	AddNodes       []coordinator.TaskNode        `json:"add_nodes,omitempty"`
+	AddEdges       []coordinator.TaskEdge        `json:"add_edges,omitempty"`
+	AddContracts   []coordinator.PlannedContract `json:"add_contracts,omitempty"`
+	Risks          []string                      `json:"risks,omitempty"`
 }
 
 type acceptancePlanPatch struct {
-	reopen    []buildAcceptanceRework
-	addNodes  []coordinator.TaskNode
-	addEdges  []coordinator.TaskEdge
-	candidate *buildAcceptanceCandidate
-	resultDAG *dag.DagData
+	reopen       []buildAcceptanceRework
+	addNodes     []coordinator.TaskNode
+	addEdges     []coordinator.TaskEdge
+	addContracts []coordinator.PlannedContract
+	candidate    *buildAcceptanceCandidate
+	resultDAG    *dag.DagData
 }
 
 func buildAcceptanceTemplate(attemptID string) []byte {
@@ -94,6 +97,9 @@ func (d *Daemon) reviewBuildAcceptance(attempt *BuildSpecAttempt) (bool, error) 
 		_ = appendBuildSpecTrace(d.runState.Root, "acceptance review skipped: coordinator does not implement BuildReviewer")
 		return true, nil
 	}
+	if failed := d.failedOrIncompleteNodes(); len(failed) > 0 {
+		return d.acceptanceAttention(attempt, fmt.Errorf("acceptance requires every DAG node Done; incomplete nodes: %s", strings.Join(failed, ", ")))
+	}
 	d.acceptanceMu.Lock()
 	defer d.acceptanceMu.Unlock()
 
@@ -120,17 +126,25 @@ func (d *Daemon) reviewBuildAcceptance(attempt *BuildSpecAttempt) (bool, error) 
 		DAG:         *d.dagManager.Snapshot(),
 		Contracts:   contracts,
 		ValidationRules: []string{
+			"acceptance is allowed only when every DAG node is Done and none Failed",
 			"verdict complete requires every build-spec requirement to be implemented and evidenced",
-			"verdict rework must name concrete existing nodes to reopen or ownership-safe new nodes",
+			"verdict retry must reopen existing nodes for unmet original requirements; it cannot add successors or contracts",
+			"verdict successor must add nodes with origin_node_id pointing to completed work; it cannot reopen nodes",
+			"successor origin edges, ownership, and successor depth are validated by the kernel",
+			"public contract changes use add_contracts with a new resource and supersedes_contract_id; never reopen a fulfilled contract",
 			"existing domain and path ownership is immutable",
-			"add_nodes target files must stay beneath their domain assigned_paths",
-			"do not invent documentation-only or duplicate work",
 			"report only real missing or unverified requirements",
 		},
 	}
 	if d.integrationRunner != nil {
 		integration := d.integrationRunner.Status()
 		input.Integration = &integration
+		if integration.Status == IntegrationDisabled && (d.config == nil || !d.config.Coordination.AllowAcceptanceWithoutIntegration) {
+			return d.acceptanceAttention(attempt, fmt.Errorf("integration is disabled; acceptance requires explicit allow_acceptance_without_integration"))
+		}
+		if integration.Status == IntegrationFailed {
+			return d.acceptanceAttention(attempt, fmt.Errorf("integration failed; acceptance cannot run"))
+		}
 	}
 	inputData, err := json.MarshalIndent(input, "", "  ")
 	if err != nil {
@@ -147,8 +161,9 @@ func (d *Daemon) reviewBuildAcceptance(attempt *BuildSpecAttempt) (bool, error) 
 	attempt.AcceptanceStatus = "running"
 	attempt.AcceptanceSummary = ""
 	d.saveBuildSpecAttempt(attempt)
-	d.server.BroadcastAgentStatus("coordinator", "Build acceptance review started against the assembled implementation.", "info")
-
+	if d.server != nil {
+		d.server.BroadcastAgentStatus("coordinator", "Build acceptance review started against the assembled implementation.", "info")
+	}
 	ctx := d.ctx
 	if ctx == nil {
 		ctx = context.Background()
@@ -185,37 +200,61 @@ func (d *Daemon) reviewBuildAcceptance(attempt *BuildSpecAttempt) (bool, error) 
 			return d.acceptanceAttention(attempt, fmt.Errorf("acceptance review invalid after repair: %w", validateErr))
 		}
 	}
+	roundPath := filepath.Join(artifactDir, fmt.Sprintf("acceptance_output_round_%d.json", attempt.AcceptanceRounds))
+	if err := os.WriteFile(roundPath, candidateData, 0o644); err != nil {
+		return d.acceptanceAttention(attempt, err)
+	}
 	attempt.AcceptanceSummary = patch.candidate.Summary
-	attempt.AcceptanceReviewPath = filepath.Join(artifactDir, "acceptance_output.json")
-	if patch.candidate.Verdict == "complete" {
+	attempt.AcceptanceReviewPath = roundPath
+	switch patch.candidate.Verdict {
+	case "attention":
+		return d.acceptanceAttention(attempt, fmt.Errorf("%s", patch.candidate.Summary))
+	case "complete":
 		attempt.AcceptanceStatus = "passed"
 		d.saveBuildSpecAttempt(attempt)
 		_ = appendBuildSpecTrace(d.runState.Root, "acceptance review passed: "+patch.candidate.Summary)
-		d.server.BroadcastAgentStatus("coordinator", "Build acceptance review passed: "+patch.candidate.Summary, "ok")
+		if d.server != nil {
+			d.server.BroadcastAgentStatus("coordinator", "Build acceptance review passed: "+patch.candidate.Summary, "ok")
+		}
 		return true, nil
-	}
-	if attempt.AcceptanceRounds >= maxAcceptanceRounds {
-		return d.acceptanceAttention(attempt, fmt.Errorf("acceptance review still reports missing requirements after %d rework rounds: %s", attempt.AcceptanceRounds, patch.candidate.Summary))
-	}
-	if err := d.applyAcceptancePatch(attempt, patch); err != nil {
-		return d.acceptanceAttention(attempt, err)
-	}
-	attempt.AcceptanceStatus = "rework"
-	attempt.AcceptanceRounds++
-	attempt.Status = BuildSpecAttemptActive
-	attempt.FailureReason = ""
-	attempt.CompletedAt = nil
-	d.saveBuildSpecAttempt(attempt)
-	_ = appendBuildSpecTrace(d.runState.Root, fmt.Sprintf("acceptance review requested rework (round %d): %s", attempt.AcceptanceRounds, patch.candidate.Summary))
-	d.server.BroadcastStatus(fmt.Sprintf("Acceptance review requested rework: %s", patch.candidate.Summary), "warn")
-	d.refreshBuildProgress("acceptance_rework")
-	if len(d.allocator.AgentInfos()) == 0 {
-		if err := d.resumeActiveBuildSpecAgents(attempt); err != nil {
+	case "retry", "successor":
+		if attempt.AcceptanceRounds >= maxAcceptanceRounds {
+			return d.acceptanceAttention(attempt, fmt.Errorf("acceptance review still requests %s after %d rework rounds: %s", patch.candidate.Verdict, attempt.AcceptanceRounds, patch.candidate.Summary))
+		}
+		if err := d.applyAcceptancePatch(attempt, patch); err != nil {
 			return d.acceptanceAttention(attempt, err)
 		}
+		attempt.AcceptanceStatus = patch.candidate.Verdict
+		attempt.AcceptanceRounds++
+		attempt.Status = BuildSpecAttemptActive
+		attempt.FailureReason = ""
+		attempt.CompletedAt = nil
+		d.saveBuildSpecAttempt(attempt)
+		_ = appendBuildSpecTrace(d.runState.Root, fmt.Sprintf("acceptance review requested %s (round %d): %s", patch.candidate.Verdict, attempt.AcceptanceRounds, patch.candidate.Summary))
+		if d.server != nil {
+			d.server.BroadcastStatus(fmt.Sprintf("Acceptance review requested %s: %s", patch.candidate.Verdict, patch.candidate.Summary), "warn")
+		}
+		d.refreshBuildProgress("acceptance_" + patch.candidate.Verdict)
+		if err := d.resumeBuildWorkAfterAcceptance(attempt); err != nil {
+			return d.acceptanceAttention(attempt, err)
+		}
+		return false, nil
+	default:
+		return d.acceptanceAttention(attempt, fmt.Errorf("unknown acceptance verdict %q", patch.candidate.Verdict))
 	}
-	d.startBuildSpecExecutionMonitor()
-	return false, nil
+}
+
+func (d *Daemon) failedOrIncompleteNodes() []string {
+	if d == nil || d.dagManager == nil {
+		return nil
+	}
+	var failed []string
+	for _, node := range d.dagManager.Snapshot().Nodes {
+		if node.Status != dag.StatusDone {
+			failed = append(failed, node.ID+"="+node.Status.String())
+		}
+	}
+	return failed
 }
 
 func (d *Daemon) buildSpecPath(attempt *BuildSpecAttempt) string {
@@ -272,13 +311,15 @@ func (d *Daemon) validateAcceptanceCandidate(attempt *BuildSpecAttempt, data []b
 	if candidate.Type != "aion_build_acceptance" || candidate.AttemptID != attempt.AttemptID {
 		return nil, fmt.Errorf("acceptance output identity does not match the active attempt")
 	}
-	if candidate.Verdict != "complete" && candidate.Verdict != "rework" {
-		return nil, fmt.Errorf("acceptance verdict must be complete or rework")
+	switch candidate.Verdict {
+	case "complete", "retry", "successor", "attention":
+	default:
+		return nil, fmt.Errorf("acceptance verdict must be complete, retry, successor, or attention")
 	}
 	if strings.TrimSpace(candidate.Summary) == "" || strings.HasPrefix(strings.TrimSpace(candidate.Summary), "Replace with") {
 		return nil, fmt.Errorf("acceptance summary is required")
 	}
-	if len(candidate.Requirements) == 0 {
+	if len(candidate.Requirements) == 0 && candidate.Verdict != "attention" {
 		return nil, fmt.Errorf("acceptance requirements are required")
 	}
 	for _, requirement := range candidate.Requirements {
@@ -291,17 +332,38 @@ func (d *Daemon) validateAcceptanceCandidate(attempt *BuildSpecAttempt, data []b
 			return nil, fmt.Errorf("requirement %q requires concrete evidence", requirement.ID)
 		}
 	}
+	if candidate.Verdict == "attention" {
+		return &acceptancePlanPatch{candidate: &candidate}, nil
+	}
 	if candidate.Verdict == "complete" {
-		if len(candidate.ReopenNodes) > 0 || len(candidate.AddNodes) > 0 || len(candidate.AddEdges) > 0 {
+		if len(candidate.ReopenNodes) > 0 || len(candidate.AddNodes) > 0 || len(candidate.AddEdges) > 0 || len(candidate.AddContracts) > 0 {
 			return nil, fmt.Errorf("complete verdict cannot request rework")
+		}
+		if failed := d.failedOrIncompleteNodes(); len(failed) > 0 {
+			return nil, fmt.Errorf("complete verdict is invalid while nodes are incomplete: %s", strings.Join(failed, ", "))
 		}
 		return &acceptancePlanPatch{candidate: &candidate}, nil
 	}
-	if len(candidate.ReopenNodes) == 0 && len(candidate.AddNodes) == 0 {
-		return nil, fmt.Errorf("rework verdict requires reopened or new nodes")
+	if candidate.Verdict == "retry" {
+		if len(candidate.ReopenNodes) == 0 {
+			return nil, fmt.Errorf("retry verdict requires reopened nodes")
+		}
+		if len(candidate.AddNodes) > 0 || len(candidate.AddEdges) > 0 || len(candidate.AddContracts) > 0 {
+			return nil, fmt.Errorf("retry verdict cannot add successors or contracts in the same review")
+		}
+		if strings.EqualFold(strings.TrimSpace(candidate.ContractImpact), "surface") {
+			return nil, fmt.Errorf("retry cannot change a public contract surface; use successor with add_contracts")
+		}
+	} else if candidate.Verdict == "successor" {
+		if len(candidate.ReopenNodes) > 0 {
+			return nil, fmt.Errorf("successor verdict cannot reopen nodes")
+		}
+		if len(candidate.AddNodes) == 0 {
+			return nil, fmt.Errorf("successor verdict requires new nodes")
+		}
 	}
 
-	patch := &acceptancePlanPatch{candidate: &candidate, reopen: candidate.ReopenNodes, addNodes: candidate.AddNodes, addEdges: candidate.AddEdges}
+	patch := &acceptancePlanPatch{candidate: &candidate, reopen: candidate.ReopenNodes, addNodes: candidate.AddNodes, addEdges: candidate.AddEdges, addContracts: candidate.AddContracts}
 	current := d.dagManager.Snapshot()
 	result := &dag.DagData{Header: current.Header, Nodes: append([]dag.DagNode(nil), current.Nodes...), Edges: append([]dag.DagEdge(nil), current.Edges...)}
 	nodesByID := make(map[string]dag.DagNode, len(result.Nodes))
@@ -319,18 +381,17 @@ func (d *Daemon) validateAcceptanceCandidate(attempt *BuildSpecAttempt, data []b
 		owned[domain.DomainID] = append([]string(nil), domain.AssignedPaths...)
 	}
 	now := time.Now().UnixMilli()
-	reopened := make(map[string]bool)
 	for _, rework := range candidate.ReopenNodes {
 		planNode, ok := planNodes[rework.NodeID]
 		if !ok {
-			return nil, fmt.Errorf("rework references unknown plan node %q", rework.NodeID)
+			return nil, fmt.Errorf("retry references unknown plan node %q", rework.NodeID)
 		}
 		node, ok := nodesByID[rework.NodeID]
 		if !ok {
-			return nil, fmt.Errorf("rework references unknown DAG node %q", rework.NodeID)
+			return nil, fmt.Errorf("retry references unknown DAG node %q", rework.NodeID)
 		}
 		if strings.TrimSpace(rework.Instruction) == "" || strings.HasPrefix(strings.TrimSpace(rework.Instruction), "Replace with") {
-			return nil, fmt.Errorf("rework node %q requires a concrete instruction", rework.NodeID)
+			return nil, fmt.Errorf("retry node %q requires a concrete instruction", rework.NodeID)
 		}
 		targets := rework.TargetFiles
 		if len(targets) == 0 {
@@ -338,14 +399,14 @@ func (d *Daemon) validateAcceptanceCandidate(attempt *BuildSpecAttempt, data []b
 		}
 		for _, target := range targets {
 			if !pathOwnedByDomain(target, owned[planNode.DomainID]) {
-				return nil, fmt.Errorf("rework node %q target %q is outside immutable domain ownership", rework.NodeID, target)
+				return nil, fmt.Errorf("retry node %q target %q is outside immutable domain ownership", rework.NodeID, target)
 			}
 		}
 		taskSpec := strings.TrimSpace(planNode.TaskSpec)
 		if taskSpec == "" {
 			taskSpec = strings.TrimSpace(node.TaskSpec)
 		}
-		taskSpec += "\n\nACCEPTANCE REWORK:\n" + strings.TrimSpace(rework.Instruction)
+		taskSpec += "\n\nACCEPTANCE RETRY:\n" + strings.TrimSpace(rework.Instruction)
 		for index := range result.Nodes {
 			if result.Nodes[index].ID != rework.NodeID {
 				continue
@@ -361,18 +422,34 @@ func (d *Daemon) validateAcceptanceCandidate(attempt *BuildSpecAttempt, data []b
 		planNode.TaskSpec = taskSpec
 		planNode.TargetFiles = append([]string(nil), targets...)
 		attempt.Plan.Nodes = replacePlanNode(attempt.Plan.Nodes, planNode)
-		reopened[rework.NodeID] = true
 	}
 	allIDs := make(map[string]bool, len(result.Nodes))
 	for _, node := range result.Nodes {
 		allIDs[node.ID] = true
 	}
+	addedNodes := make(map[string]bool, len(candidate.AddNodes))
 	for _, proposed := range candidate.AddNodes {
-		if strings.TrimSpace(proposed.ID) == "" || allIDs[proposed.ID] || reopened[proposed.ID] {
+		if strings.TrimSpace(proposed.ID) == "" || allIDs[proposed.ID] {
 			return nil, fmt.Errorf("new acceptance node ID %q is empty or already exists", proposed.ID)
 		}
 		if _, ok := domains[proposed.DomainID]; !ok {
 			return nil, fmt.Errorf("new acceptance node %q references unknown domain %q", proposed.ID, proposed.DomainID)
+		}
+		origin := strings.TrimSpace(proposed.OriginNodeID)
+		if origin == "" {
+			return nil, fmt.Errorf("new acceptance node %q requires origin_node_id", proposed.ID)
+		}
+		originNode, ok := nodesByID[origin]
+		if !ok || originNode.Status != dag.StatusDone {
+			return nil, fmt.Errorf("new acceptance node %q origin %q is not a completed DAG node", proposed.ID, origin)
+		}
+		depth := successorDepth(planNodes, origin) + 1
+		maxDepth := 2
+		if d.config != nil && d.config.Coordination.MaxSuccessorDepth > 0 {
+			maxDepth = d.config.Coordination.MaxSuccessorDepth
+		}
+		if depth > maxDepth {
+			return nil, fmt.Errorf("new acceptance node %q exceeds successor depth %d", proposed.ID, maxDepth)
 		}
 		if len(proposed.TargetFiles) == 0 {
 			return nil, fmt.Errorf("new acceptance node %q requires target files", proposed.ID)
@@ -385,9 +462,21 @@ func (d *Daemon) validateAcceptanceCandidate(attempt *BuildSpecAttempt, data []b
 		result.Nodes = append(result.Nodes, dag.DagNode{
 			ID: proposed.ID, DomainID: proposed.DomainID, TaskSpec: proposed.TaskSpec, Status: dag.StatusPending,
 			AssignedAgent: "agent-" + proposed.DomainID, TargetFiles: append([]string(nil), proposed.TargetFiles...),
-			Priority: proposed.Priority, CreatedAt: now, UpdatedAt: now,
+			Priority: proposed.Priority, CreatedAt: now, UpdatedAt: now, OriginNodeID: origin,
+			SupersedesContractID: proposed.SupersedesContractID,
 		})
 		allIDs[proposed.ID] = true
+		addedNodes[proposed.ID] = true
+		hasOriginEdge := false
+		for _, edge := range result.Edges {
+			if edge.FromNode == origin && edge.ToNode == proposed.ID {
+				hasOriginEdge = true
+				break
+			}
+		}
+		if !hasOriginEdge {
+			result.Edges = append(result.Edges, dag.DagEdge{FromNode: origin, ToNode: proposed.ID, Type: dag.EdgeDependency})
+		}
 	}
 	for _, edge := range candidate.AddEdges {
 		if !allIDs[edge.FromNode] || !allIDs[edge.ToNode] {
@@ -407,11 +496,76 @@ func (d *Daemon) validateAcceptanceCandidate(attempt *BuildSpecAttempt, data []b
 			result.Edges = append(result.Edges, dag.DagEdge{FromNode: edge.FromNode, ToNode: edge.ToNode, Type: dag.EdgeDependency})
 		}
 	}
+	for _, contract := range candidate.AddContracts {
+		if strings.TrimSpace(contract.Resource) == "" || strings.TrimSpace(contract.ProducerNode) == "" || strings.TrimSpace(contract.ConsumerNode) == "" {
+			return nil, fmt.Errorf("new acceptance contract requires resource and producer/consumer nodes")
+		}
+		producer, ok := nodesByID[contract.ProducerNode]
+		if !ok {
+			for _, node := range result.Nodes {
+				if node.ID == contract.ProducerNode {
+					producer = node
+					ok = true
+					break
+				}
+			}
+		}
+		consumer, consumerOK := nodesByID[contract.ConsumerNode]
+		if !consumerOK {
+			for _, node := range result.Nodes {
+				if node.ID == contract.ConsumerNode {
+					consumer = node
+					consumerOK = true
+					break
+				}
+			}
+		}
+		if !ok || !consumerOK {
+			return nil, fmt.Errorf("new acceptance contract %q references unknown producer or consumer node", contract.Resource)
+		}
+		if producer.DomainID == consumer.DomainID {
+			return nil, fmt.Errorf("new acceptance contract %q must cross domain boundaries", contract.Resource)
+		}
+		if len(contract.Acceptance) == 0 {
+			return nil, fmt.Errorf("new acceptance contract %q requires acceptance criteria", contract.Resource)
+		}
+		hasEdge := false
+		for _, edge := range result.Edges {
+			if edge.FromNode == contract.ProducerNode && edge.ToNode == contract.ConsumerNode {
+				hasEdge = true
+				break
+			}
+		}
+		if !hasEdge {
+			result.Edges = append(result.Edges, dag.DagEdge{FromNode: contract.ProducerNode, ToNode: contract.ConsumerNode, Type: dag.EdgeDependency})
+		}
+	}
 	if err := dag.ValidateAll(result); err != nil {
 		return nil, fmt.Errorf("acceptance DAG validation failed: %w", err)
 	}
 	patch.resultDAG = result
 	return patch, nil
+}
+
+func successorDepth(nodes map[string]coordinator.TaskNode, nodeID string) int {
+	depth := 0
+	seen := map[string]bool{}
+	for strings.TrimSpace(nodeID) != "" {
+		if seen[nodeID] {
+			return 1 << 30
+		}
+		seen[nodeID] = true
+		node, ok := nodes[nodeID]
+		if !ok {
+			return depth
+		}
+		if strings.TrimSpace(node.OriginNodeID) == "" {
+			return depth
+		}
+		depth++
+		nodeID = node.OriginNodeID
+	}
+	return depth
 }
 
 func replacePlanNode(nodes []coordinator.TaskNode, replacement coordinator.TaskNode) []coordinator.TaskNode {
@@ -456,6 +610,50 @@ func (d *Daemon) applyAcceptancePatch(attempt *BuildSpecAttempt, patch *acceptan
 		attempt.Plan.Edges = append(attempt.Plan.Edges, edge)
 		attempt.CreatedEdgeIDs = append(attempt.CreatedEdgeIDs, edge.FromNode+"->"+edge.ToNode)
 		existingEdges[key] = true
+	}
+	for _, edge := range patch.resultDAG.Edges {
+		key := edge.FromNode + "\x00" + edge.ToNode
+		if !existingEdges[key] {
+			attempt.Plan.Edges = append(attempt.Plan.Edges, coordinator.TaskEdge{FromNode: edge.FromNode, ToNode: edge.ToNode})
+			attempt.CreatedEdgeIDs = append(attempt.CreatedEdgeIDs, edge.FromNode+"->"+edge.ToNode)
+			existingEdges[key] = true
+		}
+	}
+	if len(patch.addContracts) > 0 && d.coordinationManager != nil {
+		for _, planned := range patch.addContracts {
+			producer := planned.ProducerNode
+			consumer := planned.ConsumerNode
+			contractID := deterministicContractID(producer, consumer, planned.Resource)
+			kind := strings.TrimSpace(planned.Kind)
+			if kind == "" {
+				kind = "interface"
+			}
+			producerNode, _ := d.dagManager.GetNode(producer)
+			consumerNode, _ := d.dagManager.GetNode(consumer)
+			if producerNode == nil || consumerNode == nil {
+				return fmt.Errorf("acceptance contract %s references missing nodes", planned.Resource)
+			}
+			if _, err := d.coordinationManager.Request(context.Background(), coordination.Principal{Role: coordination.RoleAdmin}, coordination.RequestCommand{
+				CommandID: "acceptance:" + attempt.AttemptID + ":" + contractID,
+				Contract: coordination.Contract{
+					ID:              contractID,
+					ProducerAgentID: expectedAgentForNode(producerNode.DomainID, ""),
+					ProducerNodeID:  producer,
+					ConsumerAgentID: expectedAgentForNode(consumerNode.DomainID, ""),
+					ConsumerNodeID:  consumer,
+					HardWait:        planned.HardWait,
+					Details: coordination.ContractDetails{
+						Name: strings.TrimSpace(planned.Resource), Kind: kind, Language: strings.TrimSpace(planned.Language),
+						PublicEntrypoint: strings.TrimSpace(planned.PublicEntrypoint), Acceptance: append([]string(nil), planned.Acceptance...),
+						HandshakeRequired: planned.HandshakeRequired, SupersedesContractID: planned.SupersedesContractID,
+					},
+				},
+			}); err != nil {
+				return fmt.Errorf("acceptance contract %s: %w", planned.Resource, err)
+			}
+			attempt.Plan.Contracts = append(attempt.Plan.Contracts, planned)
+			attempt.CreatedContractIDs = append(attempt.CreatedContractIDs, contractID)
+		}
 	}
 	return nil
 }

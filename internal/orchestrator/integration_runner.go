@@ -103,6 +103,7 @@ type IntegrationDirectiveResult struct {
 	DomainID     string    `json:"domain_id"`
 	OwnerNodeIDs []string  `json:"owner_node_ids,omitempty"`
 	Status       string    `json:"status"`
+	FailureClass string    `json:"failure_class,omitempty"`
 	ExitCode     int       `json:"exit_code"`
 	DurationMS   int64     `json:"duration_ms"`
 	Stdout       string    `json:"stdout,omitempty"`
@@ -122,6 +123,7 @@ type IntegrationRunStatus struct {
 	ContractCount   int                          `json:"contract_count"`
 	SharedFileCount int                          `json:"shared_file_count"`
 	Results         []IntegrationDirectiveResult `json:"results,omitempty"`
+	FailureClass    string                       `json:"failure_class,omitempty"`
 	Error           string                       `json:"error,omitempty"`
 	StartedAt       *time.Time                   `json:"started_at,omitempty"`
 	CompletedAt     *time.Time                   `json:"completed_at,omitempty"`
@@ -268,7 +270,7 @@ func (r *IntegrationRunner) Gate(ctx context.Context, snapshot *dag.DagData) (bo
 	if buildErr != nil {
 		r.status = IntegrationRunStatus{
 			Enabled: true, Status: IntegrationFailed, RunID: attempt.RunID, AttemptID: attempt.AttemptID,
-			Error: buildErr.Error(), UpdatedAt: time.Now().UTC(),
+			FailureClass: "prepare_failed", Error: buildErr.Error(), UpdatedAt: time.Now().UTC(),
 		}
 		now := r.status.UpdatedAt
 		r.status.CompletedAt = &now
@@ -360,9 +362,14 @@ func (r *IntegrationRunner) executeBundle(bundle *integrationBundle) {
 	if runErr != nil {
 		r.status.Status = IntegrationFailed
 		r.status.Error = runErr.Error()
+		r.status.FailureClass = "directive_execution_failed"
+		if len(results) > 0 && results[len(results)-1].FailureClass != "" {
+			r.status.FailureClass = results[len(results)-1].FailureClass
+		}
 	} else {
 		r.status.Status = IntegrationPassed
 		r.status.Error = ""
+		r.status.FailureClass = ""
 	}
 	status := cloneIntegrationStatus(r.status)
 	r.persistLocked()
@@ -419,12 +426,14 @@ func (r *IntegrationRunner) executeDirective(bundle *integrationBundle, artifact
 	defer cancel()
 	workspace, err := r.isolation.Prepare(ctx, policy)
 	if err != nil {
+		result.FailureClass = "workspace_prepare_failed"
 		result.Error = err.Error()
 		return finishDirectiveResult(result, started), err
 	}
 	defer workspace.Close()
 	cmd, err := workspace.Command(ctx, isolation.CommandSpec{Path: directive.Command[0], Args: directive.Command[1:]})
 	if err != nil {
+		result.FailureClass = "workspace_prepare_failed"
 		result.Error = err.Error()
 		return finishDirectiveResult(result, started), err
 	}
@@ -443,8 +452,10 @@ func (r *IntegrationRunner) executeDirective(bundle *integrationBundle, artifact
 		if !errors.As(err, &exitErr) && cmd.ProcessState != nil {
 			result.ExitCode = cmd.ProcessState.ExitCode()
 		}
+		result.FailureClass = "directive_execution_failed"
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			result.Error = fmt.Sprintf("directive exceeded %s timeout", timeout)
+			result.FailureClass = "directive_timeout"
 		}
 		return finishDirectiveResult(result, started), fmt.Errorf("integration directive %s failed: %s", directive.ID, result.Error)
 	}

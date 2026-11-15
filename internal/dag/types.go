@@ -80,6 +80,10 @@ type DagNode struct {
 	PromptTokens int32 `json:"prompt_tokens,omitempty"`
 	// CompletionTokens is the amount of metric tokens generated.
 	CompletionTokens int32 `json:"completion_tokens,omitempty"`
+	// OriginNodeID links successor work to the completed node it follows.
+	OriginNodeID string `json:"origin_node_id,omitempty"`
+	// SupersedesContractID records a public contract superseded by this node.
+	SupersedesContractID string `json:"supersedes_contract_id,omitempty"`
 }
 
 // DagEdge represents a directed edge between two DAG nodes.

@@ -92,15 +92,16 @@ type PlanResponse struct {
 
 // PlannedContract declares one producer/consumer artifact before agents run.
 type PlannedContract struct {
-	Resource          string   `json:"resource"`
-	ProducerNode      string   `json:"producer_node"`
-	ConsumerNode      string   `json:"consumer_node"`
-	Kind              string   `json:"kind,omitempty"`
-	Language          string   `json:"language,omitempty"`
-	PublicEntrypoint  string   `json:"public_entrypoint,omitempty"`
-	Acceptance        []string `json:"acceptance,omitempty"`
-	HardWait          bool     `json:"hard_wait,omitempty"`
-	HandshakeRequired bool     `json:"handshake_required,omitempty"`
+	Resource             string   `json:"resource"`
+	ProducerNode         string   `json:"producer_node"`
+	ConsumerNode         string   `json:"consumer_node"`
+	Kind                 string   `json:"kind,omitempty"`
+	Language             string   `json:"language,omitempty"`
+	PublicEntrypoint     string   `json:"public_entrypoint,omitempty"`
+	Acceptance           []string `json:"acceptance,omitempty"`
+	HardWait             bool     `json:"hard_wait,omitempty"`
+	HandshakeRequired    bool     `json:"handshake_required,omitempty"`
+	SupersedesContractID string   `json:"supersedes_contract_id,omitempty"`
 }
 
 // Domain describes an area of responsibility.
@@ -113,11 +114,13 @@ type Domain struct {
 
 // TaskNode is a planned task for the DAG.
 type TaskNode struct {
-	ID          string   `json:"id"`
-	DomainID    string   `json:"domain_id"`
-	TaskSpec    string   `json:"task_spec"`
-	TargetFiles []string `json:"target_files"`
-	Priority    int32    `json:"priority"`
+	ID                   string   `json:"id"`
+	DomainID             string   `json:"domain_id"`
+	TaskSpec             string   `json:"task_spec"`
+	TargetFiles          []string `json:"target_files"`
+	Priority             int32    `json:"priority"`
+	OriginNodeID         string   `json:"origin_node_id,omitempty"`
+	SupersedesContractID string   `json:"supersedes_contract_id,omitempty"`
 }
 
 // TaskEdge is a planned dependency edge.

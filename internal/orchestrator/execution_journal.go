@@ -37,6 +37,13 @@ type RecoveryRecord struct {
 	Summary          string    `json:"summary"`
 	LastError        string    `json:"last_error,omitempty"`
 	SuggestedCommand string    `json:"suggested_command,omitempty"`
+	RecoveryEpoch    int64     `json:"recovery_epoch,omitempty"`
+	RecoveryPhase    string    `json:"recovery_phase,omitempty"`
+	RecoveryOwner    string    `json:"recovery_owner,omitempty"`
+	FailureCode      string    `json:"failure_code,omitempty"`
+	FailureClass     string    `json:"failure_class,omitempty"`
+	RecoveryAttempts int       `json:"recovery_attempts,omitempty"`
+	RecoveryBudget   int       `json:"recovery_budget,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
 }

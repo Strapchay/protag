@@ -460,6 +460,9 @@ func parseCommand(command string, args []string) (map[string]interface{}, error)
 		}
 		return map[string]interface{}{"id": id}, nil
 
+	case "resume-preflight":
+		return nil, nil
+
 	case "contract-standstill":
 		contractID := flags["contract-id"]
 		revision, err := requiredPositiveRevision(flags, "contract-standstill")
@@ -914,6 +917,7 @@ Commands:
 	contract-accept-terms  --contract-id <id> --revision <N>
 	contract-terms         --contract-id <id>
 	contract-standstill    --contract-id <id> --revision <N> --reason <text> [--terminal] [--evidence '["..."]']
+	resume-preflight       Show the read-only build resume preflight
 	resolution-list        List coordinator reconciliation lineages
 	resolution-show        --id <resolution-id> Show one reconciliation lineage
 	resolution-retry       --id <resolution-id> Retry an AwaitingUser reconciliation

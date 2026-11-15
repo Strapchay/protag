@@ -355,7 +355,8 @@ func TestReviewPromptUsesTemplateAndRejectsSourceWrites(t *testing.T) {
 		"/workspace/docs/aion/acceptance/buildspec_1/acceptance_output.json",
 		"Do not modify source files",
 		"verdict complete",
-		"verdict rework",
+		"verdict retry",
+		"verdict successor",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("review prompt missing %q:\n%s", want, prompt)

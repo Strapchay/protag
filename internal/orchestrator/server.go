@@ -65,6 +65,7 @@ type Server struct {
 	continueCb                 func() error
 	resumeCb                   func() error
 	buildSpecContinueCb        func() error
+	buildSpecPreflightCb       func() ResumePreflight
 	statusCb                   func() string
 	showSpecCb                 func() (string, error)
 	resetCb                    func() error
@@ -924,6 +925,8 @@ func (s *Server) handleRequest(req Request) Response {
 		return s.handleBuildSpecShowTrace(req)
 	case "build-spec-cancel":
 		return s.handleBuildSpecCancel(req)
+	case "build-spec-resume-preflight", "resume-preflight":
+		return s.handleBuildSpecResumePreflight(req)
 	case "build-spec-continue-agents":
 		return s.handleBuildSpecContinueAgents(req)
 	case "build-spec-stop-agents", "stop-agents":
@@ -969,6 +972,10 @@ func (s *Server) SetArchitectResumeCallback(cb func() error) {
 
 func (s *Server) SetBuildSpecContinueCallback(cb func() error) {
 	s.buildSpecContinueCb = cb
+}
+
+func (s *Server) SetBuildSpecResumePreflightCallback(cb func() ResumePreflight) {
+	s.buildSpecPreflightCb = cb
 }
 
 func (s *Server) SetArchitectStatusCallback(cb func() string) {
@@ -1416,6 +1423,13 @@ func (s *Server) handleBuildSpecCancel(req Request) Response {
 		return Response{ID: req.ID, Error: err.Error()}
 	}
 	return Response{ID: req.ID, Result: map[string]string{"status": "cancel_started"}}
+}
+
+func (s *Server) handleBuildSpecResumePreflight(req Request) Response {
+	if s.buildSpecPreflightCb == nil {
+		return Response{ID: req.ID, Error: "build-spec resume preflight callback not configured"}
+	}
+	return Response{ID: req.ID, Result: s.buildSpecPreflightCb()}
 }
 
 func (s *Server) handleBuildSpecContinueAgents(req Request) Response {

@@ -67,6 +67,9 @@ coordination:
   lease_timeout_sec: ${AION_COORDINATION_LEASE_TIMEOUT_SEC}
   artifact_timeout_sec: ${AION_COORDINATION_ARTIFACT_TIMEOUT_SEC}
   deadlock_timeout_sec: ${AION_COORDINATION_DEADLOCK_TIMEOUT_SEC}
+  max_successor_depth: ${AION_COORDINATION_MAX_SUCCESSOR_DEPTH}
+  max_integration_recoveries: ${AION_COORDINATION_MAX_INTEGRATION_RECOVERIES}
+  allow_acceptance_without_integration: ${AION_ALLOW_ACCEPTANCE_WITHOUT_INTEGRATION}
 
 isolation:
   # Mandatory domain-agent sandbox backend; no production passthrough exists

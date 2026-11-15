@@ -29,36 +29,45 @@ const (
 )
 
 type BuildSpecAgentState struct {
-	AgentID   string    `json:"agent_id"`
-	DomainID  string    `json:"domain_id"`
-	State     string    `json:"state"`
-	Reason    string    `json:"reason,omitempty"`
-	UpdatedAt time.Time `json:"updated_at"`
+	AgentID            string    `json:"agent_id"`
+	DomainID           string    `json:"domain_id"`
+	State              string    `json:"state"`
+	Reason             string    `json:"reason,omitempty"`
+	UpdatedAt          time.Time `json:"updated_at"`
+	RecoveryEpoch      int64     `json:"recovery_epoch,omitempty"`
+	RecoveryPhase      string    `json:"recovery_phase,omitempty"`
+	RecoveryOwner      string    `json:"recovery_owner,omitempty"`
+	FailureCode        string    `json:"failure_code,omitempty"`
+	FailureClass       string    `json:"failure_class,omitempty"`
+	RecoveryAttempts   int       `json:"recovery_attempts,omitempty"`
+	RecoveryBudget     int       `json:"recovery_budget,omitempty"`
+	SupervisorRestarts int       `json:"supervisor_restarts,omitempty"`
 }
 
 type BuildSpecAttempt struct {
-	AttemptID            string                         `json:"attempt_id"`
-	RunID                string                         `json:"run_id"`
-	SpecPath             string                         `json:"spec_path"`
-	SpecHash             string                         `json:"spec_hash"`
-	PlannerSessionDir    string                         `json:"planner_session_dir,omitempty"`
-	PlanningArtifactDir  string                         `json:"planning_artifact_dir,omitempty"`
-	Status               BuildSpecAttemptStatus         `json:"status"`
-	StartedAt            time.Time                      `json:"started_at"`
-	UpdatedAt            time.Time                      `json:"updated_at"`
-	CompletedAt          *time.Time                     `json:"completed_at,omitempty"`
-	FailureReason        string                         `json:"failure_reason,omitempty"`
-	Plan                 *coordinator.PlanResponse      `json:"plan,omitempty"`
-	CreatedNodeIDs       []string                       `json:"created_node_ids,omitempty"`
-	CreatedEdgeIDs       []string                       `json:"created_edge_ids,omitempty"`
-	CreatedContractIDs   []string                       `json:"created_contract_ids,omitempty"`
-	AllocatedDomainIDs   []string                       `json:"allocated_domain_ids,omitempty"`
-	AgentStates          map[string]BuildSpecAgentState `json:"agent_states,omitempty"`
-	CanceledAt           *time.Time                     `json:"canceled_at,omitempty"`
-	AcceptanceStatus     string                         `json:"acceptance_status,omitempty"`
-	AcceptanceRounds     int                            `json:"acceptance_rounds,omitempty"`
-	AcceptanceSummary    string                         `json:"acceptance_summary,omitempty"`
-	AcceptanceReviewPath string                         `json:"acceptance_review_path,omitempty"`
+	AttemptID                 string                         `json:"attempt_id"`
+	RunID                     string                         `json:"run_id"`
+	SpecPath                  string                         `json:"spec_path"`
+	SpecHash                  string                         `json:"spec_hash"`
+	PlannerSessionDir         string                         `json:"planner_session_dir,omitempty"`
+	PlanningArtifactDir       string                         `json:"planning_artifact_dir,omitempty"`
+	Status                    BuildSpecAttemptStatus         `json:"status"`
+	StartedAt                 time.Time                      `json:"started_at"`
+	UpdatedAt                 time.Time                      `json:"updated_at"`
+	CompletedAt               *time.Time                     `json:"completed_at,omitempty"`
+	FailureReason             string                         `json:"failure_reason,omitempty"`
+	Plan                      *coordinator.PlanResponse      `json:"plan,omitempty"`
+	CreatedNodeIDs            []string                       `json:"created_node_ids,omitempty"`
+	CreatedEdgeIDs            []string                       `json:"created_edge_ids,omitempty"`
+	CreatedContractIDs        []string                       `json:"created_contract_ids,omitempty"`
+	AllocatedDomainIDs        []string                       `json:"allocated_domain_ids,omitempty"`
+	AgentStates               map[string]BuildSpecAgentState `json:"agent_states,omitempty"`
+	CanceledAt                *time.Time                     `json:"canceled_at,omitempty"`
+	AcceptanceStatus          string                         `json:"acceptance_status,omitempty"`
+	AcceptanceRounds          int                            `json:"acceptance_rounds,omitempty"`
+	AcceptanceSummary         string                         `json:"acceptance_summary,omitempty"`
+	AcceptanceReviewPath      string                         `json:"acceptance_review_path,omitempty"`
+	IntegrationRecoveryRounds int                            `json:"integration_recovery_rounds,omitempty"`
 }
 
 func newBuildSpecAttempt(runID, specPath string, specData []byte) *BuildSpecAttempt {
