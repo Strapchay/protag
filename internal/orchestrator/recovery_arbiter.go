@@ -168,6 +168,24 @@ func (d *Daemon) resumeBuildWorkAfterAcceptance(attempt *BuildSpecAttempt) error
 	return nil
 }
 
+func (d *Daemon) reopenFailedNodesForResume() error {
+	if d == nil || d.dagManager == nil {
+		return nil
+	}
+	for _, node := range d.dagManager.Snapshot().Nodes {
+		if node.Status != dag.StatusFailed {
+			continue
+		}
+		if err := d.dagManager.UpdateNode(node.ID, dag.StatusPending); err != nil {
+			return fmt.Errorf("reopen failed node %s: %w", node.ID, err)
+		}
+		if updated, err := d.dagManager.GetNode(node.ID); err == nil && updated != nil && d.server != nil {
+			d.server.recordNodeProgressFact(*updated, dag.StatusPending)
+		}
+	}
+	return nil
+}
+
 func (d *Daemon) initRecoveryArbiter() {
 	if d == nil || d.runState == nil {
 		return
@@ -274,6 +292,9 @@ func (d *Daemon) buildResumePreflight() ResumePreflight {
 		if agent.Recovery.Phase == "awaiting_operator" {
 			preflight.Warnings = append(preflight.Warnings, "agent "+agent.AgentID+" exhausted its recovery budget; confirmation grants a new operator-approved epoch")
 		}
+	}
+	if failedCount := preflight.NodeCounts[dag.StatusFailed.String()]; failedCount > 0 {
+		preflight.Warnings = append(preflight.Warnings, fmt.Sprintf("%d failed node(s) will be reopened for an operator-approved retry", failedCount))
 	}
 	if attempt.AcceptanceStatus == "passed" {
 		preflight.ResumePlan = append(preflight.ResumePlan, "finalize completed build")

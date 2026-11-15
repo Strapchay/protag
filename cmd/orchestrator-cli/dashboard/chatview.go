@@ -730,10 +730,11 @@ func (m *ChatModel) executeCommand(cmdStr string) {
 	case "/continue-agents", "/resume-agents", "/countine-agents":
 		if len(parts) > 1 && strings.EqualFold(strings.TrimSpace(parts[1]), "confirm") {
 			methodName = "build-spec-continue-agents"
+			params = map[string]interface{}{"confirm": true}
 		} else {
 			methodName = "build-spec-resume-preflight"
+			params = map[string]interface{}{}
 		}
-		params = map[string]interface{}{}
 		showResponse = true
 	case "/stop-agents":
 		methodName = "build-spec-stop-agents"

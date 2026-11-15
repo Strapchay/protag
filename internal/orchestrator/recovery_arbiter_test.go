@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"testing"
 	"time"
+
+	"aion-kernel/internal/dag"
 )
 
 func TestRecoveryArbiterStateTransitions(t *testing.T) {
@@ -67,5 +69,23 @@ func TestIntegrationFailureDisposition(t *testing.T) {
 		if integrationFailureDisposition(class) != "attention" {
 			t.Fatalf("%q should require attention", class)
 		}
+	}
+}
+
+func TestResumePreflightAndRetryFailedNode(t *testing.T) {
+	daemon, _ := acceptanceFixture(t)
+	if err := daemon.dagManager.UpdateNode("alpha-core", dag.StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	preflight := daemon.buildResumePreflight()
+	if !preflight.CanResume || len(preflight.Warnings) == 0 {
+		t.Fatalf("failed-node preflight = %#v", preflight)
+	}
+	if err := daemon.reopenFailedNodesForResume(); err != nil {
+		t.Fatal(err)
+	}
+	node, err := daemon.dagManager.GetNode("alpha-core")
+	if err != nil || node.Status != dag.StatusPending {
+		t.Fatalf("reopened node = %#v, err=%v", node, err)
 	}
 }

@@ -737,6 +737,9 @@ func (d *Daemon) continueBuildSpecAgents() error {
 	if !preflight.CanResume {
 		return fmt.Errorf("resume blocked: %s", strings.Join(preflight.BlockingReasons, "; "))
 	}
+	if err := d.reopenFailedNodesForResume(); err != nil {
+		return err
+	}
 	d.buildSpecMu.Lock()
 	armed := d.buildSpecContinueArmed
 	d.buildSpecMu.Unlock()

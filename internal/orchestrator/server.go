@@ -1436,6 +1436,15 @@ func (s *Server) handleBuildSpecContinueAgents(req Request) Response {
 	if s.buildSpecContinueCb == nil {
 		return Response{ID: req.ID, Error: "build-spec continue callback not configured"}
 	}
+	var params struct {
+		Confirm bool `json:"confirm"`
+	}
+	if len(req.Params) > 0 {
+		_ = json.Unmarshal(req.Params, &params)
+	}
+	if !params.Confirm {
+		return Response{ID: req.ID, Error: "resume requires preflight confirmation; run /continue-agents to review, then /continue-agents confirm"}
+	}
 	if err := s.buildSpecContinueCb(); err != nil {
 		s.BroadcastStatus("Build-spec continue failed: "+err.Error(), "error")
 		return Response{ID: req.ID, Error: err.Error()}
