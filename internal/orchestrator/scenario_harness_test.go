@@ -758,6 +758,19 @@ func scenarioRegistry() []scenarioCase {
 				if fulfilled.Status != coordination.StatusFulfilled {
 					h.t.Fatalf("fulfilled status = %s", fulfilled.Status)
 				}
+				effects, err := h.daemon.coordinationManager.PendingEffects(context.Background(), 100)
+				if err != nil {
+					h.t.Fatal(err)
+				}
+				foundFulfilled := false
+				for _, effect := range effects {
+					if effect.Type == coordination.EffectContractFulfilled {
+						foundFulfilled = true
+					}
+				}
+				if !foundFulfilled {
+					h.t.Fatalf("fulfillment notification effect missing: %#v", effects)
+				}
 			},
 		},
 		{

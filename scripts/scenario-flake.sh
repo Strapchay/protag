@@ -15,6 +15,7 @@ RUNS="${RUNS:-3}"
 MODE="${MODE:-deterministic}"
 RACE="${RACE:-0}"
 OUTPUT="${OUTPUT:-/tmp/opencode/scenario-flake-$(date +%Y%m%dT%H%M%S)}"
+HISTORY="${HISTORY:-/tmp/opencode/scenario-flake-history.jsonl}"
 mkdir -p "$OUTPUT"
 RESULTS="$OUTPUT/runs.jsonl"
 : > "$RESULTS"
@@ -56,8 +57,8 @@ for mode in $(if [ "$MODE" = "all" ]; then echo "deterministic live"; else echo 
   done
 done
 
-python3 - "$RESULTS" "$OUTPUT/summary.json" <<'PY'
-import json,sys
+python3 - "$RESULTS" "$OUTPUT/summary.json" "$HISTORY" "$OUTPUT/history_summary.json" <<'PY'
+import json,sys,os,datetime
 rows=[json.loads(line) for line in open(sys.argv[1]) if line.strip()]
 modes=sorted({r["mode"] for r in rows})
 summary={"runs":len(rows),"passed":sum(1 for r in rows if r["status"]=="passed"),
@@ -68,7 +69,26 @@ summary={"runs":len(rows),"passed":sum(1 for r in rows if r["status"]=="passed")
                         "failed":sum(1 for r in rows if r["mode"]==m and r["status"]=="failed")}
                     for m in modes}}
 json.dump(summary,open(sys.argv[2],"w"),indent=2)
+history_path=sys.argv[3]
+history_summary_path=sys.argv[4]
+os.makedirs(os.path.dirname(history_path) or ".",exist_ok=True)
+record={"timestamp":datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        **summary,"summary_path":sys.argv[2]}
+with open(history_path,"a") as fh:
+    fh.write(json.dumps(record)+"\n")
+rows=[]
+with open(history_path) as fh:
+    for line in fh:
+        if line.strip():
+            try: rows.append(json.loads(line))
+            except json.JSONDecodeError: pass
+history={"runs":sum(r.get("runs",0) for r in rows),
+         "passed":sum(r.get("passed",0) for r in rows),
+         "failed":sum(r.get("failed",0) for r in rows)}
+history["pass_rate"]=history["passed"]/history["runs"] if history["runs"] else 0
+json.dump(history,open(history_summary_path,"w"),indent=2)
 print(json.dumps(summary,indent=2))
+print(json.dumps({"history":history,"history_path":history_path,"history_summary":history_summary_path},indent=2))
 PY
 
 if [ "$failed" -ne 0 ]; then

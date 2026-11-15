@@ -459,3 +459,38 @@ func TestContinueAgentsRequiresPreflightThenConfirm(t *testing.T) {
 		t.Fatalf("confirm params = %#v", params)
 	}
 }
+
+func TestContinueAgentsRendersPreflightViewport(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = json.NewDecoder(conn).Decode(&map[string]any{})
+		_ = json.NewEncoder(conn).Encode(map[string]any{
+			"result": map[string]any{
+				"can_resume":        true,
+				"status":            "paused",
+				"acceptance_status": "attention",
+				"resume_plan":       []string{"rerun acceptance after operator review"},
+				"confirmation_hint": "Run /continue-agents confirm to proceed.",
+				"blocking_reasons":  []string{},
+			},
+		})
+	}()
+	m := NewChatModel(listener.Addr().String())
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.executeCommand("/continue-agents")
+	view := m.View()
+	for _, want := range []string{"can_resume", "resume_plan", "rerun acceptance", "continue-agents confirm"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("preflight viewport missing %q:\n%s", want, view)
+		}
+	}
+}
