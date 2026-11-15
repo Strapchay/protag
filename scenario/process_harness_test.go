@@ -1,10 +1,11 @@
-//go:build scenario_process
+//go:build scenario_process || scenario_live
 
 package scenario
 
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,9 +25,15 @@ type ProcessHarness struct {
 	cmd     *exec.Cmd
 	done    chan error
 	logFile *os.File
+	Addr    string
+	PID     int
 }
 
 func NewProcessHarness(t *testing.T) *ProcessHarness {
+	return NewProcessHarnessAt(t, t.TempDir())
+}
+
+func NewProcessHarnessAt(t *testing.T, root string) *ProcessHarness {
 	t.Helper()
 	binary := os.Getenv("AION_KERNEL_BIN")
 	if binary == "" {
@@ -39,7 +46,6 @@ func NewProcessHarness(t *testing.T) *ProcessHarness {
 	if _, err := os.Stat(binary); err != nil {
 		t.Skipf("kernel binary not available: %v", err)
 	}
-	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "docs"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -64,6 +70,7 @@ func (h *ProcessHarness) Start() {
 	if err := h.cmd.Start(); err != nil {
 		h.t.Fatal(err)
 	}
+	h.PID = h.cmd.Process.Pid
 	h.done = make(chan error, 1)
 	go func() { h.done <- h.cmd.Wait() }()
 	serverInfo := filepath.Join(h.Root, ".aion", "server.json")
@@ -74,6 +81,7 @@ func (h *ProcessHarness) Start() {
 				Addr string `json:"addr"`
 			}
 			if json.Unmarshal(data, &info) == nil && info.Addr != "" {
+				h.Addr = info.Addr
 				return
 			}
 		}
@@ -85,6 +93,33 @@ func (h *ProcessHarness) Start() {
 	}
 	h.Stop()
 	h.t.Fatalf("kernel did not become ready; log: %s", h.LogPath)
+}
+
+func (h *ProcessHarness) Request(method string, params any) (json.RawMessage, error) {
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.DialTimeout("tcp", h.Addr, 3*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	request := map[string]any{"method": method, "params": json.RawMessage(raw), "id": "scenario"}
+	if err := json.NewEncoder(conn).Encode(request); err != nil {
+		return nil, err
+	}
+	var response struct {
+		Result json.RawMessage `json:"result"`
+		Error  string          `json:"error"`
+	}
+	if err := json.NewDecoder(conn).Decode(&response); err != nil {
+		return nil, err
+	}
+	if response.Error != "" {
+		return nil, fmt.Errorf("%s", response.Error)
+	}
+	return response.Result, nil
 }
 
 func (h *ProcessHarness) Stop() {
@@ -116,4 +151,26 @@ func TestProcessScenarioSmoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	fmt.Println("process scenario server ready at", h.Root)
+	h.Stop()
+	if err := syscall.Kill(h.PID, 0); err == nil {
+		t.Fatalf("kernel process %d still alive after stop", h.PID)
+	}
+}
+
+func TestProcessScenarioPreflightGating(t *testing.T) {
+	if os.Getenv("AION_PROCESS_SCENARIO") != "1" {
+		t.Skip("set AION_PROCESS_SCENARIO=1 to run process-level scenarios")
+	}
+	h := NewProcessHarness(t)
+	t.Cleanup(h.Stop)
+	h.Start()
+	if _, err := h.Request("resume-preflight", map[string]any{}); err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	if _, err := h.Request("build-spec-continue-agents", map[string]any{}); err == nil {
+		t.Fatal("continuation without confirm was accepted")
+	}
+	if _, err := h.Request("build-spec-continue-agents", map[string]any{"confirm": true}); err == nil {
+		t.Fatal("continuation without a resumable attempt should fail")
+	}
 }

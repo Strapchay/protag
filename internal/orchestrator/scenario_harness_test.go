@@ -135,7 +135,10 @@ func newScenarioHarness(t *testing.T, coordinatorImpl coordinator.Coordinator) *
 		t.Fatal(err)
 	}
 	router := hub.NewRouter(run.LogsDir)
-	manager, err := coordination.Open(coordination.Options{StateDir: filepath.Join(root, "coordination")})
+	manager, err := coordination.Open(coordination.Options{
+		StateDir: filepath.Join(root, "coordination"), MaxNegotiationRounds: 2,
+		MaxProcessAttempts: 2, MaxRepairAttempts: 1, MaxContextExpansions: 1,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -572,6 +575,120 @@ func scenarioRegistry() []scenarioCase {
 			},
 		},
 		{
+			Name: "resolution-complete",
+			Run: func(h *scenarioHarness) {
+				spec := "# Resolution Fixture\n"
+				h.WriteBuildSpec(spec)
+				for _, node := range []dag.DagNode{
+					{ID: "alpha-node", DomainID: "alpha", TaskSpec: "alpha", Status: dag.StatusBlocked, AssignedAgent: "agent-alpha", TargetFiles: []string{"alpha/main.go"}},
+					{ID: "beta-node", DomainID: "beta", TaskSpec: "beta", Status: dag.StatusBlocked, AssignedAgent: "agent-beta", TargetFiles: []string{"beta/main.go"}},
+				} {
+					if err := h.daemon.dagManager.AddNode(node); err != nil {
+						h.t.Fatal(err)
+					}
+				}
+				attempt := newBuildSpecAttempt(h.daemon.runState.RunID, "docs/build_spec.md", []byte(spec))
+				attempt.Plan = &coordinator.PlanResponse{
+					Domains: []coordinator.Domain{{DomainID: "alpha", AssignedPaths: []string{"alpha/"}}, {DomainID: "beta", AssignedPaths: []string{"beta/"}}},
+					Nodes:   []coordinator.TaskNode{{ID: "alpha-node", DomainID: "alpha", TargetFiles: []string{"alpha/main.go"}}, {ID: "beta-node", DomainID: "beta", TargetFiles: []string{"beta/main.go"}}},
+				}
+				if err := saveBuildSpecAttempt(h.daemon.runState.Root, attempt); err != nil {
+					h.t.Fatal(err)
+				}
+				admin := coordination.Principal{Role: coordination.RoleAdmin}
+				contract, err := h.daemon.coordinationManager.Request(context.Background(), admin, coordination.RequestCommand{Contract: coordination.Contract{
+					ID: "contract-resolution", ProducerAgentID: "agent-alpha", ProducerNodeID: "alpha-node",
+					ConsumerAgentID: "agent-beta", ConsumerNodeID: "beta-node",
+					Details: coordination.ContractDetails{Name: "Boundary", Kind: "interface"}, Status: coordination.StatusRequested,
+				}})
+				if err != nil {
+					h.t.Fatal(err)
+				}
+				if _, err := h.daemon.coordinationManager.ProposeTerms(context.Background(), admin, coordination.ProposeTermsCommand{
+					ContractID: contract.ID, ExpectedRevision: 1, Details: contract.Details, Rationale: "fixture incompatible shape",
+				}); err != nil {
+					h.t.Fatal(err)
+				}
+				resolution, err := h.daemon.coordinationManager.DeclareStandstill(context.Background(), admin, coordination.StandstillCommand{
+					ContractID: contract.ID, TermsRevision: 2, Reason: "fixture requires reconciliation",
+				})
+				if err != nil {
+					h.t.Fatal(err)
+				}
+				h.daemon.coordinator = &resolutionWorkflowCoordinator{output: resolutionOutputArtifact{
+					Type: "aion_contract_resolution", Rationale: "introduce an owned adapter",
+					Evidence: []string{"fixture public contract lineage"}, Actions: []resolutionAction{{Kind: "add_task", Summary: "add an alpha-owned adapter"}},
+					Terms:    resolutionTermsOutput{Details: coordination.ContractDetails{Name: "Boundary", Kind: "interface", Compatibility: "adapter"}},
+					AddNodes: []coordinator.TaskNode{{ID: "alpha-adapter", DomainID: "alpha", TaskSpec: "implement adapter", TargetFiles: []string{"alpha/adapter.go"}, Priority: 2}},
+					AddEdges: []coordinator.TaskEdge{{FromNode: "alpha-node", ToNode: "alpha-adapter"}},
+				}}
+				if err := h.daemon.runNextCoordinationResolution(); err != nil {
+					h.t.Fatal(err)
+				}
+				resolved, err := h.daemon.coordinationManager.GetResolution(context.Background(), resolution.ID)
+				if err != nil || resolved.Status != coordination.ResolutionResolved {
+					h.t.Fatalf("resolution = %#v err=%v", resolved, err)
+				}
+				adapter, err := h.daemon.dagManager.GetNode("alpha-adapter")
+				if err != nil || adapter.Status != dag.StatusPending {
+					h.t.Fatalf("adapter = %#v err=%v", adapter, err)
+				}
+			},
+		},
+		{
+			Name: "coordination-deadlock-and-retry",
+			Run: func(h *scenarioHarness) {
+				for _, node := range []dag.DagNode{
+					coordinationNode("producer-node", "alpha", "agent-alpha"),
+					coordinationNode("consumer-node", "beta", "agent-beta"),
+				} {
+					if err := h.daemon.dagManager.AddNode(node); err != nil {
+						h.t.Fatal(err)
+					}
+				}
+				admin := coordination.Principal{Role: coordination.RoleAdmin}
+				contract := coordinationContract("contract-deadlock-fixture", "agent-alpha", "producer-node", "agent-beta", "consumer-node")
+				contract.Details.Name = "fixture-deadlock-api"
+				if _, err := h.daemon.coordinationManager.Request(context.Background(), admin, coordination.RequestCommand{Contract: contract}); err != nil {
+					h.t.Fatal(err)
+				}
+				if _, err := h.daemon.coordinationManager.Publish(context.Background(), admin, coordination.PublishCommand{
+					ContractID: contract.ID, ExpectedRevision: 0, Content: []byte("fixture"),
+				}); err != nil {
+					h.t.Fatal(err)
+				}
+				now := time.Now().Add(20 * time.Second)
+				if created := h.daemon.scanCoordinationDeadlocks(now); created != 1 {
+					h.t.Fatalf("created resolutions = %d", created)
+				}
+				if created := h.daemon.scanCoordinationDeadlocks(now); created != 0 {
+					h.t.Fatalf("duplicate resolutions = %d", created)
+				}
+				resolutions, err := h.daemon.coordinationManager.ListResolutions(context.Background())
+				if err != nil || len(resolutions) != 1 {
+					h.t.Fatalf("resolutions = %#v err=%v", resolutions, err)
+				}
+				resolution := resolutions[0]
+				for attempt := 0; attempt < 2; attempt++ {
+					claimed, err := h.daemon.coordinationManager.ClaimNextResolution(context.Background(), time.Minute)
+					if err != nil || claimed == nil {
+						h.t.Fatalf("claim %d = %#v err=%v", attempt, claimed, err)
+					}
+					if _, err := h.daemon.coordinationManager.FailResolutionAttempt(context.Background(), claimed.ID, claimed.LeaseToken, "fixture failure"); err != nil {
+						h.t.Fatal(err)
+					}
+				}
+				awaiting, err := h.daemon.coordinationManager.GetResolution(context.Background(), resolution.ID)
+				if err != nil || awaiting.Status != coordination.ResolutionAwaitingUser {
+					h.t.Fatalf("awaiting = %#v err=%v", awaiting, err)
+				}
+				retried, err := h.daemon.coordinationManager.RetryResolution(context.Background(), resolution.ID)
+				if err != nil || retried.Status != coordination.ResolutionPending || retried.ProcessAttempts != 0 {
+					h.t.Fatalf("retried = %#v err=%v", retried, err)
+				}
+			},
+		},
+		{
 			Name: "contract-lifecycle-handshake",
 			Run: func(h *scenarioHarness) {
 				producerAgent, consumerAgent := "agent-alpha", "agent-beta"
@@ -912,7 +1029,7 @@ func TestScenarioRegistry(t *testing.T) {
 				"recovery-restart-reconstruct", "recovery-failed-node-operator-retry",
 				"integration-directive-recovery", "integration-recovery-budget", "integration-prepare-attention",
 				"integration-missing-contract-attention", "integration-skipped-accepted", "integration-disabled-blocks-acceptance",
-				"contract-lifecycle-handshake":
+				"contract-lifecycle-handshake", "coordination-deadlock-and-retry", "resolution-complete":
 				runScenario(t, tc, &scenarioCoordinator{})
 			case "acceptance-retry-cycle":
 				loaded := loadScenarioFixture(t, "acceptance-retry-cycle")

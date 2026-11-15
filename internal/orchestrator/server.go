@@ -471,7 +471,9 @@ func (s *Server) ListenAndServe(addr string) error {
 	if err != nil {
 		return fmt.Errorf("server: listen: %w", err)
 	}
+	s.mu.Lock()
 	s.listener = ln
+	s.mu.Unlock()
 	log.Printf("orchestrator: listening on %s", addr)
 	return s.serve(ln)
 }
@@ -550,6 +552,8 @@ func (s *Server) Stop() error {
 
 // Addr returns the listener address, or empty if not started.
 func (s *Server) Addr() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.listener != nil {
 		return s.listener.Addr().String()
 	}

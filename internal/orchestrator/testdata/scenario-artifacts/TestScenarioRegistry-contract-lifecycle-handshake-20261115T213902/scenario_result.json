@@ -1,7 +1,0 @@
-{
-  "name": "TestScenarioRegistry/contract-lifecycle-handshake",
-  "status": "failed",
-  "started_at": "2026-11-15T21:39:02.416733435Z",
-  "duration_ms": 130,
-  "artifacts": "testdata/scenario-artifacts/TestScenarioRegistry-contract-lifecycle-handshake-20261115T213902"
-}
