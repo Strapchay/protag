@@ -62,6 +62,7 @@ type Daemon struct {
 	coordinationResolutionOn bool
 	acceptanceMu             sync.Mutex
 	workResumeFn             func(*BuildSpecAttempt) error
+	recoveryAgentInfoFn      func(string) (AgentInfo, bool)
 	recoveryMu               sync.Mutex
 	recoveryStates           map[string]AgentRecoveryState
 	recoveryQueue            []RecoveryRequest

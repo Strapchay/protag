@@ -894,6 +894,24 @@ func scenarioRegistry() []scenarioCase {
 			},
 		},
 		{
+			Name: "recovery-running-agent-stale-queue",
+			Run: func(h *scenarioHarness) {
+				h.daemon.recoveryAgentInfoFn = func(string) (AgentInfo, bool) {
+					return AgentInfo{AgentID: "agent-alpha", State: "Running"}, true
+				}
+				h.daemon.enqueueRecovery(RecoveryRequest{AgentID: "agent-alpha", Action: "revive", Cause: "stale"})
+				eventually(h.t, 2*time.Second, 10*time.Millisecond, func() bool {
+					h.daemon.recoveryMu.Lock()
+					defer h.daemon.recoveryMu.Unlock()
+					return len(h.daemon.recoveryQueue) == 0
+				})
+				state := h.daemon.recoverySnapshot("agent-alpha")
+				if state.Phase == "awaiting_operator" || state.Phase == "work_recovering" {
+					h.t.Fatalf("running-agent stale request changed state: %#v", state)
+				}
+			},
+		},
+		{
 			Name: "recovery-crash-budget",
 			Run: func(h *scenarioHarness) {
 				for i := 0; i < 3; i++ {
@@ -1026,7 +1044,7 @@ func TestScenarioRegistry(t *testing.T) {
 				"acceptance-surface-retry-rejected", "acceptance-complete-failed-node",
 				"acceptance-repair-fails", "acceptance-successor-depth-rejected",
 				"recovery-crash-budget", "recovery-supervisor-wait", "recovery-queue-dedup",
-				"recovery-restart-reconstruct", "recovery-failed-node-operator-retry",
+				"recovery-restart-reconstruct", "recovery-failed-node-operator-retry", "recovery-running-agent-stale-queue",
 				"integration-directive-recovery", "integration-recovery-budget", "integration-prepare-attention",
 				"integration-missing-contract-attention", "integration-skipped-accepted", "integration-disabled-blocks-acceptance",
 				"contract-lifecycle-handshake", "coordination-deadlock-and-retry", "resolution-complete":

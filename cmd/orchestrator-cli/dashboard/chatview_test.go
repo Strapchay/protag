@@ -2,8 +2,10 @@ package dashboard
 
 import (
 	"encoding/json"
+	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"aion-kernel/internal/hub"
 
@@ -407,5 +409,53 @@ func TestChatDefersStreamingRenderWhileScrolledUp(t *testing.T) {
 	}
 	if got := m.viewport.TotalLineCount(); got <= before {
 		t.Fatalf("viewport did not render after resuming: %d -> %d", before, got)
+	}
+}
+
+func captureChatCommand(t *testing.T, command string) (string, map[string]any) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	captured := make(chan map[string]any, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var request map[string]any
+		if err := json.NewDecoder(conn).Decode(&request); err != nil {
+			return
+		}
+		captured <- request
+		_ = json.NewEncoder(conn).Encode(map[string]any{"result": map[string]any{}})
+	}()
+	m := NewChatModel(listener.Addr().String())
+	m.executeCommand(command)
+	select {
+	case request := <-captured:
+		method, _ := request["method"].(string)
+		params, _ := request["params"].(map[string]any)
+		return method, params
+	case <-time.After(2 * time.Second):
+		t.Fatalf("dashboard command %q did not reach the server", command)
+		return "", nil
+	}
+}
+
+func TestContinueAgentsRequiresPreflightThenConfirm(t *testing.T) {
+	method, _ := captureChatCommand(t, "/continue-agents")
+	if method != "build-spec-resume-preflight" {
+		t.Fatalf("preflight method = %s", method)
+	}
+	method, params := captureChatCommand(t, "/continue-agents confirm")
+	if method != "build-spec-continue-agents" {
+		t.Fatalf("confirm method = %s", method)
+	}
+	if confirm, _ := params["confirm"].(bool); !confirm {
+		t.Fatalf("confirm params = %#v", params)
 	}
 }

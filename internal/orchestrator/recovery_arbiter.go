@@ -271,7 +271,13 @@ func (d *Daemon) processRecoveryQueue() {
 }
 
 func recoveryAgentInfo(d *Daemon, agentID string) (AgentInfo, bool) {
-	if d == nil || d.allocator == nil {
+	if d == nil {
+		return AgentInfo{}, false
+	}
+	if d.recoveryAgentInfoFn != nil {
+		return d.recoveryAgentInfoFn(agentID)
+	}
+	if d.allocator == nil {
 		return AgentInfo{}, false
 	}
 	for _, info := range d.allocator.AgentInfos() {

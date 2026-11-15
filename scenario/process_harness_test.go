@@ -50,7 +50,13 @@ func NewProcessHarnessAt(t *testing.T, root string) *ProcessHarness {
 	if err := os.MkdirAll(filepath.Join(root, "docs"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	return &ProcessHarness{t: t, Root: root, Binary: binary, Config: config, LogPath: filepath.Join(t.TempDir(), "kernel.log"), Live: os.Getenv("AION_LIVE_SCENARIO") == "1"}
+	live := os.Getenv("AION_LIVE_SCENARIO") == "1"
+	logPath := filepath.Join(t.TempDir(), "kernel.log")
+	if live {
+		_ = os.MkdirAll("/tmp/opencode", 0o755)
+		logPath = filepath.Join("/tmp/opencode", fmt.Sprintf("live-scenario-%d.log", time.Now().UnixNano()))
+	}
+	return &ProcessHarness{t: t, Root: root, Binary: binary, Config: config, LogPath: logPath, Live: live}
 }
 
 func (h *ProcessHarness) Start() {
@@ -71,7 +77,11 @@ func (h *ProcessHarness) Start() {
 		}
 		gatewayAddr := gatewayListener.Addr().String()
 		_ = gatewayListener.Close()
-		env = append(env, "AION_INFERENCE_GATEWAY_ENABLED=true", "AION_INFERENCE_GATEWAY_LISTEN_ADDR="+gatewayAddr)
+		env = append(env,
+			"AION_INFERENCE_GATEWAY_ENABLED=true",
+			"AION_INFERENCE_GATEWAY_LISTEN_ADDR="+gatewayAddr,
+			"AION_INFERENCE_GATEWAY_URL=http://"+gatewayAddr,
+		)
 	} else {
 		env = append(env, "AION_INFERENCE_GATEWAY_ENABLED=false")
 	}

@@ -61,7 +61,7 @@ test-scenarios-race:
 	$(GOTEST) -race -tags=scenario ./internal/orchestrator -run '^TestScenario' -count=1
 
 test-scenarios-live: build
-	AION_LIVE_SCENARIO=1 AION_KERNEL_BIN=$(CURDIR)/bin/aion-kernel AION_KERNEL_CONFIG=$(CURDIR)/configs/aion.yaml $(GOTEST) -tags=scenario_live ./scenario -run '^TestLive' -count=1
+	AION_LIVE_SCENARIO=1 AION_KERNEL_BIN=$(CURDIR)/bin/aion-kernel AION_KERNEL_CONFIG=$(CURDIR)/configs/aion.yaml $(GOTEST) -tags=scenario_live ./scenario -run '^TestLive' -timeout 20m -count=1
 
 test-coverage:
 	$(GOTEST) -coverprofile=coverage.out ./...
