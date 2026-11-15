@@ -27,6 +27,7 @@ type ProcessHarness struct {
 	logFile *os.File
 	Addr    string
 	PID     int
+	Live    bool
 }
 
 func NewProcessHarness(t *testing.T) *ProcessHarness {
@@ -49,7 +50,7 @@ func NewProcessHarnessAt(t *testing.T, root string) *ProcessHarness {
 	if err := os.MkdirAll(filepath.Join(root, "docs"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	return &ProcessHarness{t: t, Root: root, Binary: binary, Config: config, LogPath: filepath.Join(t.TempDir(), "kernel.log")}
+	return &ProcessHarness{t: t, Root: root, Binary: binary, Config: config, LogPath: filepath.Join(t.TempDir(), "kernel.log"), Live: os.Getenv("AION_LIVE_SCENARIO") == "1"}
 }
 
 func (h *ProcessHarness) Start() {
@@ -62,10 +63,19 @@ func (h *ProcessHarness) Start() {
 	h.cmd = exec.Command(h.Binary, "server", "--workdir", h.Root, "--config", h.Config, "--log-level", "debug")
 	h.cmd.Stdout = logFile
 	h.cmd.Stderr = logFile
-	h.cmd.Env = append(os.Environ(),
-		"AION_ORCHESTRATOR_PORT=0",
-		"AION_INFERENCE_GATEWAY_ENABLED=false",
-	)
+	env := append(os.Environ(), "AION_ORCHESTRATOR_PORT=0")
+	if h.Live {
+		gatewayListener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			h.t.Fatal(err)
+		}
+		gatewayAddr := gatewayListener.Addr().String()
+		_ = gatewayListener.Close()
+		env = append(env, "AION_INFERENCE_GATEWAY_ENABLED=true", "AION_INFERENCE_GATEWAY_LISTEN_ADDR="+gatewayAddr)
+	} else {
+		env = append(env, "AION_INFERENCE_GATEWAY_ENABLED=false")
+	}
+	h.cmd.Env = env
 	h.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := h.cmd.Start(); err != nil {
 		h.t.Fatal(err)
