@@ -17,6 +17,7 @@ import (
 	"aion-kernel/internal/coordinator"
 	"aion-kernel/internal/dag"
 	"aion-kernel/internal/hub"
+	"aion-kernel/internal/messaging"
 )
 
 // scenarioCoordinator is the scripted model boundary for deterministic
@@ -571,6 +572,140 @@ func scenarioRegistry() []scenarioCase {
 			},
 		},
 		{
+			Name: "contract-lifecycle-handshake",
+			Run: func(h *scenarioHarness) {
+				producerAgent, consumerAgent := "agent-alpha", "agent-beta"
+				for _, node := range []dag.DagNode{
+					coordinationNode("producer-node", "alpha", producerAgent),
+					coordinationNode("consumer-node", "beta", consumerAgent),
+				} {
+					if err := h.daemon.dagManager.AddNode(node); err != nil {
+						h.t.Fatal(err)
+					}
+				}
+				producerCap, err := h.daemon.server.IssueAgentCapability(producerAgent)
+				if err != nil {
+					h.t.Fatal(err)
+				}
+				consumerCap, err := h.daemon.server.IssueAgentCapability(consumerAgent)
+				if err != nil {
+					h.t.Fatal(err)
+				}
+				store, err := messaging.Open(filepath.Join(h.daemon.runState.Root, "messages.db"))
+				if err != nil {
+					h.t.Fatal(err)
+				}
+				defer store.Close()
+				h.daemon.server.messageStore = store
+				contract := coordinationContract("contract-fixture", producerAgent, "producer-node", consumerAgent, "consumer-node")
+				contract.Details.Name = "fixture-api"
+				contract.Details.HandshakeRequired = true
+				requested := decodeCoordinationResult[coordination.Contract](h.t, callCoordinationServer(h.t, h.daemon.server, "contract-request", consumerCap, map[string]any{
+					"command_id": "request-fixture", "contract": contract,
+				}))
+				if requested.Status != coordination.StatusRequested {
+					h.t.Fatalf("request status = %s", requested.Status)
+				}
+				decodeCoordinationResult[coordination.Contract](h.t, callCoordinationServer(h.t, h.daemon.server, "contract-publish", producerCap, map[string]any{
+					"command_id": "publish-fixture-1", "contract_id": contract.ID, "expected_revision": 0, "content": []byte("v1"),
+				}))
+				corrected := decodeCoordinationResult[coordination.Contract](h.t, callCoordinationServer(h.t, h.daemon.server, "contract-correct", consumerCap, map[string]any{
+					"command_id": "correct-fixture", "contract_id": contract.ID, "revision": 1, "reason": "fixture correction",
+				}))
+				if corrected.Status != coordination.StatusCorrectionRequested {
+					h.t.Fatalf("correction status = %s", corrected.Status)
+				}
+				decodeCoordinationResult[coordination.Contract](h.t, callCoordinationServer(h.t, h.daemon.server, "contract-publish", producerCap, map[string]any{
+					"command_id": "publish-fixture-2", "contract_id": contract.ID, "expected_revision": 1, "content": []byte("v2"),
+				}))
+				if response := callCoordinationServer(h.t, h.daemon.server, "contract-validate", consumerCap, map[string]any{
+					"command_id": "validate-no-message", "contract_id": contract.ID, "revision": 2,
+				}); response.Error == "" {
+					h.t.Fatal("validation without handshake was accepted")
+				}
+				if err := store.Submit(context.Background(), messaging.Message{
+					ID: "msg-fixture", FromAgent: consumerAgent, ToAgent: producerAgent,
+					Kind: messaging.KindRequest, Payload: "CONSUMER PLAN fixture-api",
+				}); err != nil {
+					h.t.Fatal(err)
+				}
+				if response := callCoordinationServer(h.t, h.daemon.server, "message-ack", producerCap, map[string]any{
+					"id": "msg-fixture", "state": messaging.ActorAcked, "note": "received",
+				}); response.Error != "" {
+					h.t.Fatalf("ack: %s", response.Error)
+				}
+				fulfilled := decodeCoordinationResult[coordination.Contract](h.t, callCoordinationServer(h.t, h.daemon.server, "contract-validate", consumerCap, map[string]any{
+					"command_id": "validate-fixture", "contract_id": contract.ID, "revision": 2, "message_id": "msg-fixture",
+				}))
+				if fulfilled.Status != coordination.StatusFulfilled {
+					h.t.Fatalf("fulfilled status = %s", fulfilled.Status)
+				}
+			},
+		},
+		{
+			Name: "integration-missing-contract-attention",
+			Run: func(h *scenarioHarness) {
+				fixture := loadScenarioFixture(h.t, "acceptance-complete")
+				seedAcceptanceScenario(h, fixture)
+				h.daemon.handleIntegrationStatusChange(IntegrationRunStatus{
+					Status: IntegrationFailed, FailureClass: "missing_contract", Error: "required contract artifact missing",
+				})
+				loaded, err := loadBuildSpecAttempt(h.daemon.runState.Root)
+				if err != nil || loaded.Status != BuildSpecAttemptPaused || !strings.Contains(loaded.FailureReason, "missing_contract") {
+					h.t.Fatalf("attempt = %#v err=%v", loaded, err)
+				}
+			},
+		},
+		{
+			Name: "integration-skipped-accepted",
+			Run: func(h *scenarioHarness) {
+				fixture := loadScenarioFixture(h.t, "acceptance-complete")
+				attempt := seedAcceptanceScenario(h, fixture)
+				runner := NewIntegrationRunner(h.daemon.config, h.daemon.projectRoot, h.daemon.runState, h.daemon.coordinationManager, nil, context.Background())
+				defer runner.Close()
+				runner.setTerminalStatus(IntegrationSkipped, "", nil)
+				h.daemon.integrationRunner = runner
+				h.daemon.coordinator = scenarioCoordinatorFromFixture(fixture)
+				complete, err := h.daemon.reviewBuildAcceptance(attempt)
+				if err != nil || !complete {
+					h.t.Fatalf("skipped acceptance complete=%v err=%v", complete, err)
+				}
+				preflight := h.daemon.buildResumePreflight()
+				found := false
+				for _, warning := range preflight.Warnings {
+					if strings.Contains(warning, "integration was skipped") {
+						found = true
+					}
+				}
+				if !found {
+					h.t.Fatalf("preflight warnings = %#v", preflight.Warnings)
+				}
+			},
+		},
+		{
+			Name: "integration-disabled-blocks-acceptance",
+			Run: func(h *scenarioHarness) {
+				fixture := loadScenarioFixture(h.t, "acceptance-complete")
+				attempt := seedAcceptanceScenario(h, fixture)
+				cfg := *h.daemon.config
+				cfg.Integration.Enabled = false
+				runner := NewIntegrationRunner(&cfg, h.daemon.projectRoot, h.daemon.runState, h.daemon.coordinationManager, nil, context.Background())
+				defer runner.Close()
+				if _, err := runner.Gate(context.Background(), h.daemon.dagManager.Snapshot()); err != nil {
+					h.t.Fatal(err)
+				}
+				h.daemon.integrationRunner = runner
+				complete, err := h.daemon.reviewBuildAcceptance(attempt)
+				if err == nil || complete {
+					h.t.Fatalf("disabled acceptance complete=%v err=%v", complete, err)
+				}
+				loaded, loadErr := loadBuildSpecAttempt(h.daemon.runState.Root)
+				if loadErr != nil || loaded.AcceptanceStatus != "attention" {
+					h.t.Fatalf("acceptance = %#v err=%v", loaded, loadErr)
+				}
+			},
+		},
+		{
 			Name: "integration-directive-recovery",
 			Run: func(h *scenarioHarness) {
 				fixture := loadScenarioFixture(h.t, "acceptance-complete")
@@ -775,7 +910,9 @@ func TestScenarioRegistry(t *testing.T) {
 				"acceptance-repair-fails", "acceptance-successor-depth-rejected",
 				"recovery-crash-budget", "recovery-supervisor-wait", "recovery-queue-dedup",
 				"recovery-restart-reconstruct", "recovery-failed-node-operator-retry",
-				"integration-directive-recovery", "integration-recovery-budget", "integration-prepare-attention":
+				"integration-directive-recovery", "integration-recovery-budget", "integration-prepare-attention",
+				"integration-missing-contract-attention", "integration-skipped-accepted", "integration-disabled-blocks-acceptance",
+				"contract-lifecycle-handshake":
 				runScenario(t, tc, &scenarioCoordinator{})
 			case "acceptance-retry-cycle":
 				loaded := loadScenarioFixture(t, "acceptance-retry-cycle")
