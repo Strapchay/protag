@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -1025,12 +1026,37 @@ func scenarioRegistry() []scenarioCase {
 	}
 }
 
+func scenarioShard() (int, int) {
+	shard := 0
+	shards := 1
+	_, _ = fmt.Sscanf(os.Getenv("AION_SCENARIO_SHARD"), "%d", &shard)
+	_, _ = fmt.Sscanf(os.Getenv("AION_SCENARIO_SHARDS"), "%d", &shards)
+	if shards < 1 {
+		shards = 1
+	}
+	if shard < 0 {
+		shard = 0
+	}
+	if shard >= shards {
+		shard = shard % shards
+	}
+	return shard, shards
+}
+
 func TestScenarioRegistry(t *testing.T) {
 	filter := strings.TrimSpace(os.Getenv("AION_SCENARIO"))
+	shard, shards := scenarioShard()
 	for _, tc := range scenarioRegistry() {
 		tc := tc
 		if filter != "" && !strings.Contains(tc.Name, filter) {
 			continue
+		}
+		if shards > 1 {
+			hash := fnv.New32a()
+			_, _ = hash.Write([]byte(tc.Name))
+			if int(hash.Sum32()%uint32(shards)) != shard {
+				continue
+			}
 		}
 		t.Run(tc.Name, func(t *testing.T) {
 			switch tc.Name {
