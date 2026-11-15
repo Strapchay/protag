@@ -180,7 +180,9 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	// Initialize Server
 	server := NewServer(dagMgr, lockMgr, coordinationManager, memStore)
 	server.SetMessageStore(messageStore)
-	server.SetMessageDeliverer(func(msg hub.Message) error { return hubRouter.Deliver(msg) })
+	server.SetMessageDeliverer(func(msg hub.Message) error {
+		return alloc.DeliverOrWakeContext(context.Background(), msg, "")
+	})
 	server.SetWorkInboxService(workInbox)
 	server.SetLogsDir(runState.LogsDir)
 	server.SetLogLevel(config.Orchestrator.LogLevel)
@@ -1400,7 +1402,9 @@ func (d *Daemon) ResetCurrentRun() error {
 	_ = newMessages.PruneTerminal(context.Background(), 1000)
 	d.messages = newMessages
 	d.server.SetMessageStore(newMessages)
-	d.server.SetMessageDeliverer(func(msg hub.Message) error { return hubRouter.Deliver(msg) })
+	d.server.SetMessageDeliverer(func(msg hub.Message) error {
+		return alloc.DeliverOrWakeContext(context.Background(), msg, "")
+	})
 	d.runState = newRun
 	d.auditor.dagManager = dagMgr
 	d.auditor.lockManager = lockMgr

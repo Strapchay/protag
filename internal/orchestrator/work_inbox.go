@@ -73,6 +73,7 @@ type WorkItem struct {
 	RuntimeRequirements []string                      `json:"runtime_requirements,omitempty"`
 	Checkpoint          *WorkCheckpoint               `json:"checkpoint,omitempty"`
 	Contract            *coordination.ContractDetails `json:"contract,omitempty"`
+	NodeTaskSpec        string                        `json:"node_task_spec,omitempty"`
 	CreatedAt           time.Time                     `json:"created_at,omitempty"`
 	UpdatedAt           time.Time                     `json:"updated_at,omitempty"`
 }
@@ -450,6 +451,7 @@ func workItemForContract(contract coordination.Contract, agentID string, nodes m
 		if node, ok := nodes[contract.ConsumerNodeID]; ok {
 			item.Priority = node.Priority
 			item.DomainID = node.DomainID
+			item.NodeTaskSpec = node.TaskSpec
 		}
 		switch contract.Status {
 		case coordination.StatusProduced:

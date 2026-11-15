@@ -569,3 +569,23 @@ func TestContractEnsureReturnsPlannerCreatedContract(t *testing.T) {
 		t.Fatalf("contracts = %#v", contracts)
 	}
 }
+
+func TestContractValidationPromptIncludesNodeHandshake(t *testing.T) {
+	prompt := formatWorkItemPrompt(WorkItem{
+		ID:           "contract:contract-x:contract_validate",
+		Kind:         WorkItemContractValidate,
+		ContractID:   "contract-x",
+		Revision:     1,
+		NodeTaskSpec: "Send CONSUMER PLAN with --expects-ack and confirm message-status before validation.",
+	})
+	for _, want := range []string{
+		"Related node task requirements",
+		"CONSUMER PLAN",
+		"--expects-ack",
+		"awaiting_ack",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("validation prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}

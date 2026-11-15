@@ -1290,6 +1290,11 @@ func formatWorkItemPrompt(item WorkItem) string {
 	for _, requirement := range item.RuntimeRequirements {
 		b.WriteString("Authoritative runtime requirement: " + requirement + "\n")
 	}
+	if strings.TrimSpace(item.NodeTaskSpec) != "" {
+		b.WriteString("\nRelated node task requirements:\n")
+		b.WriteString(item.NodeTaskSpec)
+		b.WriteString("\n")
+	}
 	b.WriteString("\nRun `orchestrator-cli work-inbox --current` first and confirm this is the current dispatched item. Process only this item. Do not poll or inspect another domain's workspace.\n")
 	if item.Kind == WorkItemNode {
 		b.WriteString("For DAG work, pass the exact `node_id` field to `update-node`; the inbox item ID is also that raw DAG node ID.\n")
@@ -1301,6 +1306,7 @@ func formatWorkItemPrompt(item WorkItem) string {
 		b.WriteString(fmt.Sprintf("Create the requested public contract artifact as a concise JSON file under /tmp or an owned domain path. It must repeat the declared language and exact public entrypoint, define the callable/schema surface needed by the consumer, and include enough usage detail for an isolated consumer to integrate without inspecting your workspace. Publish it with `orchestrator-cli contract-publish --contract-id %s --artifact-file <path> --expected-revision %d`. Do not expose private implementation source.\n", item.ContractID, item.Revision))
 	case WorkItemContractValidate:
 		artifactPath := contractValidationArtifactPath(item.ContractID, item.Revision)
+		b.WriteString("Before validating, satisfy any peer-message handshake required by the related node task. If the task requires a request, send it with `send-message --expects-ack`, retain the returned message_id, and confirm `message-status` reports acknowledged before running contract-validate. Do not validate while the request is awaiting_ack.\n")
 		b.WriteString(fmt.Sprintf("Fetch the immutable public descriptor with `orchestrator-cli contract-fetch --contract-id %s --revision %d --output %s`. The `--output` value is a regular file path, not a directory. Read that descriptor and confirm that its declared language, exact public entrypoint, signatures/schema, and usage details are sufficient for isolated implementation. Do not expect producer source or execute producer behavior in this workspace; behavioral acceptance runs later in the assembled integration workspace. Never guess a missing integration locator. If the descriptor is actionable and consistent with the stated acceptance criteria, run `orchestrator-cli contract-validate --contract-id %s --revision %d --evidence '<json>'`; otherwise request a concrete correction.\n", item.ContractID, item.Revision, artifactPath, item.ContractID, item.Revision))
 	}
 	b.WriteString("If you must yield before completing it, record a concise `work-checkpoint`. End the turn when the item is completed or waiting so the kernel can schedule the next ready item.")
