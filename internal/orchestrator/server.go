@@ -1141,7 +1141,9 @@ func (s *Server) handleSendMessage(req Request) Response {
 
 func (s *Server) handleMessageStatus(req Request) Response {
 	var params struct {
-		ID string `json:"id"`
+		ID        string `json:"id"`
+		Wait      bool   `json:"wait"`
+		TimeoutMS int    `json:"timeout_ms"`
 	}
 	if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.ID) == "" {
 		return Response{ID: req.ID, Error: "message-status requires --id"}
@@ -1149,11 +1151,47 @@ func (s *Server) handleMessageStatus(req Request) Response {
 	if s.messageStore == nil {
 		return Response{ID: req.ID, Error: "message store is unavailable"}
 	}
-	message, err := s.messageStore.Status(context.Background(), params.ID)
+	ctx := context.Background()
+	message, err := s.messageStore.Status(ctx, params.ID)
 	if err != nil {
 		return Response{ID: req.ID, Error: err.Error()}
 	}
-	return Response{ID: req.ID, Result: message}
+	if agentID, ok := s.capabilities.resolve(req.Capability); ok && agentID != "" {
+		if agentID != message.FromAgent && agentID != message.ToAgent {
+			return Response{ID: req.ID, Error: "message-status is not visible to this caller"}
+		}
+	}
+	if !params.Wait {
+		return Response{ID: req.ID, Result: message}
+	}
+	timeout := time.Duration(params.TimeoutMS) * time.Millisecond
+	if timeout <= 0 || timeout > 60*time.Second {
+		timeout = 30 * time.Second
+	}
+	initial := message.ActorState
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-deadline.C:
+			return Response{ID: req.ID, Result: message}
+		case <-ticker.C:
+			next, err := s.messageStore.Status(ctx, params.ID)
+			if err != nil {
+				return Response{ID: req.ID, Error: err.Error()}
+			}
+			message = next
+			if message.ActorState != initial || isTerminalActorState(message.ActorState) {
+				return Response{ID: req.ID, Result: message}
+			}
+		}
+	}
+}
+
+func isTerminalActorState(state string) bool {
+	return state == messaging.ActorCompleted || state == messaging.ActorFailed
 }
 
 func (s *Server) handleMessageList(req Request) Response {
@@ -1177,6 +1215,9 @@ func (s *Server) handleMessageList(req Request) Response {
 		Limit:          params.Limit,
 	}
 	if ok && strings.TrimSpace(agentID) != "" {
+		if filter.FromAgent != "" && filter.FromAgent != agentID {
+			return Response{ID: req.ID, Error: "message-list cannot query another agent's messages"}
+		}
 		if params.FromMe || (!params.ToMe && filter.FromAgent == "") {
 			filter.FromAgent = agentID
 		}
@@ -1245,6 +1286,18 @@ func (s *Server) handleMessageAck(req Request) Response {
 	}
 	if err := s.messageStore.Ack(context.Background(), params.ID, params.State, params.Note); err != nil {
 		return Response{ID: req.ID, Error: err.Error()}
+	}
+	if message.FromAgent != "user" && message.FromAgent != message.ToAgent && params.State != messaging.ActorInProgress {
+		notification := messaging.Message{
+			ID:        fmt.Sprintf("msg-%d", time.Now().UnixNano()),
+			FromAgent: message.ToAgent,
+			ToAgent:   message.FromAgent,
+			Kind:      messaging.KindNotify,
+			Payload:   fmt.Sprintf("MESSAGE STATUS | id=%s | actor_state=%s | note=%s", message.ID, params.State, params.Note),
+		}
+		if err := s.messageStore.Submit(context.Background(), notification); err == nil {
+			s.WakeMessageDelivery()
+		}
 	}
 	return Response{ID: req.ID, Result: map[string]string{"status": "updated", "message_id": params.ID, "actor_state": params.State}}
 }

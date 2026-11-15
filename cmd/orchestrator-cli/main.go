@@ -599,7 +599,17 @@ func parseCommand(command string, args []string) (map[string]interface{}, error)
 		if id == "" {
 			return nil, fmt.Errorf("message-status requires --id <message-id>")
 		}
-		return map[string]interface{}{"id": id}, nil
+		params := map[string]interface{}{"id": id}
+		if hasFlag(os.Args[2:], "--wait") {
+			params["wait"] = true
+		}
+		if timeout := flags["timeout"]; timeout != "" {
+			var seconds int
+			if _, err := fmt.Sscanf(timeout, "%d", &seconds); err == nil && seconds > 0 {
+				params["timeout_ms"] = seconds * 1000
+			}
+		}
+		return params, nil
 
 	case "message-list":
 		params := map[string]interface{}{}
@@ -893,7 +903,7 @@ Commands:
   split-node      --node-id <uuid> --into '<json>'
   read-dag        [--node-id <uuid>]
   heartbeat       --agent-id <uuid>
-  message-status  --id <message-id>
+  message-status  --id <message-id> [--wait] [--timeout <seconds>]
   message-list    [--from-me|--to-me] [--state <state>] [--limit N]
   message-inbox   [--state <state>]
   message-ack     --id <message-id> --state <state> [--note <text>]

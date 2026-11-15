@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"aion-kernel/internal/messaging"
 )
@@ -59,9 +60,28 @@ func TestSendMessageUsesCapabilityIdentityAndRequestsAck(t *testing.T) {
 	if ackResponse.Error != "" {
 		t.Fatalf("target ack failed: %s", ackResponse.Error)
 	}
+	statusParams, _ := json.Marshal(map[string]string{"id": messageID})
 	message, err = store.Status(t.Context(), messageID)
 	if err != nil || message.ActorState != messaging.ActorAcked || message.Note != "received" {
 		t.Fatalf("acked message=%#v err=%v", message, err)
+	}
+	notifications, err := store.List(t.Context(), messaging.ListFilter{FromAgent: "agent-ledger", ToAgent: "agent-report"})
+	if err != nil || len(notifications) != 1 || notifications[0].Kind != messaging.KindNotify {
+		t.Fatalf("status notification=%#v err=%v", notifications, err)
+	}
+
+	otherCapability, err := server.IssueAgentRuntimeCapability(AgentCapabilityPolicy{
+		AgentID: "agent-other", DomainID: "other", Provider: "deepseek", Model: "deepseek-flash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response := server.handleMessageStatus(Request{ID: "status-other", Capability: otherCapability, Params: statusParams}); response.Error == "" {
+		t.Fatal("unrelated agent was allowed to query the message")
+	}
+	listParams, _ := json.Marshal(map[string]any{"agent_id": "agent-report"})
+	if response := server.handleMessageList(Request{ID: "list-other", Capability: otherCapability, Params: listParams}); response.Error == "" {
+		t.Fatal("unrelated agent was allowed to list another agent's messages")
 	}
 }
 
@@ -91,5 +111,45 @@ func TestSendMessageUserIdentityAndStatusQuery(t *testing.T) {
 	message, ok := statusResponse.Result.(messaging.Message)
 	if !ok || message.ID != result["message_id"] || message.FromAgent != "user" {
 		t.Fatalf("status=%#v", statusResponse.Result)
+	}
+}
+
+func TestMessageStatusWaitReturnsOnActorChange(t *testing.T) {
+	store, err := messaging.Open(filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	server := &Server{capabilities: newAgentCapabilityRegistry(), messageStore: store}
+	capability, _ := server.IssueAgentRuntimeCapability(AgentCapabilityPolicy{
+		AgentID: "agent-report", DomainID: "report", Provider: "deepseek", Model: "deepseek-flash",
+	})
+	if err := store.Submit(t.Context(), messaging.Message{
+		ID: "msg-wait", FromAgent: "agent-report", ToAgent: "agent-ledger",
+		Kind: messaging.KindRequest, Payload: "plan",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	params, _ := json.Marshal(map[string]any{"id": "msg-wait", "wait": true, "timeout_ms": 2000})
+
+	result := make(chan Response, 1)
+	go func() {
+		result <- server.handleMessageStatus(Request{ID: "status-wait", Capability: capability, Params: params})
+	}()
+	time.Sleep(100 * time.Millisecond)
+	if err := store.Ack(t.Context(), "msg-wait", messaging.ActorAcked, "received"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case response := <-result:
+		if response.Error != "" {
+			t.Fatalf("wait: %s", response.Error)
+		}
+		message, ok := response.Result.(messaging.Message)
+		if !ok || message.ActorState != messaging.ActorAcked {
+			t.Fatalf("wait result=%#v", response.Result)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("message-status --wait did not return after the actor ack")
 	}
 }

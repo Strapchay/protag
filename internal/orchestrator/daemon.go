@@ -1080,6 +1080,8 @@ func newPiCoordinatorForRun(projectRoot string, config *Config, runState *RunSta
 				filepath.Join(projectRoot, ".agents"),
 				filepath.Join(projectRoot, ".codex"),
 				filepath.Join(projectRoot, ".env"),
+				filepath.Join(projectRoot, "build_spec_debug.log"),
+				filepath.Join(projectRoot, "tui_debug.log"),
 			},
 			Writable: []isolation.Mount{
 				docsMount,
@@ -1754,12 +1756,19 @@ const maxMessageAttempts = 5
 func (d *Daemon) messageDeliveryLoop(ctx context.Context) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
+	lastPrune := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			d.deliverPendingMessages(ctx)
+			if time.Since(lastPrune) >= 5*time.Minute {
+				if d.messages != nil {
+					_ = d.messages.PruneTerminal(ctx, 1000)
+				}
+				lastPrune = time.Now()
+			}
 		}
 	}
 }

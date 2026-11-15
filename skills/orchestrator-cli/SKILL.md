@@ -242,8 +242,16 @@ Sender commands:
 ```bash
 orchestrator-cli send-message --agent-id agent-ledger --text "..." --expects-ack
 orchestrator-cli message-status --id <message-id>
+orchestrator-cli message-status --id <message-id> --wait --timeout 30
 orchestrator-cli message-list --from-me --state awaiting_ack
 ```
+
+`message-status` is always a point query by default. `--wait` is a bounded
+convenience (maximum 60 seconds) for when the sender chooses to pause; it is not
+required. Requests also push a `MESSAGE STATUS` ContextShare to the sender when
+the actor acknowledges or reaches a terminal state, so the sender can continue
+other work and consume the update later. Never block a turn indefinitely waiting
+for a peer.
 
 Recipient commands:
 
