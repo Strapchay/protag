@@ -1164,8 +1164,12 @@ func (s *Server) handleMessageStatus(req Request) Response {
 	if !params.Wait {
 		return Response{ID: req.ID, Result: message}
 	}
+	const maxMessageWait = 15 * time.Minute
 	timeout := time.Duration(params.TimeoutMS) * time.Millisecond
-	if timeout <= 0 || timeout > 60*time.Second {
+	if timeout > maxMessageWait {
+		return Response{ID: req.ID, Error: "message-status --timeout exceeds the 15m maximum"}
+	}
+	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
 	initial := message.ActorState

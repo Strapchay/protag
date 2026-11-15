@@ -153,3 +153,25 @@ func TestMessageStatusWaitReturnsOnActorChange(t *testing.T) {
 		t.Fatal("message-status --wait did not return after the actor ack")
 	}
 }
+
+func TestMessageStatusWaitRejectsExcessiveTimeout(t *testing.T) {
+	store, err := messaging.Open(filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	server := &Server{capabilities: newAgentCapabilityRegistry(), messageStore: store}
+	if err := store.Submit(t.Context(), messaging.Message{
+		ID: "msg-timeout", FromAgent: "agent-report", ToAgent: "agent-ledger",
+		Kind: messaging.KindRequest, Payload: "plan",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	params, _ := json.Marshal(map[string]any{
+		"id": "msg-timeout", "wait": true, "timeout_ms": (16 * time.Minute).Milliseconds(),
+	})
+	response := server.handleMessageStatus(Request{ID: "status-timeout", Params: params})
+	if response.Error == "" {
+		t.Fatal("excessive message wait was accepted")
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"aion-kernel/cmd/orchestrator-cli/dashboard"
 	tea "github.com/charmbracelet/bubbletea"
@@ -604,10 +605,18 @@ func parseCommand(command string, args []string) (map[string]interface{}, error)
 			params["wait"] = true
 		}
 		if timeout := flags["timeout"]; timeout != "" {
-			var seconds int
-			if _, err := fmt.Sscanf(timeout, "%d", &seconds); err == nil && seconds > 0 {
-				params["timeout_ms"] = seconds * 1000
+			duration, err := time.ParseDuration(timeout)
+			if err != nil {
+				var seconds int
+				if _, scanErr := fmt.Sscanf(timeout, "%d", &seconds); scanErr != nil || seconds <= 0 {
+					return nil, fmt.Errorf("message-status --timeout must be a duration such as 30s or 2m")
+				}
+				duration = time.Duration(seconds) * time.Second
 			}
+			if duration <= 0 {
+				return nil, fmt.Errorf("message-status --timeout must be positive")
+			}
+			params["timeout_ms"] = duration.Milliseconds()
 		}
 		return params, nil
 
