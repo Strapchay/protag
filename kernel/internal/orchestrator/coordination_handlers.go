@@ -34,6 +34,16 @@ func (s *Server) authenticatedCoordinationPrincipal(req Request) (coordination.P
 	return s.coordinationPrincipal(policy.AgentID), nil
 }
 
+// readOnlyCoordinationPrincipal lets a host/operator inspect contracts without
+// an agent capability. Mutating contract commands still require a valid agent
+// capability. An explicitly supplied but invalid capability is always rejected.
+func (s *Server) readOnlyCoordinationPrincipal(req Request) (coordination.Principal, error) {
+	if strings.TrimSpace(req.Capability) == "" {
+		return coordination.Principal{Role: coordination.RoleAdmin}, nil
+	}
+	return s.authenticatedCoordinationPrincipal(req)
+}
+
 func (s *Server) validateContractAssignments(contract coordination.Contract) error {
 	if s.dagManager == nil {
 		return fmt.Errorf("coordination: DAG is unavailable")
@@ -236,7 +246,7 @@ func (s *Server) handleContractAcceptTerms(req Request) Response {
 }
 
 func (s *Server) handleContractTerms(req Request) Response {
-	principal, err := s.authenticatedCoordinationPrincipal(req)
+	principal, err := s.readOnlyCoordinationPrincipal(req)
 	if err != nil {
 		return Response{ID: req.ID, Error: err.Error()}
 	}
@@ -318,7 +328,7 @@ func (s *Server) handleContractTerminal(req Request, failed bool) Response {
 }
 
 func (s *Server) handleContractStatus(req Request) Response {
-	principal, err := s.authenticatedCoordinationPrincipal(req)
+	principal, err := s.readOnlyCoordinationPrincipal(req)
 	if err != nil {
 		return Response{ID: req.ID, Error: err.Error()}
 	}
@@ -336,7 +346,7 @@ func (s *Server) handleContractStatus(req Request) Response {
 }
 
 func (s *Server) handleContractList(req Request) Response {
-	principal, err := s.authenticatedCoordinationPrincipal(req)
+	principal, err := s.readOnlyCoordinationPrincipal(req)
 	if err != nil {
 		return Response{ID: req.ID, Error: err.Error()}
 	}

@@ -32,27 +32,28 @@ const maxGatewayCapacity = 16
 // InferenceGatewayStatus is exposed through debug-status for operational
 // observability without leaking upstream provider credentials.
 type InferenceGatewayStatus struct {
-	Enabled            bool                   `json:"enabled"`
-	ListenAddr         string                 `json:"listen_addr"`
-	UnixSocket         string                 `json:"unix_socket,omitempty"`
-	PublicBaseURL      string                 `json:"public_base_url"`
-	Capacity           int                    `json:"capacity"`
-	InUse              int                    `json:"in_use"`
-	Queued             int                    `json:"queued"`
-	Active             []GatewayActiveRequest `json:"active,omitempty"`
-	TotalRequests      int64                  `json:"total_requests"`
-	Rejected           int64                  `json:"rejected"`
-	Upstream429        int64                  `json:"upstream_429"`
-	RetryAttempts      int64                  `json:"retry_attempts"`
-	Retried            int64                  `json:"retried_requests"`
-	UpstreamTimeoutSec int                    `json:"upstream_timeout_sec"`
-	LastError          string                 `json:"last_error,omitempty"`
-	Canceled           int64                  `json:"canceled"`
-	LastCancellation   string                 `json:"last_cancellation,omitempty"`
-	LogPath            string                 `json:"log_path,omitempty"`
-	StatusCounts       map[int]int64          `json:"status_counts,omitempty"`
-	RecentEvents       []GatewayEvent         `json:"recent_events,omitempty"`
-	Cooldowns          []GatewayCooldown      `json:"cooldowns,omitempty"`
+	Enabled            bool                         `json:"enabled"`
+	ListenAddr         string                       `json:"listen_addr"`
+	UnixSocket         string                       `json:"unix_socket,omitempty"`
+	PublicBaseURL      string                       `json:"public_base_url"`
+	Capacity           int                          `json:"capacity"`
+	InUse              int                          `json:"in_use"`
+	Queued             int                          `json:"queued"`
+	Active             []GatewayActiveRequest       `json:"active,omitempty"`
+	TotalRequests      int64                        `json:"total_requests"`
+	Rejected           int64                        `json:"rejected"`
+	Upstream429        int64                        `json:"upstream_429"`
+	RetryAttempts      int64                        `json:"retry_attempts"`
+	Retried            int64                        `json:"retried_requests"`
+	UpstreamTimeoutSec int                          `json:"upstream_timeout_sec"`
+	LastError          string                       `json:"last_error,omitempty"`
+	Canceled           int64                        `json:"canceled"`
+	LastCancellation   string                       `json:"last_cancellation,omitempty"`
+	LogPath            string                       `json:"log_path,omitempty"`
+	StatusCounts       map[int]int64                `json:"status_counts,omitempty"`
+	RecentEvents       []GatewayEvent               `json:"recent_events,omitempty"`
+	Cooldowns          []GatewayCooldown            `json:"cooldowns,omitempty"`
+	AgentUsage         map[string]GatewayTokenUsage `json:"agent_usage,omitempty"`
 }
 
 type GatewayCooldown struct {
@@ -113,6 +114,8 @@ type InferenceGateway struct {
 	retried       atomic.Int64
 
 	mu               sync.Mutex
+	usageMu          sync.Mutex
+	usage            map[string]gatewayTokenUsage
 	lastError        string
 	lastCancellation string
 	logPath          string
@@ -361,6 +364,7 @@ func (g *InferenceGateway) Status() InferenceGatewayStatus {
 		StatusCounts:       statusCounts,
 		RecentEvents:       recentEvents,
 		Cooldowns:          cooldowns,
+		AgentUsage:         g.agentUsageSnapshot(),
 	}
 }
 
@@ -667,10 +671,18 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 	buf := make([]byte, 32*1024)
 	var bytesWritten int64
+	capture := &gatewayUsageCapture{}
+	recordCapturedUsage := func() {
+		if usage, ok := capture.Usage(); ok {
+			g.recordTokenUsage(reqInfo.AgentID, usage)
+		}
+	}
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
+			capture.Write(buf[:n])
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				recordCapturedUsage()
 				if isClientDisconnect(r.Context(), writeErr) {
 					g.emitActivity(reqInfo, "canceled")
 					g.recordCancellation(reqInfo, resp.StatusCode, start, bytesWritten, "client disconnected while streaming")
@@ -687,6 +699,7 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		if readErr != nil {
 			if readErr != io.EOF {
+				recordCapturedUsage()
 				if errors.Is(proxyCtx.Err(), context.DeadlineExceeded) {
 					g.recordError(readErr)
 					g.emitActivity(reqInfo, "failed")
@@ -703,6 +716,7 @@ func (g *InferenceGateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 				g.recordFailure(reqInfo, resp.StatusCode, start, "upstream read failed: "+readErr.Error())
 				return
 			}
+			recordCapturedUsage()
 			g.emitActivity(reqInfo, "completed")
 			g.recordCompletion(reqInfo, resp.StatusCode, start, bytesWritten)
 			return

@@ -36,6 +36,31 @@ func TestLiveBuildSmoke(t *testing.T) {
 		}
 		return status["status"] == "completed"
 	}, 15*time.Minute)
+	assertNodeTokenMetrics(t, h)
+}
+
+func assertNodeTokenMetrics(t *testing.T, h *ProcessHarness) {
+	t.Helper()
+	raw, err := h.Request("read-dag", map[string]any{})
+	if err != nil {
+		t.Fatalf("read-dag: %v", err)
+	}
+	var snapshot struct {
+		Nodes []struct {
+			ID               string `json:"id"`
+			PromptTokens     int32  `json:"prompt_tokens"`
+			CompletionTokens int32  `json:"completion_tokens"`
+		} `json:"nodes"`
+	}
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		t.Fatalf("read-dag decode: %v", err)
+	}
+	for _, node := range snapshot.Nodes {
+		if node.PromptTokens > 0 || node.CompletionTokens > 0 {
+			return
+		}
+	}
+	t.Fatalf("no node reported token metrics: %+v", snapshot.Nodes)
 }
 
 func TestLiveProcessRestart(t *testing.T) {

@@ -136,6 +136,9 @@ func TestReviewBuildAcceptancePassesAndStoresVerdict(t *testing.T) {
 	if !strings.Contains(loaded.AcceptanceSummary, "implemented") {
 		t.Fatalf("summary = %q", loaded.AcceptanceSummary)
 	}
+	if loaded.AcceptanceReviews != 1 {
+		t.Fatalf("acceptance reviews = %d, want 1", loaded.AcceptanceReviews)
+	}
 }
 
 func TestAcceptanceInputIncludesExecutionEvidence(t *testing.T) {

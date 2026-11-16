@@ -25,6 +25,7 @@ type BuildProgressSnapshot struct {
 	Warnings          []string                `json:"warnings,omitempty"`
 	AcceptanceStatus  string                  `json:"acceptance_status,omitempty"`
 	AcceptanceRounds  int                     `json:"acceptance_rounds,omitempty"`
+	AcceptanceReviews int                     `json:"acceptance_reviews,omitempty"`
 	AcceptanceSummary string                  `json:"acceptance_summary,omitempty"`
 	ClientSummary     string                  `json:"client_summary"`
 	UpdatedAt         time.Time               `json:"updated_at"`
@@ -151,6 +152,7 @@ func computeBuildProgress(attempt *BuildSpecAttempt, snapshot *dag.DagData) *Bui
 		progress.Status = string(attempt.Status)
 		progress.AcceptanceStatus = attempt.AcceptanceStatus
 		progress.AcceptanceRounds = attempt.AcceptanceRounds
+		progress.AcceptanceReviews = attempt.AcceptanceReviews
 		progress.AcceptanceSummary = attempt.AcceptanceSummary
 	}
 

@@ -456,6 +456,43 @@ func TestKernelStandstillBlocksAndPrivatelyNotifiesOnlyAffectedParticipants(t *t
 	}
 }
 
+func TestContractReadCommandsAllowHostWithoutCapability(t *testing.T) {
+	fixture := newCoordinationKernelFixture(t)
+	contract := coordinationContract("contract-host-read", "agent-a", "a-node", "agent-b", "b-node")
+	if _, err := fixture.manager.Request(context.Background(), coordination.Principal{Role: coordination.RoleAdmin}, coordination.RequestCommand{Contract: contract}); err != nil {
+		t.Fatalf("seed contract: %v", err)
+	}
+
+	listed := callCoordinationServer(t, fixture.server, "contract-list", "", map[string]any{})
+	if listed.Error != "" {
+		t.Fatalf("host contract-list error = %s", listed.Error)
+	}
+	listedContracts, ok := listed.Result.(map[string]interface{})["contracts"].([]coordination.Contract)
+	if !ok || len(listedContracts) != 1 || listedContracts[0].ID != contract.ID {
+		t.Fatalf("host contract-list result = %#v", listed.Result)
+	}
+
+	status := callCoordinationServer(t, fixture.server, "contract-status", "", map[string]any{"contract_id": contract.ID})
+	if status.Error != "" {
+		t.Fatalf("host contract-status error = %s", status.Error)
+	}
+
+	terms := callCoordinationServer(t, fixture.server, "contract-terms", "", map[string]any{"contract_id": contract.ID})
+	if terms.Error != "" {
+		t.Fatalf("host contract-terms error = %s", terms.Error)
+	}
+
+	invalid := callCoordinationServer(t, fixture.server, "contract-list", "not-a-capability", map[string]any{})
+	if !strings.Contains(invalid.Error, "valid agent capability") {
+		t.Fatalf("invalid capability error = %q", invalid.Error)
+	}
+
+	mutation := callCoordinationServer(t, fixture.server, "contract-request", "", map[string]any{"contract": contract})
+	if !strings.Contains(mutation.Error, "valid agent capability") {
+		t.Fatalf("host mutation error = %q", mutation.Error)
+	}
+}
+
 func TestContractCommandsFailClosedWithoutCoordinationManager(t *testing.T) {
 	server, _ := startTestServer(t)
 	capability, err := server.IssueAgentCapability("agent-a")

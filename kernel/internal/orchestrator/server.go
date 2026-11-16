@@ -81,6 +81,9 @@ type Server struct {
 	behaviorCb                 func(agentID, domainID, kind, evidence string)
 	inferenceGatewayStatusCb   func() InferenceGatewayStatus
 	inferenceGatewayCapacityCb func(int) (InferenceGatewayStatus, error)
+	tokenUsageCb               func(string) (int64, int64)
+	tokenUsageMu               sync.Mutex
+	tokenUsageBaseline         map[string]gatewayTokenUsage
 	integrationStatusCb        func() IntegrationRunStatus
 	integrationRetryCb         func() error
 	stopBuildSpecAgentsCb      func() error
@@ -1813,6 +1816,16 @@ func (s *Server) handleUpdateNode(req Request) Response {
 				"node_id":           params.NodeID,
 				"pending_contracts": completion.PendingContracts,
 			}}
+		}
+	}
+	if status == dag.StatusDone && s.tokenUsageCb != nil {
+		if metrics == nil {
+			metrics = &dag.NodeMetrics{}
+		}
+		prompt, completion := s.consumeAgentTokenUsage(params.AgentID)
+		if metrics.PromptTokens == 0 && metrics.CompletionTokens == 0 {
+			metrics.PromptTokens = clampTokenCount(prompt)
+			metrics.CompletionTokens = clampTokenCount(completion)
 		}
 	}
 	err := s.dagManager.UpdateNodeForAgent(params.NodeID, params.AgentID, status, metrics)

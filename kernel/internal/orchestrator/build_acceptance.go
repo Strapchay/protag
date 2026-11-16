@@ -272,6 +272,7 @@ func (d *Daemon) reviewBuildAcceptance(attempt *BuildSpecAttempt) (bool, error) 
 	}
 	attempt.AcceptanceSummary = patch.candidate.Summary
 	attempt.AcceptanceReviewPath = roundPath
+	attempt.AcceptanceReviews++
 	switch patch.candidate.Verdict {
 	case "attention":
 		return d.acceptanceAttention(attempt, fmt.Errorf("%s", patch.candidate.Summary))

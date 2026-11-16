@@ -207,6 +207,7 @@ func NewDaemon(config *Config, projectRoot string) (*Daemon, error) {
 	if inferenceGateway != nil {
 		inferenceGateway.SetUnixSocket(ipcPaths.InferenceSocket)
 		inferenceGateway.SetCapabilityResolver(server.ResolveAgentCapability)
+		server.SetTokenUsageCallback(inferenceGateway.AgentTokenUsage)
 		configureResolutionCapability(piCoord, server, config)
 	}
 	if broadcaster, ok := coord.(interface{ SetBroadcastFunc(func(hub.Message)) }); ok {

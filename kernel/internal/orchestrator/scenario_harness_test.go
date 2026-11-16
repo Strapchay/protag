@@ -375,6 +375,9 @@ func scenarioRegistry() []scenarioCase {
 				if loaded.AcceptanceStatus != "passed" {
 					h.t.Fatalf("acceptance status = %s", loaded.AcceptanceStatus)
 				}
+				if loaded.AcceptanceReviews != 1 {
+					h.t.Fatalf("acceptance reviews = %d, want 1", loaded.AcceptanceReviews)
+				}
 				if _, err := os.Stat(loaded.AcceptanceReviewPath); err != nil {
 					h.t.Fatalf("acceptance review artifact: %v", err)
 				}
@@ -401,6 +404,13 @@ func scenarioRegistry() []scenarioCase {
 				}
 				if attempt.AcceptanceStatus != "passed" {
 					h.t.Fatalf("final acceptance = %s", attempt.AcceptanceStatus)
+				}
+				loaded, err := loadBuildSpecAttempt(h.daemon.runState.Root)
+				if err != nil {
+					h.t.Fatal(err)
+				}
+				if loaded.AcceptanceReviews != 2 || loaded.AcceptanceRounds != 1 {
+					h.t.Fatalf("persisted acceptance reviews/rounds = %d/%d, want 2/1", loaded.AcceptanceReviews, loaded.AcceptanceRounds)
 				}
 				coordinator, ok := h.daemon.coordinator.(*scenarioCoordinator)
 				if !ok || coordinator.reviewCall != 2 {

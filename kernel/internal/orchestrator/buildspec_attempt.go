@@ -65,6 +65,7 @@ type BuildSpecAttempt struct {
 	CanceledAt                *time.Time                     `json:"canceled_at,omitempty"`
 	AcceptanceStatus          string                         `json:"acceptance_status,omitempty"`
 	AcceptanceRounds          int                            `json:"acceptance_rounds,omitempty"`
+	AcceptanceReviews         int                            `json:"acceptance_reviews"`
 	AcceptanceSummary         string                         `json:"acceptance_summary,omitempty"`
 	AcceptanceReviewPath      string                         `json:"acceptance_review_path,omitempty"`
 	AcceptanceFailureCode     string                         `json:"acceptance_failure_code,omitempty"`

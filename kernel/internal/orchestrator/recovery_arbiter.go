@@ -53,6 +53,7 @@ type ResumePreflight struct {
 	Status                string                 `json:"status,omitempty"`
 	FailureReason         string                 `json:"failure_reason,omitempty"`
 	AcceptanceStatus      string                 `json:"acceptance_status,omitempty"`
+	AcceptanceReviews     int                    `json:"acceptance_reviews,omitempty"`
 	AcceptanceSummary     string                 `json:"acceptance_summary,omitempty"`
 	AcceptanceFailureCode string                 `json:"acceptance_failure_code,omitempty"`
 	CanResume             bool                   `json:"can_resume"`
@@ -446,6 +447,7 @@ func (d *Daemon) buildResumePreflight() ResumePreflight {
 		preflight.Status = string(attempt.Status)
 		preflight.FailureReason = attempt.FailureReason
 		preflight.AcceptanceStatus = attempt.AcceptanceStatus
+		preflight.AcceptanceReviews = attempt.AcceptanceReviews
 		preflight.AcceptanceSummary = attempt.AcceptanceSummary
 		preflight.AcceptanceFailureCode = attempt.AcceptanceFailureCode
 	}
