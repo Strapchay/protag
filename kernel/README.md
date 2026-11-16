@@ -6,9 +6,9 @@ A 3-Tier Multi-Agent Orchestration OS for concurrent AI agent operations on a sh
 
 ## Architecture
 
-- **Tier 1 — Orchestrator** (Go Daemon): Central kernel managing state, locking, IPC, and process supervision. Contains zero AI logic.
-- **Tier 2 — Domain Agent Supervisor** (Go Process): Lightweight supervisor per domain that manages a Pi Agent subprocess lifecycle.
-- **Tier 3 — Pi Agent** (Node.js, RPC Mode): The brain. Runs reasoning loops, writes code, communicates with the Orchestrator via `orchestrator-cli`.
+- **Tier 1 — Orchestrator** (Go daemon): Central kernel managing state, locking, IPC, cgroups, and process supervision. Contains zero AI logic.
+- **Tier 2 — Domain Supervisor** (in-process): A supervisor object inside the daemon that owns one Pi process tree per domain, including workspace generation, health, and recovery.
+- **Tier 3 — Pi Agent** (Node.js, RPC mode): The brain. Runs reasoning loops, writes code, communicates with the Orchestrator via `orchestrator-cli`.
 
 ## Quick Start
 
@@ -17,13 +17,6 @@ unprivileged user namespaces. Agent allocation fails closed when either is
 unavailable.
 
 ```bash
-# Install build tools (flatc, protoc plugins)
-make install-tools
-
-# Generate code from schemas
-make flatbuf
-make proto
-
 # Build binaries
 make build
 
@@ -47,6 +40,10 @@ different project from anywhere, pass an explicit project root:
 ```bash
 ./bin/aion-kernel server --workdir /path/to/project --config /path/to/aion.yaml
 ```
+
+One kernel owns a project directory at a time. The daemon holds an exclusive
+lock at `.aion/kernel.lock`; a second server on the same project exits with an
+error naming the owning PID. Run different projects on distinct ports.
 
 If `--config` is omitted, config discovery checks:
 
@@ -161,22 +158,27 @@ kernel/
 │   ├── orchestrator/         # Orchestrator daemon
 │   └── orchestrator-cli/     # CLI for agent ↔ orchestrator comms
 ├── internal/
-│   ├── orchestrator/         # Core daemon logic
-│   ├── dag/                  # DAG state (FlatBuffer + mmap + WAL)
+│   ├── orchestrator/         # Core daemon, gateway, acceptance, recovery
+│   ├── dag/                  # mmap-backed JSON DAG + seqlock + WAL
 │   ├── locking/              # File-level lock manager
-│   ├── supervisor/           # Agent process supervisor
+│   ├── supervisor/           # In-process agent process supervisor
 │   ├── hub/                  # Context Hub message routing
-│   ├── coordinator/          # Coordinator plugin (DAG planner)
+│   ├── messaging/            # Durable agent-to-agent message registry
+│   ├── coordinator/          # Coordinator/Architect Pi processes
+│   ├── session/              # Session resilience and checkpoints
 │   └── memory/               # Semantic memory (Chromem-Go)
-├── proto/                    # Protobuf service definitions
-├── flatbuf/                  # FlatBuffer schema files
+├── flatbuf/                  # Legacy FlatBuffer schema (not in runtime path)
 ├── skills/                   # Pi Agent skills
 ├── install/                  # systemd install templates and setup helpers
 ├── configs/                  # Configuration files
+├── scenario/                 # Process and live scenario harnesses
 └── test/                     # Integration tests & mocks
 ```
 
-Durable cross-domain contracts are provided by the composable `aion-coordination` module. The kernel remains the only runtime and projects contract effects into the DAG, Context Hub, and supervisor lifecycle.
+Durable cross-domain contracts are provided by the composable
+`aion-coordination` module; sandbox policy comes from `aion-isolation`. The
+kernel remains the only runtime and projects contract effects into the DAG,
+Context Hub, and supervisor lifecycle.
 
 ## Configuration
 
@@ -212,4 +214,5 @@ daemon restart cannot reuse a workspace identity.
 
 ## Documentation
 
-See `docs/current/implementation_arch.md` for the full architecture specification.
+Architecture documentation lives in the separate `docs` repository at
+`docs/current/implementation_arch.md`. It is not included in this repository.
