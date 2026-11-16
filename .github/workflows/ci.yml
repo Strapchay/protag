@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.7"
+          cache-dependency-path: |
+            kernel/go.sum
+            coordination/go.sum
+            isolation/go.sum
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Test coordination and isolation
+        run: |
+          (cd coordination && go test ./... -count=1)
+          (cd isolation && go test ./... -count=1)
+      - name: Test kernel
+        run: cd kernel && go test ./... -count=1
+
+  scenarios:
+    name: Kernel scenarios
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.7"
+          cache-dependency-path: "**/go.sum"
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Deterministic scenarios
+        run: make test-scenarios
+      - name: Deterministic scenarios under race
+        run: make test-scenarios-race
+      - name: Process-level scenarios
+        run: make test-scenarios-process
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-artifacts
+          path: kernel/internal/orchestrator/testdata/scenario-artifacts
+          if-no-files-found: ignore

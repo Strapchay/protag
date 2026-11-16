@@ -1,0 +1,14 @@
+# Repository-local runtime state and generated artifacts
+/.aion/
+/.env
+*.log
+
+# docs/ is intentionally a separate repository and is not part of this monorepo.
+/docs/
+
+# Local binaries produced by ad-hoc builds outside kernel/bin
+/bin/
+
+# OS cruft
+.DS_Store
+Thumbs.db
